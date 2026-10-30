@@ -7,6 +7,7 @@
 #include "audio_io.h"
 #include "audio_player.h"
 #include "board.h"
+#include "diag.h"
 #include "esp_log.h"
 #include "prompt_assets.h"
 
@@ -57,6 +58,9 @@ static void on_afe_event(audio_fe_event_t evt, void *arg)
 
 void app_main(void)
 {
+    /* 先起观测能力：后续所有模块的初始化日志与自测命令都靠 console */
+    ESP_ERROR_CHECK(diag_init());
+
     ESP_LOGI(TAG, "booting esp-ai (mvp: wake + prompt)");
 
     ESP_ERROR_CHECK(board_init());

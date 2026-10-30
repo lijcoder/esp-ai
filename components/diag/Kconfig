@@ -1,0 +1,16 @@
+menu "Diagnostics"
+
+    config DIAG_HEAP_MONITOR
+        bool "周期堆水位监控任务"
+        default n
+        help
+            建一个低优先级任务，按固定间隔打印内部 RAM / PSRAM 的水位。
+            供 P5 长稳压测（T5.3）观察堆是否单调下降；默认关闭，避免污染常规日志。
+
+    config DIAG_HEAP_MONITOR_INTERVAL_S
+        int "堆水位打印间隔（秒）"
+        depends on DIAG_HEAP_MONITOR
+        range 5 3600
+        default 30
+
+endmenu

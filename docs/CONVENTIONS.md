@@ -82,6 +82,7 @@ components/<module>/
 - 串口 115200（UART0，GPIO43/44），`idf.py monitor` 直接看日志。
 - 新增调试能力优先做成 console 命令（ARCHITECTURE §10.2），不要留临时打印。
 - 内存问题先 `sys heap`/`sys tasks`；音频问题先 `mic stat`，再 `tools/record_wav.py` 抓 WAV。
+- 云端/WS 问题先跑 mock，别直接上设备：`uv run tools/ws_mock_server.py --self-test`（9 项，不需要硬件）确认协议链路，再起 `uv run tools/ws_mock_server.py` 给设备当服务端；字段口径对照 `docs/PROTOCOL.md`（含待确认项）。
 - 崩溃先看串口 panic 输出，再解析 coredump 分区（`coredump` @0x9a0000/64K，已开 `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`）：
   `idf.py -p <PORT> coredump-info`（寄存器/调用栈/任务列表）、`idf.py -p <PORT> coredump-debug`（gdb）；也可 `-s core.dump` 存盘后 `coredump-info -c core.dump` 离线解析。
 - **解析 coredump 必须用崩溃那一刻的 ELF**（`build/esp-ai.elf`，含符号与地址布局）：崩溃后先备份该文件再改代码/重建；要交付或现场测试的固件需把 elf 与 commit 一起归档，否则 coredump 无法还原调用栈。

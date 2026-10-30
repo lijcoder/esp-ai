@@ -8,9 +8,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 当前阶段 | **P0 地基（已完成）→ P1 联网** |
-| 当前任务 | P0 收尾完成：T0.1 分区表已换（9 分区 + coredump 启用）、T0.7② 回归通过（唤醒 3/3、R1/R2、模型从 1536K 分区加载）、T0.7b `sys crash` 使 coredump 落盘/解析链路闭环（实测 14,404 B，解析出全部任务调用栈） |
-| 下一步 | P1：T1.5 `tools/ws_mock_server.py`（可立即起，不依赖硬件）→ T1.1 `config_store`（nvs 分区已就绪）→ T1.2a 事件定义 → T1.3 `net_mgr` → T1.4 `transport_ws` → T1.6 联调 |
+| 当前阶段 | **P0 地基（已完成）→ P1 联网（进行中）** |
+| 当前任务 | P1 T1.5 完成：`tools/ws_mock_server.py` 落地（握手 / 心跳 / 事件下发 / 二进制帧 / interrupt / 重连 / 鉴权 / 场景开关），`--self-test` 9/9 通过，模拟设备端两轮语音 + 断线重连实测通过；契约缺口登记 PROTOCOL.md，`ws://`（本地）vs `wss://`（线上）证书策略登记 PRODUCT_IDEAS §8 X2 |
+| 下一步 | P1：T1.1 `config_store`（nvs 分区已就绪）→ T1.2a 事件定义 → T1.3 `net_mgr` → T1.4 `transport_ws`（用 mock 联调）→ T1.6 联调与基线 |
 | 最后更新 | 2026-10-30 |
 | 阻塞项 | 无（开发板 `/dev/cu.usbmodem5CF90746951` 可烧录）；X1「提示符与日志互冲」仍按 PRODUCT_IDEAS §8 方案 A 接受，真机验收用"脚本读串口 + `log * warn` 降噪"替代口径 |
 
@@ -33,7 +33,7 @@
 | P1 | T1.2 | event_bus | ☐ |
 | P1 | T1.3 | net_mgr（WiFi/重连/SNTP） | ☐ |
 | P1 | T1.4 | transport_ws | ☐ |
-| P1 | T1.5 | ws_mock_server.py | ☐ |
+| P1 | T1.5 | ws_mock_server.py | ☑ |
 | P1 | T1.6 | P1 联调与基线 | ☐ |
 | P2 | T2.1 | audio_fe 事件化 | ☐ |
 | P2 | T2.2 | codec_enc（Opus） | ☐ |
@@ -80,6 +80,8 @@
 | 2026-10-30 | T0.7b | 新增 `sys crash`（仅 `CONFIG_DIAG_ENABLE_CRASH_TEST=y` 编译，默认 n，量产必须关闭）：真机验证 coredump 闭环 —— panic reason `diag crash test` → `Core dump has been saved to flash.` → 重启后 `Core dump data checksum is correct` / `Found core dump 14404 bytes in flash @ 0x9a0000`（占 64K 分区 22%，余量充足）；`idf.py coredump-info` 还原崩溃任务 `console_repl` 与全部 8 个任务调用栈（`cmd_sys` → `diag.c:297`、`feed_task` → `audio_fe.c:89`、`player_task` → `audio_player.c:48` 等，带源文件行号）；验证后已清空 coredump 分区；size 974,328 B（+220 B） |
 | 2026-10-30 | T0.1 | 分区表切换到 ARCH §9.1 定稿（nvs/otadata/phy_init/ota_0/ota_1/model/assets/coredump/storage；app 偏移 0x10000→0x20000，model 5168K→1536K）；`gen_esp32part.py` 校验无重叠越界；`erase-flash` 全片擦除后重烧四段；bootloader 识别 9 个分区、app 从 0x20000 启动、`esp_core_dump_flash` 找到 coredump 分区、srmodels 从 1536K 分区加载成功；sdkconfig 由 defaults 重新生成（仅 coredump 相关项变化，其余逐项核对保留）；启用 `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`；size 974,108 B（+17.8KB，coredump 代码 + ISR 栈 +560B/核），DIRAM 137,578 B（+6.2KB） |
 | 2026-10-30 | T0.7② | 分区表改后回归：唤醒 3/3（10.9s/16.3s/29.9s）、R1 `feed paused`→播放 12800 样本→R2 `feed resumed`（间隔 1.35s，符合 300ms 延时）、底噪 RMS 167~291（-45.9~-41.0 dBFS）、说话峰值 4148~4189（-18.0 dBFS）、`sys tasks` 8 个任务、运行期内部 RAM 峰值 127,468 B / PSRAM 峰值 692,444 B、无 ERROR 日志。附带观察：两轮采样都在 3 次唤醒后出现第 4 次唤醒（用户说话/环境声期间），需在安静环境复核是否误唤醒（并入 T5.2） |
+| 2026-10-30 | T1.5 | 新增 `tools/ws_mock_server.py`（单文件，PEP 723 依赖 `websockets>=14`，`uv run` 即用）：按 ARCH §6.1–6.3 实现 hello / ping-pong / audio_start-end / asr-llm-tts 下发 / interrupt / music 骨架，8 字节二进制帧收发与严格校验，`--self-test` 9 项，`--no-tts`/`--drop-pong`/`--close-after`/`--save-upload`/`--scenario normal\|error\|music`；补 `tools/README.md`；`.gitignore` 增 `.uv-cache/`。**零固件改动**（size 保持 974,108 B）。实测：自测 9/9 PASS；模拟设备客户端 ping rtt 0.3ms、100 帧 TTS 流 seq 连续（末帧相对首帧 2.2s）、第 2 轮 interrupt 后不再有 `tts_end`；no-tts/error/music/close-after/upload 五个 CLI 分支均验证通过 |
+| 2026-10-30 | 文档 | T1.5 暴露的契约缺口登记到 `PROTOCOL.md`「实现中发现的契约待确认项」7 条（hello 无应答、二进制帧无 sid、音乐 sid 归属、error 码表、鉴权关闭码、pong 格式、本地 ws 与线上 wss 的证书策略），P2/T2.5 定稿时逐条确认；证书策略同时登记 `PRODUCT_IDEAS.md` §8 X2 |
 
 ## 4. 阻塞项
 
@@ -98,7 +100,7 @@
 | 2026-10-30 | P0（T0.7a mic stat） | 956,180 B | 131,358 B（DIRAM 已用，剩余 210,402 B） | —（未采） | `idf.py build` 通过、零警告；+3,436 B 主要来自 newlib math（`sqrt`/`log10`）+ 命令文本 + 统计代码，DIRAM +40 B（统计变量 + 临界区）；真机未验证，基线数据待 T0.7①C 用 `mic stat` 复测 |
 | 2026-10-30 | P0（T0.7①C 真机基线） | 956,272 B | 运行期内部 RAM 峰值占用 126,924 B（`sys heap` 口径 total−min_free，最低水位 198,943 B，剩余 203,479 B） | PSRAM 峰值占用 692,444 B（剩余 7,693,300 B，最大块 7,602,176 B） | 唤醒 3/3；底噪 RMS 104~220（-49.0~-43.5 dBFS）/峰值 502；说话峰值 4228（-17.7 dBFS）；`sys tasks` 修复后 8 个任务；固件含 T0.7a + diag 修复 |
 | 2026-10-30 | P0（T0.1 分区表 + coredump） | 974,108 B | 运行期内部 RAM 峰值占用 127,468 B（`sys heap` 口径 total−min_free，最低水位 192,979 B，剩余 197,543 B） | PSRAM 峰值占用 692,444 B（剩余 7,693,300 B） | 真机：9 分区生效、app@0x20000、model@0x620000（1536K）、coredump 可用；唤醒 3/3 + R1/R2 正常；+17.8KB 来自 coredump |
-| — | P1 |  |  |  |  |
+| 2026-10-30 | P1（T1.5 mock 工具） | 974,108 B（未变） | —（本任务无固件改动，沿用 P0/T0.1 行） | —（同上） | 仅新增 `tools/ws_mock_server.py` + `tools/README.md` + `.gitignore` 一行；`idf.py build`/`size` 未重跑（无固件差异），P1 固件基线等 T1.1 落地后重采 |
 | — | P2 |  |  |  |  |
 | — | P3 |  |  |  |  |
 | — | P4 |  |  |  |  |

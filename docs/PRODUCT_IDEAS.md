@@ -158,3 +158,20 @@
 - **建议**：当前维持 A；P5（T5.1 console 补全）时若日志量已影响使用，优先评估 D（纯软件、不改接线），其次 E。
 - **重新评估触发条件**：① P1 联网后日志频率导致输入基本不可用；② 需要脚本/产测自动解析 console 输出；③ 新增后台高频日志（WS 心跳、音乐状态、堆监控）。
 - **参考**：`components/diag/diag.c`（printf 用于命令输出、ESP_LOG 用于事件，见该组件 README"关键约束"）；ARCHITECTURE §10.2；IDF `esp_console_repl_chip.c`（`uart_vfs_dev_use_driver`）、`linenoise.c`（重绘逻辑）、`log_write.c`（默认 `vprintf`）。
+
+### X2 本地 mock 用 `ws://`、线上契约用 `wss://` 的证书验证策略（T1.5 起暴露）
+
+- **状态**：待决策（不阻塞 T1.5；T1.4 `transport_ws` 开工时定，定了回填 §6 决策记录）
+- **现象**：ARCHITECTURE §6.1 正式契约是 `wss://`，但本地 `tools/ws_mock_server.py` 为免证书负担用 `ws://`；端侧走 `wss://` 时 esp-tls 会校验证书链，本地自签证书不被信任，导致"本地能连、线上连不上"或反之。
+- **影响**：T1.4/T1.6 若只实现 `wss`，本地无法联调（mock 无法出证）；若只实现 `ws`，线上不可用。TLS 还会占内部 RAM（ARCH §9.2 预算 ~45KB），需在 P1 基线里看到实际值。
+- **候选方案**：
+
+| 方案 | 做法 | 成本 | 代价 |
+|---|---|---|---|
+| A 双传输 | `transport_ws` 同时支持 `ws://` 与 `wss://`，由 `CONFIG_AI_WS_URL` 的 scheme 决定 | 小（esp_websocket_client 本身支持，仅分支配置） | 生产固件保留 `ws` 分支 → 必须在发布检查里强制"量产只用 `wss://`" |
+| B 自签 CA 烧入开发固件 | mock 用 openssl 自签，开发固件嵌入该 CA，由 Kconfig 开关切换 | 中 | 开发/生产证书管理分叉，多一步烧录流程 |
+| C 开发期跳过校验 | `esp_tls` 关证书校验（仅开发构建） | 小 | 开发开关易漏到量产，必须 Kconfig 默认 n + 发布清单核对 |
+
+- **建议**：A（双传输，scheme 决定）+ 发布检查强制 `wss://`；本地 mock 保持 `ws://` 零证书负担。B 只在需要验证 TLS 内存/证书过期路径时再做。
+- **重新评估触发条件**：① T1.4 开工；② 需要实测 TLS 内存占用或证书过期/SNTP 时序；③ 后端要求 mTLS 或改用非 443 端口/自签网关。
+- **参考**：ARCHITECTURE §6.1、§9.2、§10.1；`tools/ws_mock_server.py`、`tools/README.md`；PROTOCOL.md 待确认项 P-7。

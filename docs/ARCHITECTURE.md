@@ -258,10 +258,13 @@ esp-ai/
 ### 6.1 连接与鉴权
 
 - 地址：`wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1`
-- 参数来自 Kconfig：`CONFIG_AI_WS_URL`、`CONFIG_AI_DEVICE_ID`、`CONFIG_AI_TOKEN`
+- 参数来自 Kconfig：`CONFIG_AI_WS_URL`、`CONFIG_AI_DEVICE_ID`、`CONFIG_AI_TOKEN`；URL 里缺省的 `device_id/token/ver` 由端侧补齐，日志只打印 scheme+host+path（**不回显 query**，token 不进日志）
 - 连接成功后发送 `{"t":"hello","device_id":..,"ver":1}`
-- 心跳：每 20s 发 `{"t":"ping"}`，10s 内未收到 `pong` 判定断线
-- 重连退避：1s → 2s → 5s → 10s → 30s（上限），无限重试直到网络恢复
+- **服务端必须回 `{"t":"hello_ack","ver":1}`**：端侧 5s 内未收到视为建连失败，关闭连接并按退避重连（T1.4 定稿新增，见 PROTOCOL.md P-1）
+- 心跳：每 20s 发 `{"t":"ping"}`；服务端回 `{"t":"pong"}`（不带其它字段）；10s 内未收到 `pong` 判定断线，RTT 用端侧 tick 计算
+- 重连退避：1s → 2s → 5s → 10s → 30s（上限），无限重试直到网络恢复；每次重连成功都重发 `hello` 并等 `hello_ack`
+- 鉴权失败（`device_id`/`token` 非法）：服务端以应用关闭码 **4001（device_id）/ 4002（token）** 关闭连接；端侧 ERROR 日志后**不再自动重试**，等 `NET_UP` 或 `ws reconnect` 再试（T1.4 定稿，见 PROTOCOL.md P-5）
+- 传输：线上只用 `wss://`；本地联调可用 `ws://`（由 `CONFIG_AI_WS_URL` 的 scheme 决定是否走 TLS，见 PRODUCT_IDEAS §8 X2 方案 A）；`wss` 建连前要求 SNTP 已对时（§10.1）
 
 ### 6.2 二进制帧（音频）
 
@@ -294,12 +297,13 @@ esp-ai/
 **下行**
 | t | 说明 |
 |---|---|
+| `hello_ack` | 握手应答（T1.4 定稿），带 `ver`；5s 内未收到按建连失败处理 |
 | `asr_partial` / `asr_final` | ASR 中间/最终结果，带 `sid`、`text` |
 | `llm_delta` | LLM 增量文本，带 `sid`、`text` |
 | `tts_start` / `tts_end` | TTS 起止，带 `sid`、`codec`、`sr` |
 | `music_track` | 曲目信息：`{"t":"music_track","sid":..,"url":"https://...mp3","codec":"mp3","duration_ms":..,"title":..}` |
 | `error` | 错误码与描述 |
-| `pong` | 心跳应答 |
+| `pong` | 心跳应答：`{"t":"pong"}`（不带其它字段） |
 
 规则：所有下行事件都带 `sid`；端侧丢弃 `sid` 不匹配当前会话的迟到帧。
 

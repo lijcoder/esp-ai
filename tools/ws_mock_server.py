@@ -264,8 +264,9 @@ class Session:
             self._log(logging.INFO, f"<-- hello device_id={msg.get('device_id')} ver={ver}")
             if ver != 1:
                 self._log(logging.WARNING, f"hello ver={ver}，mock 只实现 ver=1，继续服务")
-            # §6.1 未定义服务端 hello 应答：这里刻意不发额外帧。
-            # 若 T1.4 发现端侧必须有 ack，先改 ARCHITECTURE §6 再改本脚本。
+            # ARCH §6.1（T1.4 定稿）：服务端必须回 hello_ack，端侧 5s 内没收到按建连失败处理。
+            # 这里是 mock 对契约的最小实现，不额外发明字段。
+            await self._send_json({"t": "hello_ack", "ver": FRAME_VER})
 
         elif event == "ping":
             self.stats.pings += 1
@@ -646,6 +647,10 @@ async def _t_hello(cfg: Config) -> None:
     try:
         async with connect(url) as ws:
             await ws.send(json.dumps({"t": "hello", "device_id": "dev1", "ver": 1}))
+            # ARCH §6.1（T1.4 定稿）：hello 之后必须回 hello_ack，端侧靠它判断握手成功
+            ack = await _recv_json(ws, timeout=1.0)
+            assert ack.get("t") == "hello_ack", f"期望 hello_ack，收到 {ack}"
+            assert ack.get("ver") == 1, f"hello_ack.ver 错误：{ack}"
         await _wait_closed(server, 1)
         session = server.history[-1]
         assert session.stats.hello_seen, "服务端没看到 hello"
@@ -676,7 +681,9 @@ async def _t_voice(cfg: Config) -> None:
                 await ws.send(build_frame(TYPE_AUDIO_UP, index, b"\x01" * 40))
             await ws.send(json.dumps({"t": "audio_end", "sid": 42}))
             frames = await _recv_until(ws, "tts_end")
-        json_msgs = [msg for kind, msg in frames if kind == "json"]
+        # hello_ack（T1.4 定稿）不属于语音事件，做 sid/顺序断言前先剔除
+        json_msgs = [msg for kind, msg in frames if kind == "json" and msg.get("t") != "hello_ack"]
+        assert any(kind == "json" and msg.get("t") == "hello_ack" for kind, msg in frames), "缺少 hello_ack"
         bins = [msg for kind, msg in frames if kind == "bin"]
         types = [msg["t"] for msg in json_msgs]
         assert "asr_partial" in types and "asr_final" in types and "llm_delta" in types, types
@@ -705,7 +712,15 @@ async def _t_bad_frames(cfg: Config) -> None:
             await ws.send(MAGIC + bytes((FRAME_VER, TYPE_AUDIO_UP)) + b"\x00\x00\x00\x05")  # len 不符
             await ws.send(build_frame(0x7F, 0, b""))                      # 未知类型
             await ws.send(json.dumps({"t": "ping"}))
-            msg = await _recv_json(ws, timeout=1.0)
+            # 先收到 hello_ack（T1.4 定稿），再等 pong
+            deadline = time.monotonic() + 1.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError("坏帧之后未在 1s 内收到 pong")
+                msg = await _recv_json(ws, timeout=remaining)
+                if msg.get("t") == "pong":
+                    break
             assert msg.get("t") == "pong", "坏帧之后连接被误关闭"
         await _wait_closed(server, 1)
         session = server.history[-1]
@@ -756,7 +771,16 @@ async def _t_reconnect(cfg: Config) -> None:
         async with connect(url) as ws:
             await ws.send(json.dumps({"t": "hello", "device_id": "dev1", "ver": 1}))
             await ws.send(json.dumps({"t": "ping"}))
-            assert (await _recv_json(ws, 1.0)).get("t") == "pong", "首连 ping 未收到 pong"
+            # hello_ack 先到，跳过它再等 pong（T1.4 定稿）
+            deadline = time.monotonic() + 1.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError("首连 ping 未收到 pong")
+                msg = await _recv_json(ws, timeout=remaining)
+                if msg.get("t") == "pong":
+                    break
+            assert msg.get("t") == "pong", "首连 ping 未收到 pong"
         await _wait_closed(server, 1)
         async with connect(url) as ws:
             await ws.send(json.dumps({"t": "ping"}))
@@ -834,7 +858,7 @@ async def run_self_test() -> int:
         quiet=True,
     )
     cases = [
-        ("hello 握手与参数解析", _t_hello(base)),
+        ("hello / hello_ack 握手与参数解析", _t_hello(base)),
         ("ping → pong 心跳", _t_ping(base)),
         ("一轮语音：事件顺序 / sid 回填 / 二进制帧头", _t_voice(base)),
         ("坏帧容错（magic / len / type）后连接仍存活", _t_bad_frames(base)),

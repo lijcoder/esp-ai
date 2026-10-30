@@ -22,12 +22,12 @@ uv run tools/ws_mock_server.py                  # 起服务，打印可直连的
 
 ```bash
 uv run tools/ws_mock_server.py --self-test
-# [1/9] PASS  hello 握手与参数解析
+# [1/9] PASS  hello / hello_ack 握手与参数解析
 # ...
 # self-test: 9/9 PASS   退出码 0
 ```
 
-进程内起服务 + 起客户端，覆盖 9 项：hello 解析、ping→pong、一轮语音的事件顺序/`sid` 回填/二进制帧头、坏帧容错、`interrupt` 取消、断线重连、TTS 流中 ping、token 拒绝关闭码、`--drop-pong`。
+进程内起服务 + 起客户端，覆盖 9 项：`hello`/`hello_ack` 握手、ping→pong、一轮语音的事件顺序/`sid` 回填/二进制帧头、坏帧容错、`interrupt` 取消、断线重连、TTS 流中 ping、token 拒绝关闭码、`--drop-pong`。
 
 ### 2. 起服务并手工联调
 
@@ -48,6 +48,7 @@ ws://192.168.x.x:8765/v1/voice?device_id=dev1&token=dev-token&ver=1
 ```bash
 uv run --with websockets python -m websockets "ws://127.0.0.1:8765/v1/voice?device_id=dev1&token=dev-token&ver=1"
 > {"t":"hello","device_id":"dev1","ver":1}
+< {"t":"hello_ack","ver":1}       # ARCH §6.1（T1.4 定稿）：服务端必须回 ack
 > {"t":"audio_start","sid":1}
 > {"t":"audio_end","sid":1}          # 之后会连续收到 asr/llm/tts 事件与二进制帧
 > {"t":"ping"}                       # 立即回 {"t":"pong"}
@@ -106,7 +107,7 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 - 服务端**不主动**发 WS 协议层 ping（`ping_interval=None`），也**不主动**发应用层 `{"t":"ping"}`：§6.1 只定义了端侧 20s 上行心跳，避免出现两份心跳互相干扰。
 - 坏帧（magic/ver/len/type 不符、非 JSON 文本帧）一律 WARN + 计数 + 丢弃，但**不断开连接**——联调时希望看到问题累积，而不是一次错误就把会话踢掉。
 - `scenario=music` 只回 `music_track`，`url` 不可播放（T1.5 不提供 HTTP 音频服务，P4 前补）；`music_status` 只记日志。
-- 契约缺口（`hello` 无应答、二进制帧无 `sid`、音乐事件 `sid` 归属、`error` 码表、鉴权关闭码、服务端是否需主动心跳）不在这里私自定义，统一登记在 PROTOCOL.md，P2 补 `voice_cloud` 时一并定稿。
+- T1.4 已定稿的 4 条契约（`hello_ack`、鉴权关闭码 4001/4002、`pong` 字段与 RTT 口径、`ws://`/`wss://` 双传输）已同步到 ARCHITECTURE §6.1/§6.3 与本脚本，见 PROTOCOL.md「已定稿口径」；剩余缺口（二进制帧无 `sid`、音乐事件 `sid` 归属、`error` 码表）继续登记在 PROTOCOL.md，P2 补 `voice_cloud` 时定稿。
 
 ## 后续（未做）
 

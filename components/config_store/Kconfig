@@ -1,0 +1,13 @@
+menu "Config Store"
+
+    config CFG_VOLUME_DEFAULT
+        int "Default volume when NVS has no stored value (0-100)"
+        range 0 100
+        default 60
+        help
+            首次上电或 NVS 中没有 volume 键时的音量。
+            必须与 ARCHITECTURE §3.5 的"默认 60"一致；audio_player 自己的
+            CONFIG_AUDIO_PLAYER_DEFAULT_VOLUME 仅表示"未被 app 设置前"的上电缺省，
+            启动后以 config_store 的值为准（T3.3 统一音量体系时合并）。
+
+endmenu

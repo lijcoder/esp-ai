@@ -6,13 +6,16 @@
  */
 #include "diag.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "audio_fe.h"
+#include "config_store.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_console.h"
@@ -23,6 +26,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "DIAG";
@@ -464,6 +468,137 @@ static int cmd_mic(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- cfg 命令（配置持久化，T1.1） ---------------- */
+
+/*
+ * 注意语义：`cfg set` 是**底层存储调试口**，不做范围/语义校验（比如 volume=150 会原样落盘，
+ * 由 cfg_get_volume() 在读取侧 clamp）。业务语义的写入应由对应模块的 API 完成，
+ * 这里是用来验证"NVS 落盘/重启保持/缺省回退"本身的。
+ */
+
+static void print_cfg_info(void)
+{
+    uint32_t used = 0;
+    uint32_t free_entries = 0;
+    esp_err_t err = cfg_get_usage(&used, &free_entries);
+
+    if (err == ESP_OK) {
+        printf("NVS 分区：已用 %" PRIu32 " 条目 / 空闲 %" PRIu32 " 条目\n", used, free_entries);
+    } else {
+        printf("读取 NVS 统计失败: %s\n", esp_err_to_name(err));
+    }
+
+    int volume = 0;
+    err = cfg_get_volume(&volume);
+    if (err == ESP_OK) {
+        printf("音量 volume = %d（0~100，缺省 %d）\n", volume, CONFIG_CFG_VOLUME_DEFAULT);
+    } else {
+        printf("读取音量失败: %s\n", esp_err_to_name(err));
+    }
+    printf("说明：cfg set 是底层存储调试口（不做范围/语义校验），重启后才生效；\n"
+           "      运行中改音量走 T5.1 的 audio vol。\n");
+}
+
+static int cmd_cfg(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: cfg info | get <key> | set <key> <int> | setstr <key> <value> | erase <key>\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(argv[1], "info") == 0) {
+        print_cfg_info();
+        return ESP_OK;
+    }
+
+    if (strcmp(argv[1], "get") == 0) {
+        if (argc != 3) {
+            printf("用法: cfg get <key>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        int32_t int_value = 0;
+        esp_err_t err = cfg_get_int(argv[2], &int_value);
+        if (err == ESP_OK) {
+            printf("%s = %" PRId32 "（int）\n", argv[2], int_value);
+            return ESP_OK;
+        }
+        /* int 读失败（含类型不匹配）再试字符串：console 上不想让用户先声明类型 */
+        char str_value[128];
+        err = cfg_get_str(argv[2], str_value, sizeof(str_value));
+        if (err == ESP_OK) {
+            printf("%s = \"%s\"（str）\n", argv[2], str_value);
+            return ESP_OK;
+        }
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            printf("%s 未设置（使用缺省）\n", argv[2]);
+            return ESP_OK;
+        }
+        if (err == ESP_ERR_NVS_INVALID_LENGTH) {
+            printf("%s 是字符串但超过 %u 字节，console 不显示\n", argv[2],
+                   (unsigned)sizeof(str_value));
+            return ESP_OK;
+        }
+        printf("读取 %s 失败: %s\n", argv[2], esp_err_to_name(err));
+        return err;
+    }
+
+    if (strcmp(argv[1], "set") == 0) {
+        if (argc != 4) {
+            printf("用法: cfg set <key> <int>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(argv[3], &end, 0);
+        if (errno == ERANGE || end == argv[3] || *end != '\0') {
+            printf("非法整数: %s（支持十进制/0x 十六进制）\n", argv[3]);
+            return ESP_ERR_INVALID_ARG;
+        }
+        esp_err_t err = cfg_set_int(argv[2], (int32_t)value);
+        if (err != ESP_OK) {
+            printf("写入失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("已写入 %s = %ld（int，重启后生效）\n", argv[2], value);
+        return ESP_OK;
+    }
+
+    if (strcmp(argv[1], "setstr") == 0) {
+        if (argc != 4) {
+            printf("用法: cfg setstr <key> <value>（value 不支持空格）\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        esp_err_t err = cfg_set_str(argv[2], argv[3]);
+        if (err != ESP_OK) {
+            printf("写入失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("已写入 %s（str，%u 字节，重启后生效）\n", argv[2], (unsigned)strlen(argv[3]));
+        return ESP_OK;
+    }
+
+    if (strcmp(argv[1], "erase") == 0) {
+        if (argc != 3) {
+            printf("用法: cfg erase <key>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        esp_err_t err = cfg_erase_key(argv[2]);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            printf("%s 本来就未设置\n", argv[2]);
+            return ESP_OK;
+        }
+        if (err != ESP_OK) {
+            printf("删除失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("已删除 %s（重启后使用缺省）\n", argv[2]);
+        return ESP_OK;
+    }
+
+    printf("未知子命令: %s（可用: info | get | set | setstr | erase）\n", argv[1]);
+    return ESP_ERR_INVALID_ARG;
+}
+
 /* ---------------- 堆水位周期监控（默认关闭） ---------------- */
 
 #if CONFIG_DIAG_HEAP_MONITOR
@@ -507,6 +642,12 @@ static esp_err_t register_commands(void)
             .help = "麦克风统计：mic stat | reset",
             .hint = "stat|reset",
             .func = cmd_mic,
+        },
+        {
+            .command = "cfg",
+            .help = "配置持久化：cfg info | get <key> | set <key> <int> | setstr <key> <value> | erase <key>",
+            .hint = "info|get|set|setstr|erase",
+            .func = cmd_cfg,
         },
     };
 

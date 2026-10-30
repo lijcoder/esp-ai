@@ -15,6 +15,8 @@ extern "C" {
  * 注册的命令（本轮）：
  *   - `sys info` / `sys heap` / `sys tasks` / `sys reboot`
  *   - `log [<tag>|*] [none|error|warn|info|debug|verbose]`
+ *   - `mic stat` / `mic reset`
+ *   - `cfg info` / `cfg get <key>` / `cfg set <key> <int>` / `cfg setstr <key> <value>` / `cfg erase <key>`
  *   - `help`
  *
  * @note 只应在 app_main 的最前部调用一次；重复调用返回 ESP_ERR_INVALID_STATE。

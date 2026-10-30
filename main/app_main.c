@@ -7,6 +7,7 @@
 #include "audio_io.h"
 #include "audio_player.h"
 #include "board.h"
+#include "config_store.h"
 #include "diag.h"
 #include "esp_log.h"
 #include "prompt_assets.h"
@@ -61,12 +62,24 @@ void app_main(void)
     /* 先起观测能力：后续所有模块的初始化日志与自测命令都靠 console */
     ESP_ERROR_CHECK(diag_init());
 
+    /* 配置持久化要早于所有使用方（net_mgr/transport_ws/播放器音量都依赖它） */
+    ESP_ERROR_CHECK(cfg_init());
+
     ESP_LOGI(TAG, "booting esp-ai (mvp: wake + prompt)");
 
     ESP_ERROR_CHECK(board_init());
     ESP_ERROR_CHECK(audio_io_init());
     ESP_ERROR_CHECK(audio_player_init());
     audio_player_register_done_cb(on_play_done, NULL);
+
+    /* 启动时把 NVS 里的音量灌进播放器：这样 cfg set volume 重启后能听到效果 */
+    int volume = 0;
+    if (cfg_get_volume(&volume) == ESP_OK) {
+        ESP_ERROR_CHECK(audio_player_set_volume((uint8_t)volume));
+        ESP_LOGI(TAG, "volume restored: %d", volume);
+    } else {
+        ESP_LOGW(TAG, "read volume failed, keep player default");
+    }
 
     ESP_ERROR_CHECK(audio_fe_init(on_afe_event, NULL));
     const char *wn = audio_fe_wakenet_name();

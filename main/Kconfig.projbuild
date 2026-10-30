@@ -1,0 +1,36 @@
+menu "AI Device (WiFi / Cloud / Device)"
+
+    config AI_WIFI_SSID
+        string "Wi-Fi SSID (2.4GHz)"
+        default ""
+        help
+            设备联网用的 SSID。真实值写在本地 sdkconfig（已 gitignore）或 menuconfig 里，
+            不要提交到仓库、不要写进 sdkconfig.defaults*。
+
+    config AI_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            真实密码同样只放本地 sdkconfig。代码与日志都不得打印该值。
+
+    config AI_WS_URL
+        string "Cloud WebSocket URL"
+        default ""
+        help
+            形如 wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1（见 ARCHITECTURE §6.1）。
+            本地联调可用 tools/ws_mock_server.py 打印的 ws:// 地址（见 tools/README.md）。
+            留空时 T1.4 启动会明确报错，而不是静默连不上。
+
+    config AI_DEVICE_ID
+        string "Device ID"
+        default ""
+        help
+            设备唯一标识，握手与鉴权用（ARCHITECTURE §6.1）。
+
+    config AI_TOKEN
+        string "Device auth token"
+        default ""
+        help
+            设备鉴权 token；只放本地 sdkconfig，禁止提交、禁止打日志。
+
+endmenu

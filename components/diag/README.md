@@ -21,6 +21,11 @@
 | `log <tag>\|\* <level>` | 运行时调整日志级别，级别取 `none/error/warn/info/debug/verbose`；未知 TAG 或非法级别直接报错（不静默生效） |
 | `mic stat` | 麦克风统计窗口：电平 RMS/峰值（dBFS）、窗口时长与采样数、已喂帧数、I2S 读失败次数、收音开关、VAD、累计唤醒次数 |
 | `mic reset` | 清零麦克风统计窗口（帧数、失败次数、唤醒次数、电平一起清零） |
+| `cfg info` | NVS 分区条目用量（已用/空闲）+ 当前生效音量；提示 `cfg set` 的语义 |
+| `cfg get <key>` | 先按 int 读、再按 str 读；未设置时明确提示"未设置（使用缺省）"，不报错；返回的是 **NVS 原始值**（不做 clamp），业务语义值看 `cfg info` 或对应模块 API |
+| `cfg set <key> <int>` | **底层存储调试口**：原样写 int 到 NVS（不做范围/语义校验），重启后生效 |
+| `cfg setstr <key> <value>` | 写字符串（单参数，不支持空格） |
+| `cfg erase <key>` | 删除键，重启后恢复缺省；键本来不存在时提示而不算错误 |
 | `sys crash` | **仅开发配置**（`CONFIG_DIAG_ENABLE_CRASH_TEST=y`）：主动触发 panic，验证 coredump 落盘与解析；未编译时明确提示 |
 
 `mic stat` 的统计口径是**送 AFE 之前的麦克风真实数据**；半双工暂停收音（R1）时电平仍在累计，可用来确认"麦克风还在采、只是 AFE 吃静音"。RMS 的 `sqrt/log10` 在 console 任务侧计算，音频任务只做整数累加。
@@ -42,7 +47,7 @@
 
 ## 依赖
 
-- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计，私有依赖，不对外暴露头文件）。
+- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计）、`config_store`（`cfg` 读写 NVS），二者均为**私有依赖**，不对外暴露头文件。
 - IDF 配置：`CONFIG_FREERTOS_USE_TRACE_FACILITY`（任务枚举）与 `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` + `COUNTER_TYPE_U64`（CPU 占比，64 位计数避免 esp_timer 32 位约 71 分钟回绕）。已固化在 `sdkconfig.defaults.esp32s3`；若关掉 trace facility，`sys tasks` 会提示不可用而不是编译失败。
 - 硬件：UART0 115200，GPIO43/44（见 `docs/HARDWARE.md`）。
 

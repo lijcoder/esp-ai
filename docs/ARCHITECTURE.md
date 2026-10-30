@@ -141,7 +141,7 @@ TTS(MP3) ─┐
 |---|---|---|---|
 | `board` | L0 板级/驱动 | 引脚定义、按键、初始化顺序（LED 待 `dev_ctrl` 任务接入） | `board_init()`, `board_button_pressed()` |
 | `audio_io` | L0 板级/驱动 | I2S0 RX（16k 采集）/ I2S1 TX（48k 播放）HAL | `audio_io_init()`, `audio_io_read_mic()`, `audio_io_write_spk()`, `audio_io_spk_enable()` |
-| `config_store` | L1 基础服务 | NVS 读写（音量、设备状态）；编译期常量走 Kconfig | `cfg_get_int()`, `cfg_set_int()`, `cfg_get_str()`, `cfg_set_str()` |
+| `config_store` | L1 基础服务 | NVS 读写（音量、设备状态）+ 独占 `nvs_flash_init`；编译期常量（WiFi/WS/设备参数）走 Kconfig | `cfg_init()`, `cfg_get_int()`, `cfg_get_int_or()`, `cfg_set_int()`, `cfg_get_str()`, `cfg_set_str()`, `cfg_get_volume()`, `cfg_set_volume()`, `cfg_erase_key()` |
 | `net_mgr` | L1 基础服务 | WiFi STA 连接、自动重连、SNTP 对时、网络事件 | `net_init()`, `net_is_up()`, `net_wait_ready(ms)` |
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/重连/心跳/发送队列/二进制帧收发 | `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event） | `app_evt_register()`, `app_evt_post()` |
@@ -431,6 +431,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `wifi status` / `wifi reconnect` | 查看/重连 WiFi |
 | `net ping <host>` | 网络连通性 |
 | `mic stat` | 麦克风 RMS/峰值、VAD 状态 |
+| `cfg info` / `cfg get\|set\|setstr\|erase <key>` | 配置持久化调试：NVS 条目用量、原始值读写、删除键恢复缺省（存储层语义，不做业务校验） |
 | `audio vol <0-100>` | 设置音量 |
 | `audio play <file\|url>` | 手测播放 |
 | `audio stop` | 停止播放 |

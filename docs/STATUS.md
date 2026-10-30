@@ -68,6 +68,7 @@
 | 2026-10-30 | 排期 | 按 ROADMAP v1.3 重排：T0.5 前置、T0.1 后移到真机验证后、T0.7 分两轮；剩余顺序 T0.5 → T0.7① → T0.1 → T0.7② |
 | 2026-10-30 | 规范 | 日志 TAG 固定清单补 `APP`（`main/` 启动编排，不占组件层级）；CONVENTIONS §5 与 ARCHITECTURE §10.2 同步，供 T0.5 的 `log` 命令已知 TAG 表使用 |
 | 2026-10-30 | T0.5 | 新增 `components/diag`：启动信息横幅 + UART0 `esp_console` REPL（`esp-ai>`）+ `sys info/heap/tasks/reboot`、`log`（15 个固定 TAG，未知 TAG/非法级别报错）+ 可选堆监控任务；`main` 首位调用 `diag_init()`；`sdkconfig.defaults.esp32s3` 开 `FREERTOS_USE_TRACE_FACILITY`/`GENERATE_RUN_TIME_STATS`（`sys tasks` 需要）；`idf.py build` 通过，交互验收并入 T0.7① |
+| 2026-10-30 | 文档 | 真机验收发现 console 提示符被日志冲掉，登记为已知问题 X1：PRODUCT_IDEAS §8 技术调研记录（现象/根因/6 个候选方案对比/重评触发条件），§6 记录"暂不优化"决策；AGENTS 文档地图补 §8 |
 
 ## 4. 阻塞项
 

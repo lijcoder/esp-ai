@@ -24,7 +24,7 @@
 | 某个功能怎么设计 | `docs/ARCHITECTURE.md` | §1 范围、§3 音频、§4 模块、§6 协议、§7 状态机、§9 分区 |
 | 代码怎么写才合规 | `docs/CONVENTIONS.md` | 全文（约 90 行） |
 | 引脚 / 接线 / 电源 / 自检 | `docs/HARDWARE.md` | §2 引脚、§3 接线、§5 电源、§8 自检 |
-| 新功能要不要做 | `docs/PRODUCT_IDEAS.md` | §5 优先级矩阵、§6 决策记录 |
+| 新功能要不要做 / 已知技术问题怎么取舍 | `docs/PRODUCT_IDEAS.md` | §5 优先级矩阵、§6 决策记录、§8 技术调研记录 |
 | 暂缓功能预留了什么 | `docs/ARCHITECTURE.md` | 附录 A（预留点）、附录 B（待定输入） |
 | 协议字段细节 | `docs/PROTOCOL.md` | 空壳，P2 补全；此前以 ARCHITECTURE §6 为准 |
 | 文档怎么维护 / 边界 | `docs/CONVENTIONS.md` | §1 文档边界 |

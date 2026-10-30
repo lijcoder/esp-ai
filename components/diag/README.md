@@ -19,6 +19,10 @@
 | `sys reboot` | 软复位 |
 | `log` | 列出 15 个固定 TAG 的当前日志级别（含 `*` 全局级别） |
 | `log <tag>\|\* <level>` | 运行时调整日志级别，级别取 `none/error/warn/info/debug/verbose`；未知 TAG 或非法级别直接报错（不静默生效） |
+| `mic stat` | 麦克风统计窗口：电平 RMS/峰值（dBFS）、窗口时长与采样数、已喂帧数、I2S 读失败次数、收音开关、VAD、累计唤醒次数 |
+| `mic reset` | 清零麦克风统计窗口（帧数、失败次数、唤醒次数、电平一起清零） |
+
+`mic stat` 的统计口径是**送 AFE 之前的麦克风真实数据**；半双工暂停收音（R1）时电平仍在累计，可用来确认"麦克风还在采、只是 AFE 吃静音"。RMS 的 `sqrt/log10` 在 console 任务侧计算，音频任务只做整数累加。
 
 ## 已知 TAG
 
@@ -28,7 +32,7 @@
 
 ## 依赖
 
-- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）。
+- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计，私有依赖，不对外暴露头文件）。
 - IDF 配置：`CONFIG_FREERTOS_USE_TRACE_FACILITY`（任务枚举）与 `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` + `COUNTER_TYPE_U64`（CPU 占比，64 位计数避免 esp_timer 32 位约 71 分钟回绕）。已固化在 `sdkconfig.defaults.esp32s3`；若关掉 trace facility，`sys tasks` 会提示不可用而不是编译失败。
 - 硬件：UART0 115200，GPIO43/44（见 `docs/HARDWARE.md`）。
 
@@ -48,5 +52,5 @@
 
 ## 后续
 
-- T5.1：补 `wifi` / `net ping` / `mic stat` / `audio` / `voice` / `music` 命令（依赖对应模块就绪）。
+- T5.1：补 `wifi` / `net ping` / `audio` / `voice` / `music` 命令（依赖对应模块就绪；`mic stat` 已在 T0.7a 落地）。
 - T5.3：用 `CONFIG_DIAG_HEAP_MONITOR` 做 24h 压测的堆水位记录。

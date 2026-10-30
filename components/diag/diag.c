@@ -7,10 +7,12 @@
 #include "diag.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "audio_fe.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_console.h"
@@ -347,6 +349,92 @@ static int cmd_log(int argc, char **argv)
     return ESP_OK;
 }
 
+/* ---------------- mic 命令（麦克风观测，T0.7a） ---------------- */
+
+/*
+ * 幅度 → dBFS。用 0.1dB 定点输出（20·log10(x/32768) 的 10 倍），
+ * 不依赖 printf 的浮点格式，输出在任何 newlib 配置下都一致。
+ */
+static void print_db_line(const char *label, uint32_t linear)
+{
+    int deci;
+    int mag;
+
+    if (linear == 0) {
+        printf("  %s: %u（-inf，静音）\n", label, (unsigned)linear);
+        return;
+    }
+    deci = (int)lround(200.0 * log10((double)linear / 32768.0));
+    mag = deci < 0 ? -deci : deci;
+    printf("  %s: %u（%s%d.%d dBFS）\n", label, (unsigned)linear, deci < 0 ? "-" : "", mag / 10,
+           mag % 10);
+}
+
+static void print_mic_stats(void)
+{
+    audio_fe_stats_t st;
+    uint32_t rms = 0;
+    uint32_t window_ms = 0;
+
+    esp_err_t err = audio_fe_stats_read(&st);
+    if (err != ESP_OK) {
+        printf("读取麦克风统计失败: %s\n", esp_err_to_name(err));
+        return;
+    }
+    if (st.chunksize == 0) {
+        printf("音频前端未运行（audio_fe_start 未调用或启动失败）\n");
+        return;
+    }
+
+    /* RMS 用平方和现算；开方与 log 都在 console 任务侧，不占音频任务 */
+    if (st.sample_count > 0) {
+        rms = (uint32_t)lround(sqrt((double)st.sum_sq / (double)st.sample_count));
+        if (st.sample_rate) {
+            window_ms = (uint32_t)(((uint64_t)st.sample_count * 1000u) / st.sample_rate);
+        }
+    }
+
+    printf("麦克风统计：窗口 %u ms / %u 采样 @ %u Hz\n", (unsigned)window_ms,
+           (unsigned)st.sample_count, (unsigned)st.sample_rate);
+    print_db_line("电平", rms);
+    print_db_line("峰值", (uint32_t)st.peak);
+    printf("  采集: %u 帧 × %u 采样，I2S 读失败 %u 次\n", (unsigned)st.frames_fed,
+           (unsigned)st.chunksize, (unsigned)st.mic_read_errors);
+    if (st.feed_enabled) {
+        printf("  状态: 收音 开启，VAD %s，累计唤醒 %u 次\n", st.vad_active ? "人声" : "静音",
+               (unsigned)st.wake_count);
+    } else {
+        printf("  状态: 收音 暂停（R1 半双工，AFE 输入为静音），VAD %s，累计唤醒 %u 次\n",
+               st.vad_active ? "人声" : "静音", (unsigned)st.wake_count);
+    }
+    printf("  参考: 安静室内底噪 RMS≈40~270；正常说话峰值数百~4k\n");
+}
+
+static int cmd_mic(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: mic stat | reset\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(argv[1], "stat") == 0) {
+        print_mic_stats();
+        return ESP_OK;
+    }
+    if (strcmp(argv[1], "reset") == 0) {
+        esp_err_t err = audio_fe_stats_reset();
+        if (err != ESP_OK) {
+            printf("清零失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("麦克风统计已清零\n");
+        return ESP_OK;
+    }
+
+    printf("未知子命令: %s（可用: stat | reset）\n", argv[1]);
+    return ESP_ERR_INVALID_ARG;
+}
+
 /* ---------------- 堆水位周期监控（默认关闭） ---------------- */
 
 #if CONFIG_DIAG_HEAP_MONITOR
@@ -384,6 +472,12 @@ static esp_err_t register_commands(void)
             .help = "查看/设置日志级别：log 列出；log <tag>|* <level>",
             .hint = "[tag] [none|error|warn|info|debug|verbose]",
             .func = cmd_log,
+        },
+        {
+            .command = "mic",
+            .help = "麦克风统计：mic stat | reset",
+            .hint = "stat|reset",
+            .func = cmd_mic,
         },
     };
 

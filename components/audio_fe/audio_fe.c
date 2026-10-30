@@ -29,6 +29,46 @@ static volatile bool s_running = false;
 static volatile bool s_feed_enabled = true;
 static char s_wn_name[32] = {0};
 
+/* ---- 观测统计（mic stat）：只在 feed/fetch 任务里单写，命令侧只读 ---- */
+static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t s_stat_sum_sq;
+static uint32_t s_stat_samples;
+static int32_t s_stat_peak;
+static uint32_t s_stat_frames;
+static uint32_t s_stat_read_errors;
+static uint32_t s_stat_wake_count;
+static uint32_t s_stat_chunksize;
+static volatile bool s_stat_vad_active;
+
+/*
+ * 把一帧麦克风原始数据累加进统计窗口。
+ * 平方和/峰值先在临界区外算好，临界区只做合并，避免长时间关中断（音频任务敏感）。
+ */
+static void stats_accumulate(const int16_t *buf, int frames)
+{
+    uint64_t sum_sq = 0;
+    int32_t peak = 0;
+
+    for (int i = 0; i < frames; i++) {
+        int32_t v = buf[i];
+        if (v < 0) {
+            v = -v;
+        }
+        if (v > peak) {
+            peak = v;
+        }
+        sum_sq += (uint64_t)((int64_t)v * v);
+    }
+
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stat_sum_sq += sum_sq;
+    s_stat_samples += (uint32_t)frames;
+    if (peak > s_stat_peak) {
+        s_stat_peak = peak;
+    }
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
 static void feed_task(void *arg)
 {
     const int chunksize = s_afe->get_feed_chunksize(s_afe_data);
@@ -43,19 +83,31 @@ static void feed_task(void *arg)
     }
 
     ESP_LOGI(TAG, "feed task start: chunksize=%d ch=%d", chunksize, nch);
+    s_stat_chunksize = (uint32_t)chunksize;
     while (s_running) {
         /* 始终读麦克风以保持真实时间节奏；半双工时丢弃数据只喂静音 */
         int got = audio_io_read_mic(buf, (size_t)chunksize, 100);
         if (got < 0) {
             /* 读失败按 0 帧处理，避免负值参与后续指针运算 */
+            portENTER_CRITICAL(&s_stats_mux);
+            s_stat_read_errors++;
+            portEXIT_CRITICAL(&s_stats_mux);
             got = 0;
         }
         if (got < chunksize) {
             memset(buf + got, 0, (size_t)(chunksize - got) * sizeof(int16_t));
         }
-        if (!s_feed_enabled) {
-            memset(buf, 0, (size_t)chunksize * sizeof(int16_t));
+        /* 统计真实采到的样本（补零帧不计入电平）；暂停收音时也累加，
+         * 这样 mic stat 能区分"麦克风没声"和"AFE 吃静音"。 */
+        if (got > 0) {
+            stats_accumulate(buf, got);
         }
+        if (!s_feed_enabled) {
+            memset(buf, 0, (size_t)chunksize * nch * sizeof(int16_t));
+        }
+        portENTER_CRITICAL(&s_stats_mux);
+        s_stat_frames++;
+        portEXIT_CRITICAL(&s_stats_mux);
         s_afe->feed(s_afe_data, buf);
     }
 
@@ -76,12 +128,18 @@ static void fetch_task(void *arg)
             continue;
         }
 
-        if (res->wakeup_state == WAKENET_DETECTED && s_cb) {
-            s_cb(AUDIO_FE_EVT_WAKE, s_cb_arg);
+        if (res->wakeup_state == WAKENET_DETECTED) {
+            portENTER_CRITICAL(&s_stats_mux);
+            s_stat_wake_count++;
+            portEXIT_CRITICAL(&s_stats_mux);
+            if (s_cb) {
+                s_cb(AUDIO_FE_EVT_WAKE, s_cb_arg);
+            }
         }
 
         if (res->vad_state != last_vad) {
             last_vad = res->vad_state;
+            s_stat_vad_active = (last_vad == VAD_SPEECH);
             if (s_cb) {
                 s_cb(last_vad == VAD_SPEECH ? AUDIO_FE_EVT_VAD_SPEECH_START
                                             : AUDIO_FE_EVT_VAD_SPEECH_END,
@@ -189,4 +247,39 @@ bool audio_fe_feed_enabled(void)
 const char *audio_fe_wakenet_name(void)
 {
     return s_wn_name[0] ? s_wn_name : NULL;
+}
+
+esp_err_t audio_fe_stats_read(audio_fe_stats_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_stats_mux);
+    out->sum_sq = s_stat_sum_sq;
+    out->sample_count = s_stat_samples;
+    out->peak = s_stat_peak;
+    out->frames_fed = s_stat_frames;
+    out->mic_read_errors = s_stat_read_errors;
+    out->wake_count = s_stat_wake_count;
+    portEXIT_CRITICAL(&s_stats_mux);
+
+    out->chunksize = s_stat_chunksize;
+    out->sample_rate = AUDIO_IO_MIC_SAMPLE_RATE;
+    out->feed_enabled = s_feed_enabled;
+    out->vad_active = s_stat_vad_active;
+    return ESP_OK;
+}
+
+esp_err_t audio_fe_stats_reset(void)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stat_sum_sq = 0;
+    s_stat_samples = 0;
+    s_stat_peak = 0;
+    s_stat_frames = 0;
+    s_stat_read_errors = 0;
+    s_stat_wake_count = 0;
+    portEXIT_CRITICAL(&s_stats_mux);
+    return ESP_OK;
 }

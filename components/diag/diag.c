@@ -208,7 +208,6 @@ static void print_heap(void)
 #if CONFIG_FREERTOS_USE_TRACE_FACILITY
 static void print_tasks(void)
 {
-    UBaseType_t count;
     UBaseType_t capacity;
     UBaseType_t filled;
     TaskStatus_t *status;
@@ -216,9 +215,10 @@ static void print_tasks(void)
     configRUN_TIME_COUNTER_TYPE total_runtime = 0;
 #endif
 
-    /* 先取任务数量再分配：两次调用之间任务数可能变化，多给 4 个余量 */
-    count = uxTaskGetSystemState(NULL, 0, NULL);
-    capacity = count + 4;
+    /* 容量必须 >= 当前任务数：本内核版本的 uxTaskGetSystemState 不支持"传 NULL 查数量"，
+     * 容量不足时直接返回 0（T0.7① 真机验收发现 sys tasks 曾恒为 0 个任务）。
+     * 两次调用之间任务数可能变化，多给 8 个余量。 */
+    capacity = uxTaskGetNumberOfTasks() + 8;
     status = heap_caps_calloc(capacity, sizeof(TaskStatus_t), MALLOC_CAP_DEFAULT);
     if (status == NULL) {
         printf("内存不足，无法获取任务状态\n");
@@ -230,6 +230,11 @@ static void print_tasks(void)
 #else
     filled = uxTaskGetSystemState(status, capacity, NULL);
 #endif
+    if (filled == 0) {
+        printf("任务状态查询失败：容量 %u 不足\n", (unsigned)capacity);
+        heap_caps_free(status);
+        return;
+    }
 
     printf("%-16s %-4s %-6s %12s %6s\n", "任务", "状态", "优先级", "栈剩余(B)", "CPU");
     for (UBaseType_t i = 0; i < filled; i++) {

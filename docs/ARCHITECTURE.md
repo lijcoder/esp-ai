@@ -36,7 +36,7 @@
 | 音量控制 | 无数字音量（MAX98357A 增益由 SD_MODE 电阻固定） | 软件 16bit 数字音量 + 软限幅 |
 | 拾音 | 单麦全向，远场约 2~3m | 唤醒阈值按实测标定 |
 | 引脚 | MIC: 5/6/4；AMP: 41/42/40；LED: 48；按键: 0 | 避开 26-37/19-20/43-44 |
-| 内部 RAM | 当前固件 DIRAM 已用 126KB / 341KB | 设计目标：峰值占用 ≤ 310KB，保留 ≥ 30KB 内部堆 |
+| 内部 RAM | 当前固件 DIRAM 已用 137.6KB / 341.8KB（2026-10-30，含 coredump） | 设计目标：峰值占用 ≤ 310KB，保留 ≥ 30KB 内部堆 |
 | 分区 | 见第 9.1 节（定稿） | app 双槽位预留给后续 OTA，代码当前版本不实现 |
 
 **结论**：音频链路为 16k 采集 + 48k 播放的双时钟结构；当前不实现 AEC，采用半双工。
@@ -377,7 +377,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | ota_1 | app | ota_1 | 0x320000 | 3M | 预留 OTA 槽位（当前版本不用） |
 | model | data | spiffs | 0x620000 | 1536K | srmodels（WakeNet + VAD） |
 | assets | data | spiffs | 0x7a0000 | 2M | 提示音、默认配置 |
-| coredump | data | coredump | 0x9a0000 | 64K | 崩溃现场（diag 使用） |
+| coredump | data | coredump | 0x9a0000 | 64K | 崩溃现场（已启用落盘：`CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`，`idf.py coredump` 解析） |
 | storage | data | fat | 0x9b0000 | 6400K | 本地音乐/缓存/日志 |
 
 说明：分区表一次定稿，app 双槽位为后续 OTA 预留（当前版本不实现 OTA 代码）；尾部预留 64KB。

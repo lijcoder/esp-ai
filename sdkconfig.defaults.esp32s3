@@ -22,4 +22,6 @@ CONFIG_SPIRAM=y
 # diag 的 sys tasks：任务枚举要 trace facility，CPU 占用要运行统计
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64=y
+# 崩溃现场落 coredump 分区（ARCH §9.1 / CONVENTIONS §8：idf.py coredump 解析）
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 

@@ -8,11 +8,11 @@
 
 | 项目 | 内容 |
 |---|---|
-| 当前阶段 | **P0 地基** |
-| 当前任务 | T0.7①C 已完成（真机：唤醒 3/3、R1/R2 正常、底噪/说话电平/运行期堆水位已入基线）；下一步 T0.1 |
-| 下一步 | T0.1 分区表替换（不可逆，先备份）→ T0.7② 回归 → P1 |
+| 当前阶段 | **P0 地基（已完成）→ P1 联网** |
+| 当前任务 | P0 收尾完成：T0.1 分区表已换（9 分区 + coredump 启用）、T0.7② 回归通过（唤醒 3/3、R1/R2、模型从 1536K 分区加载） |
+| 下一步 | P1：T1.5 `tools/ws_mock_server.py`（可立即起，不依赖硬件）→ T1.1 `config_store`（nvs 分区已就绪）→ T1.2a 事件定义 → T1.3 `net_mgr` → T1.4 `transport_ws` → T1.6 联调 |
 | 最后更新 | 2026-10-30 |
-| 阻塞项 | 无（开发板 `/dev/cu.usbmodem5CF90746951` 可烧录）；X1「提示符与日志互冲」仍按 PRODUCT_IDEAS §8 方案 A 接受，真机验收已用"脚本读串口 + `log * warn` 降噪"的替代口径通过 |
+| 阻塞项 | 无（开发板 `/dev/cu.usbmodem5CF90746951` 可烧录）；X1「提示符与日志互冲」仍按 PRODUCT_IDEAS §8 方案 A 接受，真机验收用"脚本读串口 + `log * warn` 降噪"替代口径 |
 
 ## 2. 任务看板
 
@@ -20,13 +20,13 @@
 
 | 阶段 | 编号 | 任务 | 状态 |
 |---|---|---|---|
-| P0 | T0.1 | 替换分区表并烧录校验 | ☐ |
+| P0 | T0.1 | 替换分区表并烧录校验（9 分区 + coredump） | ☑ |
 | P0 | T0.2 | 组件骨架（5 个已建，其余随任务创建） | ☑ |
 | P0 | T0.3 | board：引脚、按键 | ☑ |
 | P0 | T0.4 | audio_io：双 I2S（16k 采集 / 48k 播放） | ☑ |
 | P0 | T0.5 | diag + esp_console 框架 | ☑ |
 | P0 | T0.6 | POC 迁移，删除旧代码 | ☑ |
-| P0 | T0.7 | P0 交付自检 + 基线记录 | ◐ |
+| P0 | T0.7 | P0 交付自检 + 基线记录（两轮均通过） | ☑ |
 | P0 | T0.7a | diag 增 `mic stat`/`mic reset`（基线观测，T0.7 前置） | ☑ |
 | P1 | T1.1 | config_store | ☐ |
 | P1 | T1.2 | event_bus | ☐ |
@@ -76,6 +76,8 @@
 | 2026-10-30 | T0.7a | 新增 `mic stat`/`mic reset`：`audio_fe` 暴露只读统计（sum_sq/peak/sample_count/帧数/读失败/唤醒数/VAD/feed 状态），feed 任务内只做整数累加、临界区只合并，`sqrt/log10` 放 console 侧；顺手修掉"暂停收音补零只清 1 通道"的隐患（缓冲是 chunksize×nch）；`diag` 以 `PRIV_REQUIRES audio_fe` 私有依赖；`idf.py build` 通过且零警告，size 956,180 B（+3,436 B，主要来自 newlib math），DIRAM 131,358 B（+40 B）；真机验收随 T0.7①C 进行 |
 | 2026-10-30 | T0.7①C | 真机复测（`mic stat`）：**底噪** 安静段 RMS 104~220（-49.0~-43.5 dBFS）、峰值 502（-36.3 dBFS），与历史 40~270 / -45~-53 dBFS 吻合；**说话** 峰值 4228（-17.7 dBFS）；**唤醒 3/3**（21.7s / 24.4s / 27.1s），R1 播放期 feed 暂停、R2 恢复均可见；console 验收通过（`log` 副作用生效、`mic stat/reset`、`sys info/heap/tasks`、`sys reboot` 见重启横幅）。首次采样（开机窗口）环境在放音乐/视频，RMS 2686~4149、峰值 30208（-0.7 dBFS），**不作为底噪基线**。采样期另出现第 4 次唤醒（用户说话/环境声期间），安静环境需复核是否误唤醒（并入 T5.2） |
 | 2026-10-30 | **fix(diag)** | 真机发现 `sys tasks` 恒为"共 0 个任务"：本内核版本的 `uxTaskGetSystemState` **不支持**"传 `NULL` 查数量"，容量不足时直接返回 0；改为用 `uxTaskGetNumberOfTasks()+8` 定容量并加失败提示。修复后读到 8 个任务（afe_feed / afe_fetch / player / console_repl / IDLE0 / IDLE1 / ipc0 / ipc1），`afe_fetch` 栈剩 2060/4096 B、`afe_feed` 5932/8192 B；size 956,272 B（+92 B） |
+| 2026-10-30 | T0.1 | 分区表切换到 ARCH §9.1 定稿（nvs/otadata/phy_init/ota_0/ota_1/model/assets/coredump/storage；app 偏移 0x10000→0x20000，model 5168K→1536K）；`gen_esp32part.py` 校验无重叠越界；`erase-flash` 全片擦除后重烧四段；bootloader 识别 9 个分区、app 从 0x20000 启动、`esp_core_dump_flash` 找到 coredump 分区、srmodels 从 1536K 分区加载成功；sdkconfig 由 defaults 重新生成（仅 coredump 相关项变化，其余逐项核对保留）；启用 `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`；size 974,108 B（+17.8KB，coredump 代码 + ISR 栈 +560B/核），DIRAM 137,578 B（+6.2KB） |
+| 2026-10-30 | T0.7② | 分区表改后回归：唤醒 3/3（10.9s/16.3s/29.9s）、R1 `feed paused`→播放 12800 样本→R2 `feed resumed`（间隔 1.35s，符合 300ms 延时）、底噪 RMS 167~291（-45.9~-41.0 dBFS）、说话峰值 4148~4189（-18.0 dBFS）、`sys tasks` 8 个任务、运行期内部 RAM 峰值 127,468 B / PSRAM 峰值 692,444 B、无 ERROR 日志。附带观察：两轮采样都在 3 次唤醒后出现第 4 次唤醒（用户说话/环境声期间），需在安静环境复核是否误唤醒（并入 T5.2） |
 
 ## 4. 阻塞项
 
@@ -93,6 +95,7 @@
 | 2026-10-30 | P0（T0.7 唤醒修复后） | 952,744 B | 131,318 B（DIRAM 已用，剩余 210,442 B） | —（开机横幅 PSRAM 剩余 8,386,148 B，峰值未采） | 真机验证：3/3 唤醒 + 提示音正常；对比 T0.5 基线 -20B（净变化 = 超时单位修复 + 读失败健壮性 - 临时诊断打点）。实测底噪：麦克风 RMS≈40~270、AFE 输入 -45~-53 dBFS（临时打点测得，打点已移除） |
 | 2026-10-30 | P0（T0.7a mic stat） | 956,180 B | 131,358 B（DIRAM 已用，剩余 210,402 B） | —（未采） | `idf.py build` 通过、零警告；+3,436 B 主要来自 newlib math（`sqrt`/`log10`）+ 命令文本 + 统计代码，DIRAM +40 B（统计变量 + 临界区）；真机未验证，基线数据待 T0.7①C 用 `mic stat` 复测 |
 | 2026-10-30 | P0（T0.7①C 真机基线） | 956,272 B | 运行期内部 RAM 峰值占用 126,924 B（`sys heap` 口径 total−min_free，最低水位 198,943 B，剩余 203,479 B） | PSRAM 峰值占用 692,444 B（剩余 7,693,300 B，最大块 7,602,176 B） | 唤醒 3/3；底噪 RMS 104~220（-49.0~-43.5 dBFS）/峰值 502；说话峰值 4228（-17.7 dBFS）；`sys tasks` 修复后 8 个任务；固件含 T0.7a + diag 修复 |
+| 2026-10-30 | P0（T0.1 分区表 + coredump） | 974,108 B | 运行期内部 RAM 峰值占用 127,468 B（`sys heap` 口径 total−min_free，最低水位 192,979 B，剩余 197,543 B） | PSRAM 峰值占用 692,444 B（剩余 7,693,300 B） | 真机：9 分区生效、app@0x20000、model@0x620000（1536K）、coredump 可用；唤醒 3/3 + R1/R2 正常；+17.8KB 来自 coredump |
 | — | P1 |  |  |  |  |
 | — | P2 |  |  |  |  |
 | — | P3 |  |  |  |  |

@@ -13,6 +13,7 @@
 #include "event_bus.h"
 #include "net_mgr.h"
 #include "prompt_assets.h"
+#include "transport_ws.h"
 
 static const char *TAG = "APP";
 
@@ -95,6 +96,11 @@ void app_main(void)
     /* 联网放在音频链路之后：唤醒/播放是本地核心能力，不能被 WiFi 初始化拖慢；
      * 未配置 SSID 时 net_init 内部降级为离线（只 WARN），不影响本地功能 */
     ESP_ERROR_CHECK(net_init());
+
+    /* WebSocket 传输放在联网之后：它订阅 NET_UP/NET_DOWN（T1.4），
+     * 未配置 WS_URL 时 ws_init 只 WARN 并降级离线，本地功能不受影响 */
+    ESP_ERROR_CHECK(ws_init());
+    ws_start();
 
     ESP_LOGI(TAG, "ready, say \"Hi Lexin\"");
 }

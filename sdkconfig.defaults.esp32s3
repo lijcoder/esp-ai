@@ -33,3 +33,13 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 
 # 开发期：sys crash 用于验证 coredump 落盘/解析；量产固件必须关闭
 CONFIG_DIAG_ENABLE_CRASH_TEST=y
+
+# T1.4（PRODUCT_IDEAS §8 X3 方案 A/B）：WS + TLS 要占用内部 RAM，
+# T1.3 基线空闲堆只剩 79KB、最大连续块 31.7KB，按 X3 先做两件低风险裁剪：
+# A. WiFi 静态 RX 缓冲 10→6（上行 4KB/s、下行 3KB/s 的小流量足够，省约 6.4KB）
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+# 注：动态 RX/TX 缓冲 32→16 在 T1.4 实测对 TLS 峰值没有改善（动态缓冲按需分配），
+# 因此保持 IDF 默认值不引入未验证偏差；内部 RAM 余量的统一优化按 X3 在 P2 前做
+# B. TLS 记录缓冲 16K/4K → 8K/2K（音频走二进制帧、JSON 帧很小，省约 10KB 握手期堆）
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048

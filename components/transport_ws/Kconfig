@@ -1,0 +1,55 @@
+menu "WebSocket Transport"
+
+    config WS_TX_QUEUE_BYTES
+        int "发送队列总容量（字节，放 PSRAM）"
+        range 1024 32768
+        default 8192
+        help
+            transport_ws 的发送队列：ws_send_text/ws_send_bin 只入队（非阻塞），
+            由 `ws` 任务按序发出。队列放在 PSRAM（CONVENTIONS §4；PRODUCT_IDEAS §8 X3
+            方案 D：原设计 24KB 内部 RAM 改为 8KB PSRAM）。队列满时丢帧 + 限频 WARN，
+            绝不阻塞调用方（音频路径只能入队，不能等）。
+
+    config WS_TX_MSG_BYTES
+        int "发送队列单槽大小（字节）"
+        range 128 1024
+        default 256
+        help
+            单个待发消息的上限，直接影响队列槽位数（= 总容量 / 单槽）。
+            当前上行帧是 Opus 20ms（payload 约 40B + 8B 头），文本帧是短视频 JSON，
+            256B 足够；改大前先评估 PSRAM 占用。
+
+    config WS_TASK_STACK
+        int "`ws` 任务栈（字节）"
+        range 4096 8192
+        default 6144
+        help
+            按 ARCHITECTURE §9.3：核 0 / 优先级 5 / 6KB。负责任务状态机、退避、
+            心跳与发送队列出队。
+
+    config WS_CLIENT_TASK_STACK
+        int "esp_websocket_client 内部任务栈（字节）"
+        range 3072 8192
+        default 6144
+        help
+            WS 客户端的收包/握手任务（库任务，类似 wifi/sys_evt，不占 §9.3 的应用任务表）。
+            它要跑 TLS 握手与事件分发，实测默认 4096 偏紧；默认按 6KB 留余量。
+
+    config WS_RX_BUFFER_BYTES
+        int "单帧收包缓冲（字节）"
+        range 1024 4096
+        default 2048
+        help
+            下行单帧最大长度；超过会被客户端分片，本组件按 payload_offset 重组，
+            重组后仍超过该值则丢弃并 WARN（计入 rx_bad）。当前最大的下行帧是
+            TTS 音频帧（8B 头 + 约 200B payload）与短 JSON。
+
+    config WS_SEND_TIMEOUT_MS
+        int "单次发送超时（毫秒）"
+        range 100 5000
+        default 1000
+        help
+            `ws` 任务调用 esp_websocket_client_send_* 的超时，只影响 `ws` 任务自身；
+            调用方永不等待（只入队）。
+
+endmenu

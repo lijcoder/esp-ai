@@ -1,0 +1,6 @@
+## transport_ws 的托管依赖：Espressif 官方 WebSocket 客户端（Apache-2.0）。
+## 评估记录见 components/transport_ws/README.md「依赖评估」：只引入这一个组件，
+## 它自带 WS 握手/掩码/分片/关闭握手，避免自研 RFC6455 客户端的分片与掩码 bug；
+## 内存增量实测值在 T1.4 基线里记录（ARCHITECTURE §9.2）。
+dependencies:
+  espressif/esp_websocket_client: "^1.2.0"

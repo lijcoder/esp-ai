@@ -30,6 +30,7 @@
 #include "net_mgr.h"
 #include "nvs.h"
 #include "sdkconfig.h"
+#include "transport_ws.h"
 
 static const char *TAG = "DIAG";
 
@@ -664,6 +665,71 @@ static int cmd_wifi(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- ws 命令（WebSocket 观测，T1.4） ---------------- */
+
+static void print_ws_status(void)
+{
+    ws_status_t st;
+    esp_err_t err = ws_status_read(&st);
+    if (err != ESP_OK) {
+        printf("读取 WebSocket 状态失败: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("WebSocket 状态: %s（%s）\n", ws_state_name(st.state),
+           st.started ? "已请求在线" : "未请求在线");
+    if (!st.url_configured) {
+        printf("  端点: 未配置（CONFIG_AI_WS_URL 为空或非法，云端链路关闭）\n");
+        return;
+    }
+
+    printf("  端点: %s（%s）\n", st.endpoint, st.tls ? "wss/TLS" : "ws 明文，仅本地联调");
+    if (st.state == WS_STATE_BACKOFF) {
+        printf("  重连: 累计 %u 次，%u ms 后重试\n", (unsigned)st.retry_count,
+               (unsigned)st.next_retry_ms);
+    } else {
+        printf("  重连: 累计 %u 次，当前无待执行重试\n", (unsigned)st.retry_count);
+    }
+    printf("  握手完成: %u 次，最近心跳 RTT: %u ms\n", (unsigned)st.connect_count,
+           (unsigned)st.last_rtt_ms);
+    printf("  发送: 文本 %u / 二进制 %u，丢弃 %u；队列 %u/%u\n", (unsigned)st.tx_text,
+           (unsigned)st.tx_bin, (unsigned)st.tx_dropped, (unsigned)st.queue_used,
+           (unsigned)st.queue_cap);
+    printf("  接收: 文本 %u / 二进制 %u，坏帧 %u\n", (unsigned)st.rx_text, (unsigned)st.rx_bin,
+           (unsigned)st.rx_bad);
+    printf("  说明: 每 20s 发 ping、10s 未收 pong 判离线；掉线按 1/2/5/10/30s 退避\n");
+}
+
+static int cmd_ws(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: ws status | reconnect\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(argv[1], "status") == 0) {
+        print_ws_status();
+        return ESP_OK;
+    }
+
+    if (strcmp(argv[1], "reconnect") == 0) {
+        esp_err_t err = ws_reconnect();
+        if (err == ESP_ERR_INVALID_STATE) {
+            printf("无法重连：未初始化或未配置 CONFIG_AI_WS_URL\n");
+            return ESP_OK;
+        }
+        if (err != ESP_OK) {
+            printf("重连失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("已请求重连（退避已重置，可用 ws status 观察）\n");
+        return ESP_OK;
+    }
+
+    printf("未知子命令: %s（可用: status | reconnect）\n", argv[1]);
+    return ESP_ERR_INVALID_ARG;
+}
+
 /* ---------------- evt 命令（事件总线观测，T1.2a） ---------------- */
 
 /*
@@ -904,6 +970,12 @@ static esp_err_t register_commands(void)
             .help = "网络状态：wifi status | reconnect",
             .hint = "status|reconnect",
             .func = cmd_wifi,
+        },
+        {
+            .command = "ws",
+            .help = "WebSocket 状态：ws status | reconnect",
+            .hint = "status|reconnect",
+            .func = cmd_ws,
         },
     };
 

@@ -143,7 +143,7 @@ TTS(MP3) ─┐
 | `audio_io` | L0 板级/驱动 | I2S0 RX（16k 采集）/ I2S1 TX（48k 播放）HAL | `audio_io_init()`, `audio_io_read_mic()`, `audio_io_write_spk()`, `audio_io_spk_enable()` |
 | `config_store` | L1 基础服务 | NVS 读写（音量、设备状态）+ 独占 `nvs_flash_init`；编译期常量（WiFi/WS/设备参数）走 Kconfig | `cfg_init()`, `cfg_get_int()`, `cfg_get_int_or()`, `cfg_set_int()`, `cfg_get_str()`, `cfg_set_str()`, `cfg_get_volume()`, `cfg_set_volume()`, `cfg_erase_key()` |
 | `net_mgr` | L1 基础服务 | WiFi STA 连接、退避重连、SNTP 对时、网络事件（无独立任务：事件回调 + 一次性定时器） | `net_init()`, `net_is_up()`, `net_wait_ready(ms)`, `net_is_time_synced()`, `net_get_info()`, `net_reconnect()` |
-| `transport_ws` | L1 基础服务 | wss 客户端：连接/重连/心跳/发送队列/二进制帧收发 | `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()` |
+| `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发 | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
 | `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 回调（上行音频读取随 P2 增加） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()` |
 | `audio_player` | L2 音频引擎 | 播放引擎：PCM 播放 + 重采样到 48k + 软件音量 + 淡入淡出（多通道/MP3/HTTP 随 P2–P4 增加） | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_register_done_cb()`, `audio_player_set_volume()` |
@@ -409,6 +409,9 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | PSRAM | AFE 缓冲 ~200KB、播放 ring 1MB（三通道合计）、HTTP 缓冲 128KB、解码器状态、预留 4MB+ |
 | Flash | app 2×3M（一槽使用）、model 1.5M、assets 2M、storage 6.25M |
 
+> T1.4 实测（见 STATUS §5 基线）：`ws://` 连接时内部堆峰值 209,252 B；`wss`/TLS 握手期峰值 236,544 B、**最低水位 27,655 B**（略低于上面「保留 ≥30KB」的目标）。
+> WS 发送队列 8KB 已按约定放 PSRAM；内部 RAM 余量的统一优化按 [PRODUCT_IDEAS §8 X3](PRODUCT_IDEAS.md) 排在 P2 前（触发条件已命中）。
+
 ### 9.3 任务与核心（确定）
 
 | 任务 | 核 | 优先级 | 栈 | 职责 |
@@ -417,7 +420,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `afe_fetch` | 1 | 6 | 4KB | 唤醒/VAD/上行音频输出 |
 | `player` | 1 | 5 | 6KB | MP3 解码 + 重采样 + 混音 + I2S 写 |
 | `evt` | 0 | 5 | 4KB | 事件分发（`event_bus` 自建 esp_event 循环，T1.2a 起） |
-| `ws` | 0 | 5 | 6KB | WebSocket/TLS 收发 |
+| `ws` | 0 | 5 | 6KB | WS 状态机/退避/心跳/发送队列（TLS 收发在库任务 `ws_client`） |
 | `music_http` | 0 | 4 | 6KB | HTTP 拉流 |
 | `voice_session` | 0 | 4 | 4KB | 状态机事件循环 |
 | `dev` | 0 | 3 | 3KB | 按键扫描 + LED 驱动 |
@@ -426,6 +429,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 原则：核 1 只跑音频路径，不受网络抖动影响；跨核只通过队列/ringbuffer。
 
 > 上表是**应用任务**；IDF 库任务（`sys_evt`、`wifi`、`esp_timer`、`Tmr Svc`、`IDLE`、`ipc`）不在此表。
+> `transport_ws` 的 `esp_websocket_client` 另建一个库任务 `ws_client`（核 0 / 优先级 5 / 6KB，T1.4 起），收包回调在它上面执行。
 > `net_mgr` 的 WiFi/IP 事件处理器运行在 `sys_evt` 任务上，其栈由 `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096` 提供（P1 T1.3 实测默认 2304 B 时只剩 380 B，已加栈）。
 
 ---
@@ -454,6 +458,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `sys reboot` | 软复位 |
 | `log <tag> <level>` | 运行时调整日志级别 |
 | `wifi status` / `wifi reconnect` | 查看/重连 WiFi |
+| `ws status` / `ws reconnect` | WebSocket 观测：状态/脱敏端点/握手与重连计数/心跳 RTT/收发送与丢弃计数/队列水位；主动重连（T1.4 提前交付） |
 | `net ping <host>` | 网络连通性 |
 | `mic stat` | 麦克风 RMS/峰值、VAD 状态 |
 | `cfg info` / `cfg get\|set\|setstr\|erase <key>` | 配置持久化调试：NVS 条目用量、原始值读写、删除键恢复缺省（存储层语义，不做业务校验） |

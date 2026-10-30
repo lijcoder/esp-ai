@@ -9,9 +9,9 @@
 | 项目 | 内容 |
 |---|---|
 | 当前阶段 | **P0 地基（已完成）→ P1 联网（进行中）** |
-| 当前任务 | P1 T1.1 完成：`config_store`（NVS 音量持久化 + 越界 clamp）+ `main/Kconfig.projbuild`（WiFi/WS/设备参数）+ `diag` 的 `cfg` 命令；真机验收 20/20 PASS（写入 42 → 重启仍 42、启动 `PLAYER: volume=42`、缺省 60、150 越界读侧 clamp、erase 后重启回缺省、字符串键、非法整数拒绝）；固件 995,372 B（+21.3KB，NVS 引擎为主），内部 RAM 峰值 128,500 B（+1,032 B），PSRAM 峰值 692,476 B（+32 B） |
-| 下一步 | P1：T1.2a 事件定义 → T1.3 `net_mgr`（WiFi/重连/SNTP）→ T1.4 `transport_ws`（用 mock 联调）→ T1.6 联调与基线 |
-| 最后更新 | 2026-10-30 |
+| 当前任务 | P1 T1.2a 完成：新增 `components/event_bus`（L1，独立 esp_event 循环，13 个事件 + 定长 32B payload + 注册/分发封装，任务 `evt` 核 0/优先级 5/栈 4KB，队列 Kconfig 默认 16，投递非阻塞）+ `diag` 的 `evt list/post/burst/trace` 命令 + `EVT` 日志 TAG（全工程 16 个）+ `main` 一行 `app_evt_init()`；真机 10/10 PASS（`evt list` 13 个事件、trace 下 `NET_UP/NET_DOWN` 示例 payload 正确、`WAKE_DETECTED` 无 payload、非法事件名拒绝、`burst 64` 成功 48/丢弃 16 且不阻塞、trace off 后不再打印、唤醒 4/4 + R1/R2 正常、无 ERROR）；固件 1,003,936 B（+8,564 B，`esp_event` 库 + `evt` 命令 + 命令文本），内部 RAM 峰值 133,460 B（+4,960 B，`evt` 任务栈 4KB 为主），PSRAM 峰值 693,200 B（+724 B），任务数 9 |
+| 下一步 | P1：T1.3 `net_mgr`（WiFi/退避重连 1s→30s/SNTP，产出 `NET_UP/NET_DOWN` 事件）→ T1.4 `transport_ws`（订阅 `NET_UP`，用 mock 联调）→ T1.6 联调与基线；T1.2b（唤醒/VAD/播放改走事件）随 P2 的 T2.5/T3.1 落地 |
+| 最后更新 | 2026-10-31 |
 | 阻塞项 | 无（开发板 `/dev/cu.usbmodem5CF90746951` 可烧录）；X1「提示符与日志互冲」仍按 PRODUCT_IDEAS §8 方案 A 接受，真机验收用"脚本读串口 + `log * warn` 降噪"替代口径 |
 
 ## 2. 任务看板
@@ -30,7 +30,7 @@
 | P0 | T0.7a | diag 增 `mic stat`/`mic reset`（基线观测，T0.7 前置） | ☑ |
 | P0 | T0.7b | diag 增 `sys crash`，验证 coredump 落盘/解析链路 | ☑ |
 | P1 | T1.1 | config_store | ☑ |
-| P1 | T1.2 | event_bus | ☐ |
+| P1 | T1.2 | event_bus（a 事件定义/分发封装；b 业务接线） | ◐ |
 | P1 | T1.3 | net_mgr（WiFi/重连/SNTP） | ☐ |
 | P1 | T1.4 | transport_ws | ☐ |
 | P1 | T1.5 | ws_mock_server.py | ☑ |
@@ -83,6 +83,7 @@
 | 2026-10-30 | T1.5 | 新增 `tools/ws_mock_server.py`（单文件，PEP 723 依赖 `websockets>=14`，`uv run` 即用）：按 ARCH §6.1–6.3 实现 hello / ping-pong / audio_start-end / asr-llm-tts 下发 / interrupt / music 骨架，8 字节二进制帧收发与严格校验，`--self-test` 9 项，`--no-tts`/`--drop-pong`/`--close-after`/`--save-upload`/`--scenario normal\|error\|music`；补 `tools/README.md`。**零固件改动**（size 保持 974,108 B）。实测：自测 9/9 PASS；模拟设备客户端 ping rtt 0.3ms、100 帧 TTS 流 seq 连续（末帧相对首帧 2.2s）、第 2 轮 interrupt 后不再有 `tts_end`；no-tts/error/music/close-after/upload 五个 CLI 分支均验证通过 |
 | 2026-10-30 | 文档 | T1.5 暴露的契约缺口登记到 `PROTOCOL.md`「实现中发现的契约待确认项」7 条（hello 无应答、二进制帧无 sid、音乐 sid 归属、error 码表、鉴权关闭码、pong 格式、本地 ws 与线上 wss 的证书策略），P2/T2.5 定稿时逐条确认；证书策略同时登记 `PRODUCT_IDEAS.md` §8 X2 |
 | 2026-10-30 | T1.1 | 新增 `components/config_store`（L1，只依赖 `nvs_flash`）：独占 `nvs_flash_init`（含 NO_FREE_PAGES/NEW_VERSION 擦除重试）、命名空间 `cfg`、键 `volume`（i32）、通用 int/str 读写 + `cfg_get_volume/cfg_set_volume`（写前 clamp、读侧兜底 clamp + WARN）+ `cfg_erase_key`/`cfg_get_usage`；`main/Kconfig.projbuild` 定义 `CONFIG_AI_WIFI_SSID/PASSWORD/WS_URL/DEVICE_ID/TOKEN`（默认空，真实值只放本地 `sdkconfig`）；`app_main` 在 `diag_init` 后 `cfg_init`、`audio_player_init` 后按 NVS 音量设置播放器；`diag` 增 `cfg info/get/set/setstr/erase`（`PRIV_REQUIRES config_store nvs_flash`）；`ARCHITECTURE §4.1` 接口列同步。真机验收 20/20 PASS：`cfg set volume 42` → 重启 `CFG: 音量=42（来自 NVS）` + `PLAYER: volume=42` + `APP: volume restored: 42`；`cfg set volume 150` 落盘原值、`cfg info` 读侧 clamp 100 + `W (..) CFG: 音量越界 150`；`cfg erase volume` + 重启回缺省 60；`cfg setstr/get dev_name` 正常；`cfg set volume abc` 拒绝；`cfg get` 保留"读原始值"的底层语义。`idf.py build` 零警告；固件 995,372 B（+21.3KB，NVS 引擎/分区访问为主）、DIRAM 137,610 B（+32 B）、运行期内部 RAM 峰值 128,500 B（+1,032 B）、PSRAM 峰值 692,476 B（+32 B）、任务数仍 8 |
+| 2026-10-31 | T1.2a | 新增 `components/event_bus`（L1，只依赖 `esp_event`）：`APP_EVT` 基 + 13 个事件（与 ARCH §4.2 逐字一致，`APP_EVT_ANY` 用于订阅全部）+ 定长 32B `app_evt_data_t`（P1 只有 `NET_UP`/`NET_DOWN` 带 payload，其余投 `NULL`；文本类 payload 所有权留给 T2.5/T3.1）+ `app_evt_init/register/unregister/post/name`（8 个处理器槽位、post 非阻塞、队列满 WARN + `ESP_ERR_TIMEOUT`）；自建独立 esp_event 循环（任务 `evt` 核 0/优先级 5/栈 4KB，队列 `CONFIG_EVENT_BUS_QUEUE_SIZE` 默认 16），不占 default loop 以免与 WiFi/esp_netif 互相阻塞；**音频任务只许投无 payload 事件**（esp_event 带 payload 会内部 `calloc`）写入头文件与 README；`diag` 新增 `evt list/post/burst/trace`（`PRIV_REQUIRES event_bus`），日志 TAG 增 `EVT`（16 个）；`main/app_main.c` 在 `cfg_init` 后加一行 `app_evt_init()`，业务接线不动（T1.2b）。真机 10/10 PASS：`evt list` 13 个事件；trace 下 `NET_UP ip=10.0.0.42 rssi=-42`、`NET_DOWN reason=2 retry=1000 ms` 在 `evt` 任务上下文打印；`WAKE_DETECTED` 无 payload 正常；非法事件名拒绝（`ESP_ERR_INVALID_ARG`）；`burst 64` 成功 48/丢弃 16（queue=16，不阻塞、WARN 可见）；trace off 后 `evt post BUTTON` 不再打印；唤醒 4/4 + R1/R2 正常（`feed paused`→`play 12800 samples`→`feed resumed`）；`log` 列出 16 个 TAG（含 `EVT`）且 `log EVT debug` 可设；`sys tasks` 9 个任务（`evt` 栈剩余 1,660/4,096 B）；无 ERROR。`idf.py build` 零警告；固件 1,003,936 B（+8,564 B：`esp_event` 3.3KB + `event_bus` 1.0KB + `evt` 命令/文本），DIRAM 138,070 B（+460 B），运行期内部 RAM 峰值 133,460 B（+4,960 B，`evt` 任务栈 4KB 为主），PSRAM 峰值 693,200 B（+724 B）。附注：`app_evt_post()` 的投递打点是 DEBUG 级，本工程 `CONFIG_LOG_MAXIMUM_LEVEL=INFO` 时编译期被裁掉，运行期观测用 `evt trace on` |
 
 ## 4. 阻塞项
 
@@ -103,6 +104,7 @@
 | 2026-10-30 | P0（T0.1 分区表 + coredump） | 974,108 B | 运行期内部 RAM 峰值占用 127,468 B（`sys heap` 口径 total−min_free，最低水位 192,979 B，剩余 197,543 B） | PSRAM 峰值占用 692,444 B（剩余 7,693,300 B） | 真机：9 分区生效、app@0x20000、model@0x620000（1536K）、coredump 可用；唤醒 3/3 + R1/R2 正常；+17.8KB 来自 coredump |
 | 2026-10-30 | P1（T1.5 mock 工具） | 974,108 B（未变） | —（本任务无固件改动，沿用 P0/T0.1 行） | —（同上） | 仅新增 `tools/ws_mock_server.py` + `tools/README.md` + `.gitignore` 一行；`idf.py build`/`size` 未重跑（无固件差异），P1 固件基线等 T1.1 落地后重采 |
 | 2026-10-30 | P1（T1.1 config_store） | 995,372 B（+21,264 B，NVS 引擎 + 分区访问为主） | 运行期内部 RAM 峰值占用 128,500 B（`sys heap` 口径 total−min_free，最低水位 191,851 B，剩余 196,267 B） | PSRAM 峰值占用 692,476 B（剩余 7,693,264 B，最大块 7,602,176 B） | 真机 20/20 PASS（持久化/缺省/clamp/erase/字符串/非法参数）；`idf.py build` 零警告；DIRAM 137,610 B（+32 B）、任务数 8 不变；NVS 分区 24K（空闲 755 条目，命名空间自身占 1 条目） |
+| 2026-10-31 | P1（T1.2a event_bus） | 1,003,936 B（+8,564 B：`esp_event` 3.3KB + `event_bus` 1.0KB + `evt` 命令/文本） | 运行期内部 RAM 峰值占用 133,460 B（`sys heap` 口径 total−min_free，最低水位 186,387 B，剩余 190,551 B） | PSRAM 峰值占用 693,200 B（剩余 7,693,228 B，最大块 7,602,176 B） | 真机 10/10 PASS；任务数 8→9（新增 `evt`，核 0/优先级 5/栈 4KB，剩余 1,660 B）；唤醒 4/4 + R1/R2 正常；`idf.py build` 零警告；DIRAM 138,070 B（+460 B） |
 | — | P2 |  |  |  |  |
 | — | P3 |  |  |  |  |
 | — | P4 |  |  |  |  |

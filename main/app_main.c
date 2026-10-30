@@ -10,6 +10,7 @@
 #include "config_store.h"
 #include "diag.h"
 #include "esp_log.h"
+#include "event_bus.h"
 #include "prompt_assets.h"
 
 static const char *TAG = "APP";
@@ -64,6 +65,9 @@ void app_main(void)
 
     /* 配置持久化要早于所有使用方（net_mgr/transport_ws/播放器音量都依赖它） */
     ESP_ERROR_CHECK(cfg_init());
+
+    /* 事件总线要早于任何会投递/订阅事件的模块（P1 起 net_mgr/transport_ws 都依赖它） */
+    ESP_ERROR_CHECK(app_evt_init());
 
     ESP_LOGI(TAG, "booting esp-ai (mvp: wake + prompt)");
 

@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "event_bus.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -37,7 +38,7 @@ static const char *TAG = "DIAG";
  */
 static const char *const k_tags[] = {
     "APP", "BOARD", "AUDIO_IO", "AFE", "PLAYER", "ENC", "NET",
-    "WS", "VC", "VS", "MC", "MS", "DEV", "DIAG", "CFG",
+    "WS", "VC", "VS", "MC", "MS", "DEV", "DIAG", "CFG", "EVT",
 };
 #define TAG_COUNT (sizeof(k_tags) / sizeof(k_tags[0]))
 
@@ -599,6 +600,185 @@ static int cmd_cfg(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- evt 命令（事件总线观测，T1.2a） ---------------- */
+
+/*
+ * 本命令只做"投递/订阅"的观测口，不模拟业务：post 用的是示例 payload，
+ * trace 打开后能看到事件是否真的在 evt 任务上下文被分发到（而不是只打印了投递）。
+ */
+
+static bool evt_has_payload(app_evt_t evt)
+{
+    return evt == APP_EVT_NET_UP || evt == APP_EVT_NET_DOWN;
+}
+
+static bool evt_parse(const char *text, app_evt_t *out)
+{
+    for (int i = 0; i < APP_EVT_COUNT; i++) {
+        if (strcmp(text, app_evt_name((app_evt_t)i)) == 0) {
+            *out = (app_evt_t)i;
+            return true;
+        }
+    }
+
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(text, &end, 0);
+    if (errno == 0 && end != text && *end == '\0' && value >= 0 && value < APP_EVT_COUNT) {
+        *out = (app_evt_t)value;
+        return true;
+    }
+    return false;
+}
+
+static void evt_fill_sample_payload(app_evt_t evt, app_evt_data_t *data)
+{
+    memset(data, 0, sizeof(*data));
+    if (evt == APP_EVT_NET_UP) {
+        snprintf(data->net_up.ip, sizeof(data->net_up.ip), "%s", "10.0.0.42");
+        data->net_up.rssi = -42;
+    } else if (evt == APP_EVT_NET_DOWN) {
+        data->net_down.reason = 2; /* 示例值：模拟鉴权过期类断开原因 */
+        data->net_down.retry_ms = 1000;
+    }
+}
+
+static void evt_trace_cb(void *arg, app_evt_t evt, const app_evt_data_t *data)
+{
+    (void)arg;
+    if (evt == APP_EVT_NET_UP && data != NULL) {
+        ESP_LOGI(TAG, "evt trace: %s ip=%s rssi=%d", app_evt_name(evt), data->net_up.ip,
+                 data->net_up.rssi);
+    } else if (evt == APP_EVT_NET_DOWN && data != NULL) {
+        ESP_LOGI(TAG, "evt trace: %s reason=%u retry=%u ms", app_evt_name(evt),
+                 (unsigned)data->net_down.reason, (unsigned)data->net_down.retry_ms);
+    } else {
+        ESP_LOGI(TAG, "evt trace: %s", app_evt_name(evt));
+    }
+}
+
+static void print_evt_list(void)
+{
+    printf("APP_EVT 事件（共 %d 个，定义见 ARCHITECTURE §4.2）：\n", (int)APP_EVT_COUNT);
+    for (int i = 0; i < APP_EVT_COUNT; i++) {
+        printf("  %2d  %-20s %s\n", i, app_evt_name((app_evt_t)i),
+               evt_has_payload((app_evt_t)i) ? "带 payload" : "无 payload");
+    }
+    printf("说明: evt post <name|id> / burst <n> / trace on|off\n");
+}
+
+static int cmd_evt(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: evt list | post <name|id> | burst <n> | trace on|off\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(argv[1], "list") == 0) {
+        print_evt_list();
+        return ESP_OK;
+    }
+
+    if (strcmp(argv[1], "post") == 0) {
+        if (argc != 3) {
+            printf("用法: evt post <name|id>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        app_evt_t evt;
+        if (!evt_parse(argv[2], &evt)) {
+            printf("未知事件: %s（evt list 查看；支持名字或 0~%d 的 ID）\n", argv[2],
+                   (int)APP_EVT_COUNT - 1);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        app_evt_data_t data;
+        const bool with_payload = evt_has_payload(evt);
+        if (with_payload) {
+            evt_fill_sample_payload(evt, &data);
+        }
+        esp_err_t err = app_evt_post(evt, with_payload ? &data : NULL);
+        if (err != ESP_OK) {
+            printf("投递失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        if (evt == APP_EVT_NET_UP) {
+            printf("已投递 %s（示例 payload: ip=%s rssi=%d）\n", app_evt_name(evt), data.net_up.ip,
+                   data.net_up.rssi);
+        } else if (evt == APP_EVT_NET_DOWN) {
+            printf("已投递 %s（示例 payload: reason=%u retry=%u ms）\n", app_evt_name(evt),
+                   (unsigned)data.net_down.reason, (unsigned)data.net_down.retry_ms);
+        } else {
+            printf("已投递 %s（无 payload）\n", app_evt_name(evt));
+        }
+        return ESP_OK;
+    }
+
+    if (strcmp(argv[1], "burst") == 0) {
+        if (argc != 3) {
+            printf("用法: evt burst <n>（n=1~256）\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        char *end = NULL;
+        errno = 0;
+        long count = strtol(argv[2], &end, 0);
+        if (errno != 0 || end == argv[2] || *end != '\0' || count < 1 || count > 256) {
+            printf("非法数量: %s（1~256）\n", argv[2]);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        uint32_t ok = 0;
+        uint32_t dropped = 0;
+        for (long i = 0; i < count; i++) {
+            if (app_evt_post(APP_EVT_WAKE_DETECTED, NULL) == ESP_OK) {
+                ok++;
+            } else {
+                dropped++;
+            }
+        }
+        printf("突发投递 %ld 个 WAKE_DETECTED：成功 %u / 丢弃 %u（queue=%d，非阻塞语义）\n", count,
+               (unsigned)ok, (unsigned)dropped, CONFIG_EVENT_BUS_QUEUE_SIZE);
+        return ESP_OK;
+    }
+
+    if (strcmp(argv[1], "trace") == 0) {
+        if (argc != 3) {
+            printf("用法: evt trace on|off\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (strcmp(argv[2], "on") == 0) {
+            esp_err_t err = app_evt_register(APP_EVT_ANY, evt_trace_cb, NULL);
+            if (err == ESP_ERR_INVALID_STATE) {
+                printf("事件 trace 已经开启\n");
+                return ESP_OK;
+            }
+            if (err != ESP_OK) {
+                printf("开启失败: %s\n", esp_err_to_name(err));
+                return err;
+            }
+            printf("事件 trace 已开启：在 evt 任务上下文打印收到的每个事件\n");
+            return ESP_OK;
+        }
+        if (strcmp(argv[2], "off") == 0) {
+            esp_err_t err = app_evt_unregister(APP_EVT_ANY, evt_trace_cb, NULL);
+            if (err == ESP_ERR_NOT_FOUND) {
+                printf("事件 trace 本来就未开启\n");
+                return ESP_OK;
+            }
+            if (err != ESP_OK) {
+                printf("关闭失败: %s\n", esp_err_to_name(err));
+                return err;
+            }
+            printf("事件 trace 已关闭\n");
+            return ESP_OK;
+        }
+        printf("用法: evt trace on|off\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    printf("未知子命令: %s（可用: list | post | burst | trace）\n", argv[1]);
+    return ESP_ERR_INVALID_ARG;
+}
+
 /* ---------------- 堆水位周期监控（默认关闭） ---------------- */
 
 #if CONFIG_DIAG_HEAP_MONITOR
@@ -648,6 +828,12 @@ static esp_err_t register_commands(void)
             .help = "配置持久化：cfg info | get <key> | set <key> <int> | setstr <key> <value> | erase <key>",
             .hint = "info|get|set|setstr|erase",
             .func = cmd_cfg,
+        },
+        {
+            .command = "evt",
+            .help = "事件总线观测：evt list | post <name|id> | burst <n> | trace on|off",
+            .hint = "list|post|burst|trace",
+            .func = cmd_evt,
         },
     };
 

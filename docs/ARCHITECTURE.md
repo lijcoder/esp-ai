@@ -144,7 +144,7 @@ TTS(MP3) ─┐
 | `config_store` | L1 基础服务 | NVS 读写（音量、设备状态）+ 独占 `nvs_flash_init`；编译期常量（WiFi/WS/设备参数）走 Kconfig | `cfg_init()`, `cfg_get_int()`, `cfg_get_int_or()`, `cfg_set_int()`, `cfg_get_str()`, `cfg_set_str()`, `cfg_get_volume()`, `cfg_set_volume()`, `cfg_erase_key()` |
 | `net_mgr` | L1 基础服务 | WiFi STA 连接、自动重连、SNTP 对时、网络事件 | `net_init()`, `net_is_up()`, `net_wait_ready(ms)` |
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/重连/心跳/发送队列/二进制帧收发 | `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()` |
-| `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event） | `app_evt_register()`, `app_evt_post()` |
+| `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
 | `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 回调（上行音频读取随 P2 增加） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()` |
 | `audio_player` | L2 音频引擎 | 播放引擎：PCM 播放 + 重采样到 48k + 软件音量 + 淡入淡出（多通道/MP3/HTTP 随 P2–P4 增加） | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_register_done_cb()`, `audio_player_set_volume()` |
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms） | `enc_open()`, `enc_encode(pcm, out, len)`, `enc_close()` |
@@ -159,9 +159,10 @@ TTS(MP3) ─┐
 ### 4.2 事件总线（确定）
 
 ```c
-ESP_EVENT_DEFINE_BASE(APP_EVT);
+ESP_EVENT_DECLARE_BASE(APP_EVT);   /* event_bus.h；定义在 event_bus.c */
 
 typedef enum {
+    APP_EVT_ANY = -1,              /* 仅用于注册：订阅全部应用事件 */
     APP_EVT_NET_UP, APP_EVT_NET_DOWN,
     APP_EVT_WAKE_DETECTED,
     APP_EVT_VAD_SPEECH_START, APP_EVT_VAD_SPEECH_END,
@@ -170,8 +171,22 @@ typedef enum {
     APP_EVT_VOICE_STATE_CHANGED,
     APP_EVT_BUTTON,
     APP_EVT_MUSIC_STATE_CHANGED, APP_EVT_MUSIC_ERROR,
+    APP_EVT_COUNT,                 /* 哨兵：事件数量 */
 } app_evt_t;
 ```
+
+**payload**：统一装进定长 32 字节的 `app_evt_data_t`（union），投递时整块拷贝，发布方无需保活；处理器拿到的指针只在回调内有效。P1 只定义网络事件，其余事件投递 `NULL`，由使用方落地时补定义（文本类 payload 的所有权语义随 T2.5/T3.1 定稿）：
+
+| 事件 | payload 结构 |
+|---|---|
+| `APP_EVT_NET_UP` | `app_evt_net_up_t { char ip[16]; int8_t rssi; }` |
+| `APP_EVT_NET_DOWN` | `app_evt_net_down_t { uint8_t reason; uint32_t retry_ms; }` |
+
+**投递与线程约束**：
+
+- 独立循环不占系统 default loop（避免与 WiFi/`esp_netif` 处理器互相阻塞），队列长度 `CONFIG_EVENT_BUS_QUEUE_SIZE`（默认 16），投递一律非阻塞（`ticks_to_wait = 0`），满则丢弃 + WARN；
+- 处理器在 `evt` 任务上下文执行，不得做耗时/阻塞操作；
+- **音频实时任务（`afe_feed`/`afe_fetch`）只能投递无 payload 事件**：esp_event 带 payload 时会内部 `calloc` 拷贝，违反 §4.3 第 2 条。
 
 ### 4.3 依赖规则（强制）
 
@@ -397,6 +412,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `afe_feed` | 1 | 8 | 4KB | I2S 读 + AFE feed（实时性最高） |
 | `afe_fetch` | 1 | 6 | 4KB | 唤醒/VAD/上行音频输出 |
 | `player` | 1 | 5 | 6KB | MP3 解码 + 重采样 + 混音 + I2S 写 |
+| `evt` | 0 | 5 | 4KB | 事件分发（`event_bus` 自建 esp_event 循环，T1.2a 起） |
 | `ws` | 0 | 5 | 6KB | WebSocket/TLS 收发 |
 | `music_http` | 0 | 4 | 6KB | HTTP 拉流 |
 | `voice_session` | 0 | 4 | 4KB | 状态机事件循环 |
@@ -432,13 +448,14 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `net ping <host>` | 网络连通性 |
 | `mic stat` | 麦克风 RMS/峰值、VAD 状态 |
 | `cfg info` / `cfg get\|set\|setstr\|erase <key>` | 配置持久化调试：NVS 条目用量、原始值读写、删除键恢复缺省（存储层语义，不做业务校验） |
+| `evt list` / `evt post <name\|id>` / `evt burst <n>` / `evt trace on\|off` | 事件总线观测：事件清单、投递（网络事件带示例 payload）、突发投递验证非阻塞/队列满、订阅打印分发结果 |
 | `audio vol <0-100>` | 设置音量 |
 | `audio play <file\|url>` | 手测播放 |
 | `audio stop` | 停止播放 |
 | `voice state` / `voice start` / `voice interrupt` / `voice wake on\|off` | 会话调试 |
 | `music play <url>` / `music pause` / `music resume` / `music stop` | 音乐调试 |
 
-日志 TAG 固定：`BOARD`、`AUDIO_IO`、`AFE`、`PLAYER`、`ENC`、`NET`、`WS`、`VC`、`VS`、`MC`、`MS`、`DEV`、`DIAG`、`CFG`、`APP`（`APP` 属 `main/` 启动编排，不占组件层级）。
+日志 TAG 固定：`BOARD`、`AUDIO_IO`、`AFE`、`PLAYER`、`ENC`、`NET`、`WS`、`VC`、`VS`、`MC`、`MS`、`DEV`、`DIAG`、`CFG`、`EVT`、`APP`（`APP` 属 `main/` 启动编排，`EVT` 属 `event_bus` 基础服务，均不占业务层级）。
 
 ---
 

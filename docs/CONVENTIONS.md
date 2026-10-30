@@ -46,7 +46,7 @@
 
 - 命名：函数/变量 `snake_case`，宏/常量 `UPPER_CASE`，文件与模块同名。
 - 对外接口统一返回 `esp_err_t`，错误码定义在组件头文件。
-- 日志 TAG 固定：`BOARD/AUDIO_IO/AFE/PLAYER/ENC/NET/WS/VC/VS/MC/MS/DEV/DIAG/CFG/APP`（`APP` 属 `main/` 启动编排）；状态迁移 INFO、异常 WARN、失败 ERROR。
+- 日志 TAG 固定：`BOARD/AUDIO_IO/AFE/PLAYER/ENC/NET/WS/VC/VS/MC/MS/DEV/DIAG/CFG/EVT/APP`（`APP` 属 `main/` 启动编排，`EVT` 属 `event_bus` 基础服务）；状态迁移 INFO、异常 WARN、失败 ERROR。
 - 注释写"为什么"而非"做了什么"，中文注释。
 - 组件目录模板：
 

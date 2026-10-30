@@ -1,0 +1,13 @@
+menu "Event Bus"
+
+    config EVENT_BUS_QUEUE_SIZE
+        int "事件循环队列长度（项）"
+        range 4 64
+        default 16
+        help
+            自定义 esp_event 循环的队列深度。队列满时 app_evt_post() 立即返回
+            ESP_ERR_TIMEOUT 并丢弃事件（非阻塞，音频任务不允许等待），同时打 WARN。
+            16 项足够覆盖 NET_UP/DOWN、唤醒/VAD、会话事件在半双工一轮内的突发；
+            调大前先评估内部 RAM（每项约 20 B）与处理器耗时。
+
+endmenu

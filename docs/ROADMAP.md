@@ -92,6 +92,7 @@
 | T0.6 | POC 迁移：AFE 唤醒 → `audio_fe` 回调 → `audio_player` 播放提示音（`CH_PROMPT`）；删除 `main/esp-ai.c` 旧代码 | 唤醒 + 提示音功能不退化 |
 | T0.7 | 两轮真机自检：① T0.5 后验证唤醒/提示音/麦克风 RMS/底噪；② T0.1 分区表改完后回归关键项 | 两轮验收记录，数据写入 STATUS.md 基线表 |
 | T0.7a | `diag` 增 `mic stat`/`mic reset`：`audio_fe` 暴露只读统计（电平 RMS/峰值、帧数、I2S 读失败、唤醒次数、VAD、feed 状态） | 底噪/说话电平可在设备上直接读取，T0.7① 基线与 T5.2 实测可复现 |
+| T0.7b | `diag` 增 `sys crash`（Kconfig 开发开关）：主动 panic 验证 coredump 落盘与 `idf.py coredump-info` 解析 | coredump 排障链路可用（ARCH §9.1、CONVENTIONS §8） |
 
 **验收**：`idf.py build` 通过；说"嗨，乐鑫"播放应答；`sys heap` 可用；`main/` ≤ 150 行。
 
@@ -164,7 +165,7 @@
 | T5.2 | `tools/record_wav.py` 串口采集，输出唤醒率/误唤醒基线数据 | 语音指标基线 |
 | T5.3 | 24h 压测：周期打印堆/任务水位、播放+对话交替、记录异常 | 稳定性报告 |
 | T5.4 | 与后端真实服务按架构第 6 节契约联调，问题清单闭环 | 端云链路可交付 |
-| T5.5 | 文档收尾：`PROTOCOL.md` 补全、HARDWARE 自检结果、README 更新 | 文档齐备 |
+| T5.5 | 文档收尾：`PROTOCOL.md` 补全、HARDWARE 自检结果、README 更新；**确认关闭开发期调试开关**（`DIAG_ENABLE_CRASH_TEST` 等） | 文档齐备、量产配置干净 |
 
 **验收**：24h 无重启、无内存泄漏；真实服务下完成语音对话 + 音乐播放；问题清单清零。
 
@@ -219,3 +220,4 @@ P0 ──> P1 ──> P2 ──> P3 ──> P4 ──> P5
 | 2026-10-30 | v1.2 | T0.3 去掉 LED（移到 dev_ctrl）、T0.4 去掉环形缓冲（由 audio_player 队列承担），与已实现代码对齐 |
 | 2026-10-30 | v1.3 | 重排执行顺序：观测能力（diag/console）前置、分区表后移到真机验证之后；T0.7 明确两轮自检；新增 §2.0 顺序依据与 P2 双轨并行 |
 | 2026-10-30 | v1.4 | 新增 T0.7a（`diag` 增 `mic stat`，0.5d）并前置于 T0.7①，保证电平基线可复现；P0 剩余顺序改为 T0.7a → T0.7① → T0.1 → T0.7②；明确 T0.1 的 `nvs` 是 P1 硬前置 |
+| 2026-10-30 | v1.5 | 新增 T0.7b（`sys crash` + coredump 链路验证，0.2d）；T5.5 增加“关闭开发期调试开关”一项 |

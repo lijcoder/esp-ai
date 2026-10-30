@@ -21,8 +21,18 @@
 | `log <tag>\|\* <level>` | 运行时调整日志级别，级别取 `none/error/warn/info/debug/verbose`；未知 TAG 或非法级别直接报错（不静默生效） |
 | `mic stat` | 麦克风统计窗口：电平 RMS/峰值（dBFS）、窗口时长与采样数、已喂帧数、I2S 读失败次数、收音开关、VAD、累计唤醒次数 |
 | `mic reset` | 清零麦克风统计窗口（帧数、失败次数、唤醒次数、电平一起清零） |
+| `sys crash` | **仅开发配置**（`CONFIG_DIAG_ENABLE_CRASH_TEST=y`）：主动触发 panic，验证 coredump 落盘与解析；未编译时明确提示 |
 
 `mic stat` 的统计口径是**送 AFE 之前的麦克风真实数据**；半双工暂停收音（R1）时电平仍在累计，可用来确认"麦克风还在采、只是 AFE 吃静音"。RMS 的 `sqrt/log10` 在 console 任务侧计算，音频任务只做整数累加。
+
+## coredump 验证流程（`sys crash`）
+
+1. `sdkconfig.defaults.esp32s3` 里 `CONFIG_DIAG_ENABLE_CRASH_TEST=y`（**量产固件必须关掉**）；
+2. 串口敲 `sys crash` → 打印 panic backtrace → 日志出现 `Core dump has been saved to flash.`；
+3. 设备自动重启，启动日志出现 `Found core dump <N> bytes in flash @ 0x9a0000`（实测 14,404 B / 64K）；
+4. `idf.py -p <PORT> coredump-info` 解析：崩溃任务、panic reason、寄存器、**所有任务的调用栈（含源文件行号）**；
+5. 清理现场：`python -m esptool --chip esp32s3 -p <PORT> erase_region 0x9a0000 0x10000`；
+6. 解析依赖崩溃固件对应的 `build/esp-ai.elf`——崩溃后**先备份 elf 再改代码**（见 CONVENTIONS §8）。
 
 ## 已知 TAG
 

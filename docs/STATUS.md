@@ -9,7 +9,7 @@
 | 项目 | 内容 |
 |---|---|
 | 当前阶段 | **P0 地基（已完成）→ P1 联网** |
-| 当前任务 | P0 收尾完成：T0.1 分区表已换（9 分区 + coredump 启用）、T0.7② 回归通过（唤醒 3/3、R1/R2、模型从 1536K 分区加载） |
+| 当前任务 | P0 收尾完成：T0.1 分区表已换（9 分区 + coredump 启用）、T0.7② 回归通过（唤醒 3/3、R1/R2、模型从 1536K 分区加载）、T0.7b `sys crash` 使 coredump 落盘/解析链路闭环（实测 14,404 B，解析出全部任务调用栈） |
 | 下一步 | P1：T1.5 `tools/ws_mock_server.py`（可立即起，不依赖硬件）→ T1.1 `config_store`（nvs 分区已就绪）→ T1.2a 事件定义 → T1.3 `net_mgr` → T1.4 `transport_ws` → T1.6 联调 |
 | 最后更新 | 2026-10-30 |
 | 阻塞项 | 无（开发板 `/dev/cu.usbmodem5CF90746951` 可烧录）；X1「提示符与日志互冲」仍按 PRODUCT_IDEAS §8 方案 A 接受，真机验收用"脚本读串口 + `log * warn` 降噪"替代口径 |
@@ -28,6 +28,7 @@
 | P0 | T0.6 | POC 迁移，删除旧代码 | ☑ |
 | P0 | T0.7 | P0 交付自检 + 基线记录（两轮均通过） | ☑ |
 | P0 | T0.7a | diag 增 `mic stat`/`mic reset`（基线观测，T0.7 前置） | ☑ |
+| P0 | T0.7b | diag 增 `sys crash`，验证 coredump 落盘/解析链路 | ☑ |
 | P1 | T1.1 | config_store | ☐ |
 | P1 | T1.2 | event_bus | ☐ |
 | P1 | T1.3 | net_mgr（WiFi/重连/SNTP） | ☐ |
@@ -76,6 +77,7 @@
 | 2026-10-30 | T0.7a | 新增 `mic stat`/`mic reset`：`audio_fe` 暴露只读统计（sum_sq/peak/sample_count/帧数/读失败/唤醒数/VAD/feed 状态），feed 任务内只做整数累加、临界区只合并，`sqrt/log10` 放 console 侧；顺手修掉"暂停收音补零只清 1 通道"的隐患（缓冲是 chunksize×nch）；`diag` 以 `PRIV_REQUIRES audio_fe` 私有依赖；`idf.py build` 通过且零警告，size 956,180 B（+3,436 B，主要来自 newlib math），DIRAM 131,358 B（+40 B）；真机验收随 T0.7①C 进行 |
 | 2026-10-30 | T0.7①C | 真机复测（`mic stat`）：**底噪** 安静段 RMS 104~220（-49.0~-43.5 dBFS）、峰值 502（-36.3 dBFS），与历史 40~270 / -45~-53 dBFS 吻合；**说话** 峰值 4228（-17.7 dBFS）；**唤醒 3/3**（21.7s / 24.4s / 27.1s），R1 播放期 feed 暂停、R2 恢复均可见；console 验收通过（`log` 副作用生效、`mic stat/reset`、`sys info/heap/tasks`、`sys reboot` 见重启横幅）。首次采样（开机窗口）环境在放音乐/视频，RMS 2686~4149、峰值 30208（-0.7 dBFS），**不作为底噪基线**。采样期另出现第 4 次唤醒（用户说话/环境声期间），安静环境需复核是否误唤醒（并入 T5.2） |
 | 2026-10-30 | **fix(diag)** | 真机发现 `sys tasks` 恒为"共 0 个任务"：本内核版本的 `uxTaskGetSystemState` **不支持**"传 `NULL` 查数量"，容量不足时直接返回 0；改为用 `uxTaskGetNumberOfTasks()+8` 定容量并加失败提示。修复后读到 8 个任务（afe_feed / afe_fetch / player / console_repl / IDLE0 / IDLE1 / ipc0 / ipc1），`afe_fetch` 栈剩 2060/4096 B、`afe_feed` 5932/8192 B；size 956,272 B（+92 B） |
+| 2026-10-30 | T0.7b | 新增 `sys crash`（仅 `CONFIG_DIAG_ENABLE_CRASH_TEST=y` 编译，默认 n，量产必须关闭）：真机验证 coredump 闭环 —— panic reason `diag crash test` → `Core dump has been saved to flash.` → 重启后 `Core dump data checksum is correct` / `Found core dump 14404 bytes in flash @ 0x9a0000`（占 64K 分区 22%，余量充足）；`idf.py coredump-info` 还原崩溃任务 `console_repl` 与全部 8 个任务调用栈（`cmd_sys` → `diag.c:297`、`feed_task` → `audio_fe.c:89`、`player_task` → `audio_player.c:48` 等，带源文件行号）；验证后已清空 coredump 分区；size 974,328 B（+220 B） |
 | 2026-10-30 | T0.1 | 分区表切换到 ARCH §9.1 定稿（nvs/otadata/phy_init/ota_0/ota_1/model/assets/coredump/storage；app 偏移 0x10000→0x20000，model 5168K→1536K）；`gen_esp32part.py` 校验无重叠越界；`erase-flash` 全片擦除后重烧四段；bootloader 识别 9 个分区、app 从 0x20000 启动、`esp_core_dump_flash` 找到 coredump 分区、srmodels 从 1536K 分区加载成功；sdkconfig 由 defaults 重新生成（仅 coredump 相关项变化，其余逐项核对保留）；启用 `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`；size 974,108 B（+17.8KB，coredump 代码 + ISR 栈 +560B/核），DIRAM 137,578 B（+6.2KB） |
 | 2026-10-30 | T0.7② | 分区表改后回归：唤醒 3/3（10.9s/16.3s/29.9s）、R1 `feed paused`→播放 12800 样本→R2 `feed resumed`（间隔 1.35s，符合 300ms 延时）、底噪 RMS 167~291（-45.9~-41.0 dBFS）、说话峰值 4148~4189（-18.0 dBFS）、`sys tasks` 8 个任务、运行期内部 RAM 峰值 127,468 B / PSRAM 峰值 692,444 B、无 ERROR 日志。附带观察：两轮采样都在 3 次唤醒后出现第 4 次唤醒（用户说话/环境声期间），需在安静环境复核是否误唤醒（并入 T5.2） |
 

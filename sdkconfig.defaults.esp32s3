@@ -25,3 +25,5 @@ CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64=y
 # 崩溃现场落 coredump 分区（ARCH §9.1 / CONVENTIONS §8：idf.py coredump 解析）
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 
+# 开发期：sys crash 用于验证 coredump 落盘/解析；量产固件必须关闭
+CONFIG_DIAG_ENABLE_CRASH_TEST=y

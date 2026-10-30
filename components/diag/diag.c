@@ -262,7 +262,13 @@ static void print_tasks(void)
 static int cmd_sys(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("用法: sys info | heap | tasks | reboot\n");
+        printf("用法: sys info | heap | tasks | reboot%s\n",
+#if CONFIG_DIAG_ENABLE_CRASH_TEST
+               " | crash"
+#else
+               ""
+#endif
+        );
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -282,8 +288,26 @@ static int cmd_sys(int argc, char **argv)
         fflush(stdout);
         esp_restart();
         return ESP_OK;
+    } else if (strcmp(argv[1], "crash") == 0) {
+#if CONFIG_DIAG_ENABLE_CRASH_TEST
+        /* 故意触发 panic，验证 coredump 落盘与事后解析（仅开发配置编译） */
+        printf("即将触发 panic 验证 coredump；设备会重启，之后执行:\n"
+               "  idf.py -p <PORT> coredump-info\n");
+        fflush(stdout);
+        esp_system_abort("diag crash test");
+        return ESP_OK; /* 不会执行到 */
+#else
+        printf("crash 测试未编译：需 CONFIG_DIAG_ENABLE_CRASH_TEST=y\n");
+        return ESP_ERR_NOT_SUPPORTED;
+#endif
     } else {
-        printf("未知子命令: %s（可用: info | heap | tasks | reboot）\n", argv[1]);
+        printf("未知子命令: %s（可用: info | heap | tasks | reboot%s）\n", argv[1],
+#if CONFIG_DIAG_ENABLE_CRASH_TEST
+               " | crash"
+#else
+               ""
+#endif
+        );
         return ESP_ERR_INVALID_ARG;
     }
     return ESP_OK;

@@ -13,4 +13,12 @@ menu "Diagnostics"
         range 5 3600
         default 30
 
+    config DIAG_ENABLE_CRASH_TEST
+        bool "启用 sys crash 崩溃测试命令（仅开发期）"
+        default n
+        help
+            编译进 `sys crash` 子命令，主动触发 panic 以验证 coredump 分区
+            是否能正常落盘、能否用 `idf.py coredump-info` 解析。
+            **量产固件必须关闭**（默认 n，sdkconfig.defaults 里显式开启仅供开发板）。
+
 endmenu

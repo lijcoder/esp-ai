@@ -14,7 +14,6 @@ uv run tools/ws_mock_server.py                  # 起服务，打印可直连的
 ```
 
 - 本机 `python3` 没有 pip、也没有装 websockets，所以用 `uv run` 自动装到隔离环境（Python 3.12 / websockets 17.4 已验证）。
-- 若出现 `failed to open file ~/.cache/uv/...: Operation not permitted`（本机沙箱不允许写 `~/.cache/uv`），把缓存指到工作区：`UV_CACHE_DIR=$PWD/.uv-cache uv run tools/ws_mock_server.py`（`.uv-cache/` 已在 `.gitignore`）。
 - 只用标准库的实现不予考虑：WS 握手/掩码/分片/关闭握手自己写容易引入额外 bug，联调工具不值得。
 
 ## 快速开始

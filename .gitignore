@@ -55,8 +55,6 @@ CTestTestfile.cmake
 __pycache__/
 *.egg-info/
 dist/
-# uv 缓存（本机沙箱不能写 ~/.cache/uv，工具统一 UV_CACHE_DIR=$PWD/.uv-cache）
-.uv-cache/
 
 # Virtual environment folders
 venv/

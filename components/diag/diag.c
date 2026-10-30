@@ -27,6 +27,7 @@
 #include "event_bus.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "net_mgr.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
@@ -600,6 +601,69 @@ static int cmd_cfg(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- wifi 命令（网络观测，T1.3） ---------------- */
+
+static void print_wifi_status(void)
+{
+    net_info_t info;
+    esp_err_t err = net_get_info(&info);
+    if (err != ESP_OK) {
+        printf("读取网络状态失败: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("WiFi 状态: %s\n", net_state_name(info.state));
+    if (info.ssid[0] == '\0') {
+        printf("  SSID: 未配置（CONFIG_AI_WIFI_SSID 为空，联网功能关闭，本地功能可用）\n");
+        return;
+    }
+
+    printf("  SSID: %s\n", info.ssid);
+    if (info.state == NET_STATE_UP) {
+        printf("  IP: %s，RSSI: %d dBm\n", info.ip, info.rssi);
+    } else {
+        printf("  IP: （未联网）\n");
+    }
+    printf("  SNTP: %s（服务器 %s）\n", info.time_synced ? "已对时" : "未对时",
+           CONFIG_NET_SNTP_SERVER);
+    if (info.next_retry_ms > 0) {
+        printf("  重连: 累计 %u 次，%u ms 后重试\n", (unsigned)info.retry_count,
+               (unsigned)info.next_retry_ms);
+    } else {
+        printf("  重连: 累计 %u 次，当前没有待执行的重试\n", (unsigned)info.retry_count);
+    }
+}
+
+static int cmd_wifi(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: wifi status | reconnect\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(argv[1], "status") == 0) {
+        print_wifi_status();
+        return ESP_OK;
+    }
+
+    if (strcmp(argv[1], "reconnect") == 0) {
+        esp_err_t err = net_reconnect();
+        if (err == ESP_ERR_INVALID_STATE) {
+            printf("无法重连：未初始化或未配置 CONFIG_AI_WIFI_SSID\n");
+            return ESP_OK;
+        }
+        if (err != ESP_OK) {
+            printf("重连失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("已请求断开并重连（退避已重置，可用 wifi status 观察）\n");
+        return ESP_OK;
+    }
+
+    printf("未知子命令: %s（可用: status | reconnect）\n", argv[1]);
+    return ESP_ERR_INVALID_ARG;
+}
+
 /* ---------------- evt 命令（事件总线观测，T1.2a） ---------------- */
 
 /*
@@ -834,6 +898,12 @@ static esp_err_t register_commands(void)
             .help = "事件总线观测：evt list | post <name|id> | burst <n> | trace on|off",
             .hint = "list|post|burst|trace",
             .func = cmd_evt,
+        },
+        {
+            .command = "wifi",
+            .help = "网络状态：wifi status | reconnect",
+            .hint = "status|reconnect",
+            .func = cmd_wifi,
         },
     };
 

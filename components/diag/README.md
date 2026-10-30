@@ -6,7 +6,7 @@
 
 | 接口 | 说明 |
 |---|---|
-| `diag_init()` | 打印启动横幅 → 在 UART0（115200，GPIO43/44）起 REPL → 注册 `help`/`sys`/`log`/`mic`/`cfg`/`evt`；只能在 `app_main` 最前部调用一次，重复调用返回 `ESP_ERR_INVALID_STATE` |
+| `diag_init()` | 打印启动横幅 → 在 UART0（115200，GPIO43/44）起 REPL → 注册 `help`/`sys`/`log`/`mic`/`cfg`/`evt`/`wifi`；只能在 `app_main` 最前部调用一次，重复调用返回 `ESP_ERR_INVALID_STATE` |
 
 ## console 命令（本轮）
 
@@ -30,6 +30,8 @@
 | `evt post <name\|id>` | 投递一个事件（网络事件自动带示例 payload），用于验证投递链路 |
 | `evt burst <n>` | 连续投递 n 个（1~256）无 payload 事件，验证"非阻塞 + 队列满丢弃"路径 |
 | `evt trace on\|off` | 订阅/取消订阅全部事件，在 `evt` 任务上下文打印收到的每个事件（验证跨任务分发，而不是只看投递） |
+| `wifi status` | 网络状态：state、SSID、IP、RSSI、SNTP 是否对时、累计重连次数与当前退避 |
+| `wifi reconnect` | 主动断开并重连（重置退避）；已联网时先投 `NET_DOWN` 再恢复，用于验证重连链路 |
 | `sys crash` | **仅开发配置**（`CONFIG_DIAG_ENABLE_CRASH_TEST=y`）：主动触发 panic，验证 coredump 落盘与解析；未编译时明确提示 |
 
 `mic stat` 的统计口径是**送 AFE 之前的麦克风真实数据**；半双工暂停收音（R1）时电平仍在累计，可用来确认"麦克风还在采、只是 AFE 吃静音"。RMS 的 `sqrt/log10` 在 console 任务侧计算，音频任务只做整数累加。
@@ -51,7 +53,7 @@
 
 ## 依赖
 
-- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计）、`config_store`（`cfg` 读写 NVS）、`event_bus`（`evt` 投递/订阅），三者均为**私有依赖**，不对外暴露头文件。
+- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计）、`config_store`（`cfg` 读写 NVS）、`event_bus`（`evt` 投递/订阅）、`net_mgr`（`wifi status/reconnect`），均为**私有依赖**，不对外暴露头文件。
 - IDF 配置：`CONFIG_FREERTOS_USE_TRACE_FACILITY`（任务枚举）与 `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` + `COUNTER_TYPE_U64`（CPU 占比，64 位计数避免 esp_timer 32 位约 71 分钟回绕）。已固化在 `sdkconfig.defaults.esp32s3`；若关掉 trace facility，`sys tasks` 会提示不可用而不是编译失败。
 - 硬件：UART0 115200，GPIO43/44（见 `docs/HARDWARE.md`）。
 

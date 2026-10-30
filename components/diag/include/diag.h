@@ -18,6 +18,7 @@ extern "C" {
  *   - `mic stat` / `mic reset`
  *   - `cfg info` / `cfg get <key>` / `cfg set <key> <int>` / `cfg setstr <key> <value>` / `cfg erase <key>`
  *   - `evt list` / `evt post <name|id>` / `evt burst <n>` / `evt trace on|off`
+ *   - `wifi status` / `wifi reconnect`
  *   - `help`
  *
  * @note 只应在 app_main 的最前部调用一次；重复调用返回 ESP_ERR_INVALID_STATE。

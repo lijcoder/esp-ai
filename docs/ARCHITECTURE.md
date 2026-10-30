@@ -142,7 +142,7 @@ TTS(MP3) ─┐
 | `board` | L0 板级/驱动 | 引脚定义、按键、初始化顺序（LED 待 `dev_ctrl` 任务接入） | `board_init()`, `board_button_pressed()` |
 | `audio_io` | L0 板级/驱动 | I2S0 RX（16k 采集）/ I2S1 TX（48k 播放）HAL | `audio_io_init()`, `audio_io_read_mic()`, `audio_io_write_spk()`, `audio_io_spk_enable()` |
 | `config_store` | L1 基础服务 | NVS 读写（音量、设备状态）+ 独占 `nvs_flash_init`；编译期常量（WiFi/WS/设备参数）走 Kconfig | `cfg_init()`, `cfg_get_int()`, `cfg_get_int_or()`, `cfg_set_int()`, `cfg_get_str()`, `cfg_set_str()`, `cfg_get_volume()`, `cfg_set_volume()`, `cfg_erase_key()` |
-| `net_mgr` | L1 基础服务 | WiFi STA 连接、自动重连、SNTP 对时、网络事件 | `net_init()`, `net_is_up()`, `net_wait_ready(ms)` |
+| `net_mgr` | L1 基础服务 | WiFi STA 连接、退避重连、SNTP 对时、网络事件（无独立任务：事件回调 + 一次性定时器） | `net_init()`, `net_is_up()`, `net_wait_ready(ms)`, `net_is_time_synced()`, `net_get_info()`, `net_reconnect()` |
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/重连/心跳/发送队列/二进制帧收发 | `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
 | `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 回调（上行音频读取随 P2 增加） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()` |
@@ -372,7 +372,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 
 ### 8.5 断线重连
 
-- `net_mgr` 检测到断开 → `APP_EVT_NET_DOWN`；
+- `net_mgr` 检测到断开 → `APP_EVT_NET_DOWN`（**只在已联网后掉线时投递**；上电首次连不上不投，避免上层处理正常中间态），payload 带驱动原因码与本次退避延时；
 - 正在进行的会话立即终止，播放淡出，回 `IDLE`；
 - 自动重连成功后重新 `ws_start()` + `hello`；
 - 重连期间唤醒仍可用（本地唤醒不依赖网络），进入 `LISTENING` 时若网络未恢复则播"网络未连接"提示音并回 `IDLE`。
@@ -421,15 +421,20 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 
 原则：核 1 只跑音频路径，不受网络抖动影响；跨核只通过队列/ringbuffer。
 
+> 上表是**应用任务**；IDF 库任务（`sys_evt`、`wifi`、`esp_timer`、`Tmr Svc`、`IDLE`、`ipc`）不在此表。
+> `net_mgr` 的 WiFi/IP 事件处理器运行在 `sys_evt` 任务上，其栈由 `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096` 提供（P1 T1.3 实测默认 2304 B 时只剩 380 B，已加栈）。
+
 ---
 
 ## 10. 网络与调试（确定）
 
 ### 10.1 WiFi
 
-- STA 模式，SSID/密码走 Kconfig（`CONFIG_AI_WIFI_SSID` / `CONFIG_AI_WIFI_PASSWORD`），编译进固件；
-- 上电自动连接，失败重试；运行中断线自动重连（退避 1s→30s）；
-- 开启 SNTP，同步时间用于 TLS 证书校验；
+- STA 模式，SSID/密码走 Kconfig（`CONFIG_AI_WIFI_SSID` / `CONFIG_AI_WIFI_PASSWORD`），编译进固件；驱动存储用 `WIFI_STORAGE_RAM`，避免 NVS 里旧凭证覆盖配置；
+- 上电自动连接，失败重试；运行中断线自动重连（退避 1s→30s，无限重试）；
+- 关闭 modem sleep（`WIFI_PS_NONE`）：语音要低时延，避免省电引入上下行抖动；
+- 开启 SNTP（服务器 `CONFIG_NET_SNTP_SERVER`，默认 `ntp.aliyun.com`），同步时间用于 TLS 证书校验；**联网成功（GOT_IP）时立即触发对时**，并关闭 lwIP 首次请求的随机启动延迟（`CONFIG_LWIP_SNTP_STARTUP_DELAY=n`），实测对时落在地址就绪后 ~40ms（改前最坏 33s）；
+- 未配置 SSID 时 `net_mgr` 降级为离线（只 WARN），本地唤醒/播放不受影响，`transport_ws` 会因 `net_is_up()` 为 false 而拒绝启动；
 - WiFi 与 PSRAM 同时使用，注意 `CONFIG_ESP32S3_DATA_CACHE_64KB` 已满足（现有配置）。
 
 ### 10.2 调试能力（diag + esp_console）

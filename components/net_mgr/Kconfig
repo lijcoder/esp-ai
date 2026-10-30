@@ -1,0 +1,10 @@
+menu "Network Manager"
+
+    config NET_SNTP_SERVER
+        string "SNTP server"
+        default "ntp.aliyun.com"
+        help
+            NTP 服务器域名/IP。对时用于 TLS 证书校验；国内网络建议保留默认值，
+            海外环境可改成 pool.ntp.org。对时失败不影响联网与本地功能。
+
+endmenu

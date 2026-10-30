@@ -11,6 +11,7 @@
 #include "diag.h"
 #include "esp_log.h"
 #include "event_bus.h"
+#include "net_mgr.h"
 #include "prompt_assets.h"
 
 static const char *TAG = "APP";
@@ -90,5 +91,10 @@ void app_main(void)
     ESP_LOGI(TAG, "wake word model: %s", wn ? wn : "unknown");
 
     ESP_ERROR_CHECK(audio_fe_start());
+
+    /* 联网放在音频链路之后：唤醒/播放是本地核心能力，不能被 WiFi 初始化拖慢；
+     * 未配置 SSID 时 net_init 内部降级为离线（只 WARN），不影响本地功能 */
+    ESP_ERROR_CHECK(net_init());
+
     ESP_LOGI(TAG, "ready, say \"Hi Lexin\"");
 }

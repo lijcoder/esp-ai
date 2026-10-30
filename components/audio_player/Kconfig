@@ -1,0 +1,14 @@
+menu "Audio Player"
+
+    config AUDIO_PLAYER_DEFAULT_VOLUME
+        int "Default volume (0-100)"
+        range 0 100
+        default 60
+
+    config AUDIO_PLAYER_TAIL_DELAY_MS
+        int "Tail delay after playback before done callback (ms)"
+        default 300
+        help
+            播放结束后等待该时长再回调，用于吸收喇叭尾音（半双工规则 R2）。
+
+endmenu

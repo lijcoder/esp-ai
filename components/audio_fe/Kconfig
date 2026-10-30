@@ -1,0 +1,16 @@
+menu "Audio Front-End"
+
+    config AUDIO_FE_MODEL_PARTITION
+        string "Model partition label"
+        default "model"
+        help
+            从该 data/spiffs 分区加载 ESP-SR 模型（见 partitions.csv）。
+
+    config AUDIO_FE_INPUT_FORMAT
+        string "AFE input format"
+        default "M"
+        help
+            AFE 输入通道格式：M=单麦，MR=单麦+参考，MMR=双麦+参考。
+            本期硬件为单麦（INMP441），固定 "M"。
+
+endmenu

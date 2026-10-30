@@ -35,9 +35,9 @@
 | 编号 | 任务 | 产出 |
 |---|---|---|
 | T0.1 | 替换 `partitions.csv` 为定稿方案，校验并通过烧录 | 分区表可用，model 分区可被 `esp_srmodel_init` 正常加载 |
-| T0.2 | 建 15 个组件骨架（`components/<module>/`：CMakeLists + `include/*.h` + Kconfig + 空实现） | `idf.py build` 通过 |
-| T0.3 | `board`：引脚宏、LED/按键驱动、初始化入口 | LED 可控、按键可读 |
-| T0.4 | `audio_io`：I2S0 RX 16k（32bit→int16）、I2S1 TX 48k 立体声、环形缓冲 | 采集/播放通路可用，48k 播测试音正常 |
+| T0.2 | 建 P0 所需组件骨架（本轮 5 个：board/audio_io/audio_fe/audio_player/assets；其余模块随对应任务创建，避免空骨架） | `idf.py build` 通过 |
+| T0.3 | `board`：引脚宏、按键初始化/读取（LED 驱动留给 `dev_ctrl`/P3） | 按键可读、引脚集中定义 |
+| T0.4 | `audio_io`：I2S0 RX 16k（32bit→int16）、I2S1 TX 48k 立体声 | 采集/播放通路可用（真机播测试音在 T0.7 验证） |
 | T0.5 | `diag`：日志 TAG 规范落地、启动信息、`esp_console` 框架 + `sys info/heap/tasks`、`log` 命令 | console 可交互 |
 | T0.6 | POC 迁移：AFE 唤醒 → `audio_fe` 回调 → `audio_player` 播放提示音（`CH_PROMPT`）；删除 `main/esp-ai.c` 旧代码 | 唤醒 + 提示音功能不退化 |
 | T0.7 | 交付自检：烧录、唤醒、播放、console；记录固件 size 与内存水位基线 | P0 验收报告（数据记录在 STATUS.md 基线表） |
@@ -84,7 +84,7 @@
 | T3.2 | 半双工规则 R1–R5 实现与真机验证 | 播放不误唤醒、打断可恢复 |
 | T3.3 | 三通道混音、音量 0~100、软限幅 -1dBFS、淡入淡出 | 播放质量达标 |
 | T3.4 | `dev_ctrl`：短按打断/开始对话、长按静音、LED 状态模式 | 物理交互可用 |
-| T3.5 | 提示音资源制作 + `tools/audio_pack.py` 打包到 assets 分区 | 提示音可配置 |
+| T3.5 | 提示音资源制作 + `tools/audio_pack.py` 打包进 `assets` 分区（SPIFFS 镜像）；把临时 `components/assets` 的 C 数组改成"启动时从分区加载索引"，完成后**删除该组件** | 提示音可单独烧 `assets` 分区替换（不重编固件）；app 固件体积下降 |
 | T3.6 | 错误提示：网络未连接、TTS 失败、超时 | 异常有明确反馈 |
 
 **验收**：按键打断 < 100ms；连续 10 轮对话内部堆稳定（无单调下降）；LED 状态与实际状态一致。
@@ -163,3 +163,5 @@ P0 ──> P1 ──> P2 ──> P3 ──> P4 ──> P5
 | 日期 | 版本 | 变更内容 |
 |---|---|---|
 | 2026-10-30 | v1.0 | 初版：P0–P5 排期、任务清单、验收标准、风险缓冲 |
+| 2026-10-30 | v1.1 | T0.2 调整为按需创建组件骨架（MVP 先建 5 个），进度与基线改由 STATUS.md 维护 |
+| 2026-10-30 | v1.2 | T0.3 去掉 LED（移到 dev_ctrl）、T0.4 去掉环形缓冲（由 audio_player 队列承担），与已实现代码对齐 |

@@ -1,2 +1,3 @@
-idf_component_register(SRCS "esp-ai.c" "voice_data.c"
-                    INCLUDE_DIRS ".")
+idf_component_register(SRCS "app_main.c"
+                       INCLUDE_DIRS "."
+                       REQUIRES board audio_io audio_fe audio_player assets)

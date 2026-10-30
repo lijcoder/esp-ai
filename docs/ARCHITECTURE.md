@@ -133,25 +133,28 @@ TTS(MP3) ─┐
 └─────────────────────────────────────────────────────────┘
 ```
 
+> **L 指 Layer（调用层级）**：数字越大越靠上层。依赖方向只能从大编号指向小编号（L4→L3→L2→L1→L0），禁止反向依赖或跨层直连；同层之间通过 `event_bus`/队列通信。`assets` 是纯资源组件，不参与分层。
+
 ### 4.1 模块清单
 
-| 模块 | 确定职责 | 对外接口 |
-|---|---|---|
-| `board` | 引脚定义、LED、按键、初始化顺序 | `board_init()`, `board_led_set()`, `board_button_read()` |
-| `audio_io` | I2S0 RX / I2S1 TX 双通道 HAL，环形缓冲，16k/48k | `audio_io_init()`, `audio_io_read()`, `audio_io_write()`, `audio_io_flush()` |
-| `audio_fe` | AFE 封装：feed 开关、唤醒/VAD 回调、上行音频输出 | `audio_fe_init()`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_read_uplink()`, `audio_fe_register_cb()` |
-| `audio_player` | 三通道播放：源抽象(HTTP/文件)、MP3 解码、重采样、混音、音量、限幅、淡入淡出 | `player_init()`, `player_play_uri(ch, uri)`, `player_play_stream(ch, cb)`, `player_stop(ch, fade)`, `player_set_volume()`, `player_duck(ch, db)` |
-| `codec_enc` | Opus 编码（16k/16kbps/20ms） | `enc_open()`, `enc_encode(pcm, out, len)`, `enc_close()` |
-| `config_store` | NVS 读写（音量、设备状态）；编译期常量走 Kconfig | `cfg_get_int()`, `cfg_set_int()`, `cfg_get_str()`, `cfg_set_str()` |
-| `net_mgr` | WiFi STA 连接、自动重连、SNTP 对时、网络事件 | `net_init()`, `net_is_up()`, `net_wait_ready(ms)` |
-| `transport_ws` | wss 客户端：连接/重连/心跳/发送队列/二进制帧收发 | `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()` |
-| `voice_cloud` | 语音云协议：会话建立、上行音频、下行事件解析与分发 | `vc_start()`, `vc_send_audio()`, `vc_cancel()`, `vc_register_cb()` |
-| `music_cloud` | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
-| `voice_session` | 会话状态机 + 半双工调度 + 超时重试 | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_get_state()` |
-| `music_session` | 音乐播放控制：播放/暂停/继续/停止/切歌；与语音抢占 | `ms_init()`, `ms_play()`, `ms_pause()`, `ms_resume()`, `ms_stop()` |
-| `dev_ctrl` | 按键事件（短按/长按）、LED 状态模式、静音切换 | `dev_init()`, `dev_register_cb()` |
-| `diag` | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
-| `event_bus` | 全局事件定义与分发（基于 esp_event） | `app_evt_register()`, `app_evt_post()` |
+| 模块 | 层级 | 确定职责 | 对外接口 |
+|---|---|---|---|
+| `board` | L0 板级/驱动 | 引脚定义、按键、初始化顺序（LED 待 `dev_ctrl` 任务接入） | `board_init()`, `board_button_pressed()` |
+| `audio_io` | L0 板级/驱动 | I2S0 RX（16k 采集）/ I2S1 TX（48k 播放）HAL | `audio_io_init()`, `audio_io_read_mic()`, `audio_io_write_spk()`, `audio_io_spk_enable()` |
+| `config_store` | L1 基础服务 | NVS 读写（音量、设备状态）；编译期常量走 Kconfig | `cfg_get_int()`, `cfg_set_int()`, `cfg_get_str()`, `cfg_set_str()` |
+| `net_mgr` | L1 基础服务 | WiFi STA 连接、自动重连、SNTP 对时、网络事件 | `net_init()`, `net_is_up()`, `net_wait_ready(ms)` |
+| `transport_ws` | L1 基础服务 | wss 客户端：连接/重连/心跳/发送队列/二进制帧收发 | `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()` |
+| `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event） | `app_evt_register()`, `app_evt_post()` |
+| `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 回调（上行音频读取随 P2 增加） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()` |
+| `audio_player` | L2 音频引擎 | 播放引擎：PCM 播放 + 重采样到 48k + 软件音量 + 淡入淡出（多通道/MP3/HTTP 随 P2–P4 增加） | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_register_done_cb()`, `audio_player_set_volume()` |
+| `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms） | `enc_open()`, `enc_encode(pcm, out, len)`, `enc_close()` |
+| `voice_cloud` | L3 能力 | 语音云协议：会话建立、上行音频、下行事件解析与分发 | `vc_start()`, `vc_send_audio()`, `vc_cancel()`, `vc_register_cb()` |
+| `music_cloud` | L3 能力 | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
+| `dev_ctrl` | L3 能力 | 按键事件（短按/长按）、LED 状态模式、静音切换 | `dev_init()`, `dev_register_cb()` |
+| `diag` | L3 能力 | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
+| `voice_session` | L4 业务编排 | 会话状态机 + 半双工调度 + 超时重试 | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_get_state()` |
+| `music_session` | L4 业务编排 | 音乐播放控制：播放/暂停/继续/停止/切歌；与语音抢占 | `ms_init()`, `ms_play()`, `ms_pause()`, `ms_resume()`, `ms_stop()` |
+| `assets`（临时） | 资源（不分层） | 内置提示音 PCM 资源；P3（T3.5）迁到 `assets` 分区后删除该组件 | `prompt_wo_zai_ne_pcm[]` |
 
 ### 4.2 事件总线（确定）
 
@@ -197,6 +200,7 @@ esp-ai/
 │   ├── audio_io/
 │   ├── audio_fe/
 │   ├── audio_player/               # decoder_mp3.c / resample.c / mixer.c / source_http.c / source_file.c
+│   ├── assets/                     # 临时：内置提示音 PCM（P3 迁到 assets 分区后删除）
 │   ├── codec_enc/
 │   ├── config_store/
 │   ├── net_mgr/
@@ -227,7 +231,7 @@ esp-ai/
 | `feed_Task()` | `components/audio_fe` 内部采集任务 |
 | `detect_Task()` | `components/audio_fe` 回调 → `event_bus` |
 | `play_voice_task()` | `components/audio_player` 的 `CH_PROMPT` 路径 |
-| `voice_data.c` | 转为 `assets` 分区资源（提示音） |
+| `voice_data.c` | 转为 `components/assets`（临时内置），P3 迁到 `assets` 分区 |
 | `app_main()` | `main/app_main.c` 初始化编排 |
 
 迁移后 `main/` 只保留组装逻辑，原 `esp-ai.c` 删除。

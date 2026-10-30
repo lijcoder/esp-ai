@@ -53,9 +53,16 @@
 components/<module>/
 ├── CMakeLists.txt
 ├── Kconfig
+├── idf_component.yml       # 可选：本组件的托管依赖（如 esp-sr）
+├── README.md               # 必需：组件作用、接口、依赖、配置、约束、后续
 ├── include/<module>.h      # 唯一对外头文件
 └── <module>.c              # 内部实现
 ```
+
+每个组件目录必须有 `README.md`，内容至少包含：作用（一句话）、对外接口表、依赖、Kconfig 配置、关键约束/后续计划。新增组件时同步补 README。
+
+托管依赖（`idf_component.yml`）声明在**实际使用它的组件**目录下，不要一律堆到 `main/`：
+`main` 只是 `idf.py create-manifest` 的默认位置；组件管理器的依赖解析按组件进行。
 
 ## 6. 协议
 

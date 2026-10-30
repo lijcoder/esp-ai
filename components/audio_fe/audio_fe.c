@@ -46,9 +46,12 @@ static void feed_task(void *arg)
     while (s_running) {
         /* 始终读麦克风以保持真实时间节奏；半双工时丢弃数据只喂静音 */
         int got = audio_io_read_mic(buf, (size_t)chunksize, 100);
+        if (got < 0) {
+            /* 读失败按 0 帧处理，避免负值参与后续指针运算 */
+            got = 0;
+        }
         if (got < chunksize) {
-            memset((uint8_t *)buf + got * sizeof(int16_t), 0,
-                   (size_t)(chunksize - got) * sizeof(int16_t));
+            memset(buf + got, 0, (size_t)(chunksize - got) * sizeof(int16_t));
         }
         if (!s_feed_enabled) {
             memset(buf, 0, (size_t)chunksize * sizeof(int16_t));
@@ -66,6 +69,8 @@ static void fetch_task(void *arg)
     ESP_LOGI(TAG, "fetch task start");
 
     while (s_running) {
+        /* fetch_with_delay 的超时参数是 tick（与 audio_io 的毫秒不同）：
+         * 200ms >> 一帧 32ms，仅用于让任务能响应 s_running 退出。 */
         afe_fetch_result_t *res = s_afe->fetch_with_delay(s_afe_data, pdMS_TO_TICKS(200));
         if (!res || res->ret_value == ESP_FAIL) {
             continue;

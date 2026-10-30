@@ -29,6 +29,7 @@
 
 - 音频任务内禁止：`malloc`、网络/HTTP、Flash 读写、阻塞等待、长持有 mutex。
 - 采样率固定：麦克风 16kHz、功放 48kHz，运行中不切换。
+- **超时参数必核对单位**：IDF I2S 驱动 `i2s_channel_read/write` 的最后一个参数是**毫秒**，禁止传 `pdMS_TO_TICKS()`；只有 FreeRTOS API（`TickType_t` 参数，如 `fetch_with_delay`）才用 tick。单位错会让读写持续超时、功能静默失效（2026-10-30 唤醒失效即此原因，见 STATUS）。
 - 半双工规则 R1–R5（ARCHITECTURE §3.3）是硬约束，任何改动必须同步架构文档。
 - 播放必须淡入 10ms / 淡出 100ms；混音后软限幅 -1dBFS。
 - 唤醒词/VAD 回调里只投递事件，不做耗时操作。

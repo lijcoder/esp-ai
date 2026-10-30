@@ -32,6 +32,12 @@
 | `AUDIO_FE_MODEL_PARTITION` | `model` | 模型分区标签 |
 | `AUDIO_FE_INPUT_FORMAT` | `M` | 单麦；后续 AEC 实验可改 `MR`/`MMR` |
 
+## 关键约束
+
+- 麦克风读取失败（`audio_io_read_mic` 返回负值）时按 0 帧处理并整帧补零，禁止让负值参与指针运算（否则 memset 会越界写堆）。
+- 每次 `feed` 必须喂 **chunksize × nch** 个 int16（单麦 chunksize=512/32ms）；不足帧补零，不能改变喂数节奏。
+- `fetch_with_delay` 的超时参数是 **tick**（与 `audio_io` 的毫秒不同），用于让 fetch 任务能响应退出。
+
 ## 依赖
 
 `audio_io`（采集）、`espressif/esp-sr`（见 `idf_component.yml`）。

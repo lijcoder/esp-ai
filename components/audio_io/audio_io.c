@@ -131,9 +131,13 @@ int audio_io_read_mic(int16_t *dst, size_t frames, uint32_t timeout_ms)
     }
 
     size_t bytes_read = 0;
+    /* 注意：i2s_channel_read 的最后一个参数单位是毫秒（不是 tick），
+     * 不能传 pdMS_TO_TICKS()，否则在 100Hz tick 下会被除以 10，
+     * 读 512 帧 @16k（需 32ms）必然超时（2026-10-30 唤醒失效的根因）。 */
     esp_err_t err = i2s_channel_read(s_rx, s_rx_scratch, frames * sizeof(int32_t),
-                                     &bytes_read, pdMS_TO_TICKS(timeout_ms));
-    if (err != ESP_OK) {
+                                     &bytes_read, timeout_ms);
+    /* 超时但已拿到部分数据时按实际帧数返回，由调用方补零，避免整帧丢弃 */
+    if (err != ESP_OK && bytes_read == 0) {
         return -1;
     }
 
@@ -153,8 +157,8 @@ int audio_io_write_spk(const int16_t *data, size_t frames, uint32_t timeout_ms)
 
     size_t bytes_written = 0;
     esp_err_t err = i2s_channel_write(s_tx, data, frames * 2 * sizeof(int16_t),
-                                      &bytes_written, pdMS_TO_TICKS(timeout_ms));
-    if (err != ESP_OK) {
+                                      &bytes_written, timeout_ms);
+    if (err != ESP_OK && bytes_written == 0) {
         return -1;
     }
     return (int)(bytes_written / (2 * sizeof(int16_t)));

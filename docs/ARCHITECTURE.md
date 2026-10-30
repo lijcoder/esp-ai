@@ -437,7 +437,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `voice state` / `voice start` / `voice interrupt` / `voice wake on\|off` | 会话调试 |
 | `music play <url>` / `music pause` / `music resume` / `music stop` | 音乐调试 |
 
-日志 TAG 固定：`BOARD`、`AUDIO_IO`、`AFE`、`PLAYER`、`ENC`、`NET`、`WS`、`VC`、`VS`、`MC`、`MS`、`DEV`、`DIAG`、`CFG`。
+日志 TAG 固定：`BOARD`、`AUDIO_IO`、`AFE`、`PLAYER`、`ENC`、`NET`、`WS`、`VC`、`VS`、`MC`、`MS`、`DEV`、`DIAG`、`CFG`、`APP`（`APP` 属 `main/` 启动编排，不占组件层级）。
 
 ---
 

@@ -7,6 +7,7 @@
 #include "esp_afe_sr_models.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wn_models.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,6 +29,7 @@ static void *s_cb_arg = NULL;
 static volatile bool s_running = false;
 static volatile bool s_feed_enabled = true;
 static char s_wn_name[32] = {0};
+static bool s_fetch_chunk_logged; /* 只在 fetch 任务里读写，单线程无需保护 */
 
 /* ---- 观测统计（mic stat）：只在 feed/fetch 任务里单写，命令侧只读 ---- */
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -67,6 +69,265 @@ static void stats_accumulate(const int16_t *buf, int frames)
         s_stat_peak = peak;
     }
     portEXIT_CRITICAL(&s_stats_mux);
+}
+
+/* ---------------- 上行 16k PCM 环形缓冲（T2.1） ----------------
+ *
+ * 生产者 = afe_fetch 任务（单写），消费者 = 调用 audio_fe_uplink_read 的任务（单读）。
+ * 为什么不用回调：编码（Opus）+ 发送（ws_send_bin 内部要分配队列节点）若放进
+ * afe_fetch 会违反 CONVENTIONS §3（音频任务禁止 malloc/网络/阻塞）；环形缓冲把
+ * 抖动隔离到消费端任务，AFE 任务里只剩一次 memcpy + 一次任务通知。
+ *
+ * 两端在同一把临界区里做 memcpy + 索引更新：单次拷贝 ≤ 1KB、关中断微秒级，
+ * 比 mutex 更稳（mutex 可能让 fetch 任务阻塞在持锁方）。
+ */
+static int16_t *s_up_ring; /* PSRAM，容量为 2 的幂 */
+static uint32_t s_up_ring_samples;
+static uint32_t s_up_head; /* 累计写入样本（减去 tail 即当前占用） */
+static uint32_t s_up_tail; /* 累计读出样本 */
+static volatile bool s_up_active;
+static TaskHandle_t s_up_reader; /* 最近一次调用 read 的任务，写入后通知它 */
+static portMUX_TYPE s_up_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_up_written;
+static uint32_t s_up_read;
+static uint32_t s_up_dropped;
+static uint32_t s_up_timeouts;
+static uint32_t s_up_high_water;
+static uint32_t s_up_first_frame_us;
+static int64_t s_up_start_us;
+
+static esp_err_t uplink_init(void)
+{
+#if CONFIG_AUDIO_FE_UPLINK_RING_MS > 0
+    uint32_t want = (uint32_t)CONFIG_AUDIO_FE_UPLINK_RING_MS * AUDIO_IO_MIC_SAMPLE_RATE / 1000u;
+    uint32_t cap = 1;
+
+    /* 容量取 2 的幂：取模用掩码，且 2000ms → 32000 样本 → 32768（2.048s） */
+    while (cap < want) {
+        cap <<= 1;
+    }
+    s_up_ring = heap_caps_malloc((size_t)cap * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!s_up_ring) {
+        ESP_LOGE(TAG, "uplink ring alloc failed: %u B (PSRAM)",
+                 (unsigned)(cap * sizeof(int16_t)));
+        return ESP_ERR_NO_MEM;
+    }
+    s_up_ring_samples = cap;
+    ESP_LOGI(TAG, "uplink ring: %u samples (%u ms), %u B PSRAM", (unsigned)cap,
+             (unsigned)(cap * 1000u / AUDIO_IO_MIC_SAMPLE_RATE),
+             (unsigned)(cap * sizeof(int16_t)));
+    return ESP_OK;
+#else
+    ESP_LOGW(TAG, "uplink disabled (CONFIG_AUDIO_FE_UPLINK_RING_MS=0)");
+    return ESP_OK;
+#endif
+}
+
+/* 写入一帧 AFE 输出；由 afe_fetch 任务调用，禁止日志/分配/阻塞 */
+static void uplink_write(const int16_t *src, size_t samples)
+{
+    if (!s_up_active || !src || samples == 0) {
+        return;
+    }
+
+    TaskHandle_t reader;
+
+    portENTER_CRITICAL(&s_up_mux);
+    const uint32_t cap = s_up_ring_samples;
+    uint32_t used = s_up_head - s_up_tail;
+
+    /* 异常大帧（> 整环）只保留尾部，避免绕圈写两遍 */
+    if (samples > cap) {
+        src += samples - cap;
+        samples = cap;
+    }
+    if (samples > cap - used) {
+        /* 环满：丢最旧样本，保证上行时延上限（宁可丢数据也不让延迟无限增长） */
+        uint32_t over = (uint32_t)samples - (cap - used);
+        s_up_tail += over;
+        s_up_dropped += over;
+        used = cap;
+    }
+    uint32_t idx = s_up_head & (cap - 1u);
+    uint32_t first = cap - idx;
+    if (first > samples) {
+        first = (uint32_t)samples;
+    }
+    memcpy(&s_up_ring[idx], src, first * sizeof(int16_t));
+    if (samples > first) {
+        memcpy(&s_up_ring[0], src + first, (samples - first) * sizeof(int16_t));
+    }
+    s_up_head += (uint32_t)samples;
+    s_up_written += (uint32_t)samples;
+    used = s_up_head - s_up_tail;
+    if (used > s_up_high_water) {
+        s_up_high_water = used;
+    }
+    reader = s_up_reader;
+    portEXIT_CRITICAL(&s_up_mux);
+
+    /* 丢弃只记统计、不在音频任务里 WARN：UART 输出可能阻塞（CONVENTIONS §3），
+     * 由 console/消费端读 stats 时发现 samples_dropped 增长再告警 */
+    if (reader) {
+        xTaskNotifyGive(reader);
+    }
+}
+
+esp_err_t audio_fe_uplink_start(void)
+{
+    if (!s_up_ring) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    portENTER_CRITICAL(&s_up_mux);
+    s_up_head = 0;
+    s_up_tail = 0;
+    s_up_written = 0;
+    s_up_read = 0;
+    s_up_dropped = 0;
+    s_up_timeouts = 0;
+    s_up_high_water = 0;
+    s_up_first_frame_us = 0;
+    s_up_start_us = esp_timer_get_time();
+    s_up_reader = NULL;
+    s_up_active = true;
+    portEXIT_CRITICAL(&s_up_mux);
+
+    ESP_LOGI(TAG, "uplink started");
+    return ESP_OK;
+}
+
+void audio_fe_uplink_stop(void)
+{
+    uint32_t written;
+    uint32_t dropped;
+    bool was_active;
+
+    portENTER_CRITICAL(&s_up_mux);
+    was_active = s_up_active;
+    s_up_active = false;
+    s_up_head = 0;
+    s_up_tail = 0;
+    s_up_reader = NULL;
+    written = s_up_written;
+    dropped = s_up_dropped;
+    portEXIT_CRITICAL(&s_up_mux);
+
+    if (was_active) {
+        ESP_LOGI(TAG, "uplink stopped (written %u, dropped %u samples)", (unsigned)written,
+                 (unsigned)dropped);
+    }
+}
+
+bool audio_fe_uplink_active(void)
+{
+    return s_up_active;
+}
+
+int audio_fe_uplink_read(int16_t *dst, size_t samples, uint32_t timeout_ms)
+{
+    if (!dst || samples == 0) {
+        return -ESP_ERR_INVALID_ARG;
+    }
+    if (!s_up_ring) {
+        return -ESP_ERR_INVALID_STATE;
+    }
+
+    portENTER_CRITICAL(&s_up_mux);
+    s_up_reader = xTaskGetCurrentTaskHandle();
+    portEXIT_CRITICAL(&s_up_mux);
+
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+
+    for (;;) {
+        uint32_t got = 0;
+        /* 只在"够 samples 个"或"已到超时"时才交数据：消费端（T2.2）按 20ms 精确
+         * 分帧，若一有数据就返回小块，编码器就得自己重组，契约会变模糊。 */
+        bool deadline_passed = esp_timer_get_time() >= deadline_us;
+
+        portENTER_CRITICAL(&s_up_mux);
+        uint32_t avail = s_up_head - s_up_tail;
+        if (avail >= samples) {
+            got = (uint32_t)samples;
+        } else if (avail > 0 && deadline_passed) {
+            got = avail; /* 超时：把剩余不足一帧的数据交给调用方，避免丢样本 */
+        }
+        if (got > 0) {
+            const uint32_t cap = s_up_ring_samples;
+            uint32_t idx = s_up_tail & (cap - 1u);
+            uint32_t first = cap - idx;
+            if (first > got) {
+                first = got;
+            }
+            memcpy(dst, &s_up_ring[idx], first * sizeof(int16_t));
+            if (got > first) {
+                memcpy(dst + first, &s_up_ring[0], (got - first) * sizeof(int16_t));
+            }
+            s_up_tail += got;
+            s_up_read += got;
+            if (s_up_first_frame_us == 0 && s_up_start_us != 0) {
+                s_up_first_frame_us = (uint32_t)(esp_timer_get_time() - s_up_start_us);
+            }
+        }
+        portEXIT_CRITICAL(&s_up_mux);
+
+        if (got > 0) {
+            /* 本次读结束：清掉等待者，避免 fetch 任务持续给 console 任务累积任务通知 */
+            portENTER_CRITICAL(&s_up_mux);
+            s_up_reader = NULL;
+            portEXIT_CRITICAL(&s_up_mux);
+            return (int)got;
+        }
+        if (!s_up_active) {
+            portENTER_CRITICAL(&s_up_mux);
+            s_up_reader = NULL;
+            portEXIT_CRITICAL(&s_up_mux);
+            return 0;
+        }
+        int64_t remain_ms = (deadline_us - esp_timer_get_time()) / 1000;
+        if (remain_ms <= 0) {
+            portENTER_CRITICAL(&s_up_mux);
+            s_up_timeouts++;
+            s_up_reader = NULL;
+            portEXIT_CRITICAL(&s_up_mux);
+            return 0;
+        }
+        /* 写入方在退出临界区之后才通知：即使通知先于本次等待到达，
+         * ulTaskNotifyTake 也会立即返回，不会丢唤醒 */
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS((uint32_t)remain_ms));
+    }
+}
+
+esp_err_t audio_fe_uplink_stats_read(audio_fe_uplink_stats_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_up_mux);
+    out->samples_written = s_up_written;
+    out->samples_read = s_up_read;
+    out->samples_dropped = s_up_dropped;
+    out->read_timeouts = s_up_timeouts;
+    out->ring_samples = s_up_ring_samples;
+    out->high_water = s_up_high_water;
+    out->first_frame_us = s_up_first_frame_us;
+    out->active = s_up_active;
+    portEXIT_CRITICAL(&s_up_mux);
+    return ESP_OK;
+}
+
+esp_err_t audio_fe_uplink_stats_reset(void)
+{
+    portENTER_CRITICAL(&s_up_mux);
+    s_up_written = 0;
+    s_up_read = 0;
+    s_up_dropped = 0;
+    s_up_timeouts = 0;
+    s_up_high_water = 0;
+    s_up_first_frame_us = 0;
+    portEXIT_CRITICAL(&s_up_mux);
+    return ESP_OK;
 }
 
 static void feed_task(void *arg)
@@ -146,6 +407,17 @@ static void fetch_task(void *arg)
                      s_cb_arg);
             }
         }
+
+        /* 上行音频：AFE 输出（16k/单声道/int16）。帧长由 AFE 决定，
+         * 只打印一次供 T2.2 分帧参考（不要把 fetch 帧长当 Opus 帧长假设）。 */
+        if (res->data && res->data_size > 0) {
+            if (!s_fetch_chunk_logged) {
+                s_fetch_chunk_logged = true;
+                ESP_LOGI(TAG, "fetch chunk: %d samples (%d ms)", res->data_size / 2,
+                         (res->data_size / 2) * 1000 / AUDIO_IO_MIC_SAMPLE_RATE);
+            }
+            uplink_write(res->data, (size_t)res->data_size / sizeof(int16_t));
+        }
     }
 
     vTaskDelete(NULL);
@@ -201,6 +473,12 @@ esp_err_t audio_fe_init(audio_fe_cb_t cb, void *arg)
 
     ESP_LOGI(TAG, "afe ready: input_format=\"%s\" mic=%d Hz", CONFIG_AUDIO_FE_INPUT_FORMAT,
              AUDIO_IO_MIC_SAMPLE_RATE);
+
+    /* 上行缓冲失败只降级（P1 功能不依赖它）：uplink_start 会返回 ESP_ERR_NOT_SUPPORTED，
+     * 唤醒/提示音仍可用，避免整机启动被一个可选功能卡死 */
+    if (uplink_init() != ESP_OK) {
+        ESP_LOGW(TAG, "uplink unavailable, wake/prompt keep working");
+    }
     return ESP_OK;
 }
 

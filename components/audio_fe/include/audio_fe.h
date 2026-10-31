@@ -56,3 +56,50 @@ esp_err_t audio_fe_stats_read(audio_fe_stats_t *out);
 
 /* 清零统计窗口（帧数、失败次数、唤醒次数、电平窗口一起清零） */
 esp_err_t audio_fe_stats_reset(void);
+
+/* ---------------- 上行 16k 单声道 PCM 输出（T2.1） ----------------
+ *
+ * 数据源 = AFE fetch 输出（已降噪的 16k/单声道/int16），不是原始麦克风。
+ * audio_fe 在 afe_fetch 任务里**只做一次 memcpy 写入 PSRAM 环形缓冲**；
+ * 编码/发送必须由消费端在自己的任务里做（CONVENTIONS §3：音频任务内禁止
+ * malloc/网络/阻塞），这也是不用"回调"而用环形缓冲的原因。
+ *
+ * 使用约定（详见 audio_fe README）：
+ *   1. 进入 LISTENING 前 start()，进入 SPEAKING（R1）或打断时 stop()；
+ *   2. feed 暂停（R1）时 AFE 吃静音、输出也是静音，**不能**用 feed 开关代替 stop；
+ *   3. read() 按需取样本，AFE 每帧长度由实现决定，**不要假设等于 Opus 20ms 帧**；
+ *   4. stop() 会丢弃残留数据；统计为累计值，可单独 reset。
+ */
+
+/* 分配缓冲并开始写入（清空残留 + 复位本次会话统计）；未初始化/未分配返回错误 */
+esp_err_t audio_fe_uplink_start(void);
+
+/* 停止写入并丢弃残留数据（不影响 feed 状态） */
+void audio_fe_uplink_stop(void);
+
+bool audio_fe_uplink_active(void);
+
+/**
+ * @brief 精确读取最多 samples 个样本（阻塞到够数或超时）
+ *
+ * @param dst         输出缓冲，由调用方提供（接口内不分配内存）
+ * @param samples     期望样本数（16k 单声道 int16）
+ * @param timeout_ms  超时；0 表示不等待
+ * @return >0 实际读到的样本数（超时可能少于 samples）；0 无数据（未启动/超时）；
+ *         <0 为 -esp_err_t
+ */
+int audio_fe_uplink_read(int16_t *dst, size_t samples, uint32_t timeout_ms);
+
+typedef struct {
+    uint32_t samples_written; /* AFE 输出累计写入样本数（16k 单声道） */
+    uint32_t samples_read;    /* 消费端累计读走样本数 */
+    uint32_t samples_dropped; /* 环形缓冲满时丢弃的最旧样本数 */
+    uint32_t read_timeouts;   /* read() 超时返回 0 的次数 */
+    uint32_t ring_samples;    /* 环形缓冲容量（样本，2 的幂） */
+    uint32_t high_water;      /* 历史最高占用（样本） */
+    uint32_t first_frame_us;  /* start() → 首次成功读出耗时（µs） */
+    bool active;              /* 当前是否在写入 */
+} audio_fe_uplink_stats_t;
+
+esp_err_t audio_fe_uplink_stats_read(audio_fe_uplink_stats_t *out);
+esp_err_t audio_fe_uplink_stats_reset(void);

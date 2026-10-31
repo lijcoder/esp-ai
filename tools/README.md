@@ -113,6 +113,35 @@ uv run tools/voice_test.py --no-reset --wakes 1   # 设备已在跑、不想复�
 
 ---
 
+## afe_uplink_test.py —— 上行 PCM 接口真机自测（T2.1）
+
+**作用**：验证 `audio_fe` 的上行 16k PCM 输出接口（`audio_fe_uplink_*`）在真机上的行为，
+是 T2.2（Opus 编码）/T2.5（`voice_cloud`）之前的上行链路基线。一条命令完成：复位 → 精确分帧读出 →
+回放可闻 → 溢出去 → 反复开关无泄漏 → 唤醒链路回归。
+
+```bash
+uv run tools/afe_uplink_test.py --volume 50 --log /tmp/afe_uplink.log
+uv run tools/afe_uplink_test.py --no-reset          # 设备已在跑、不想复位
+```
+
+**断言项**（15 项，全 PASS 退出码 0）：
+
+- 环形缓冲已分配（32768 样本 / 2048ms / 64KB PSRAM）；
+- 320 样本精确成帧（AFE fetch 512 样本 → 消费端重组）、样本/时长比例 16k ±10%、无丢弃、读超时 ≤1、首帧 <200ms；
+- 回放能被上行拾到：**3s 1kHz 音调 + 4s 窗口**，比较同一窗口内的「音调段 RMS」与「静音段 RMS」（≥ max(300, 静音段×1.5)）；
+  用音调而非语音，是因为本机系统音量上限 50% 时语音在设备侧只比底噪高 1~4dB，波动大、易误判；
+- 交互语音回放时上行有真实音频（非全零/静音）；
+- 溢出策略：停读 3.5s（>2.048s 缓冲）后 `samples_dropped` 增长、最高占用=缓冲容量、恢复后仍能读；
+- 反复 `on/off` 10 次：内部 RAM / PSRAM 剩余 Δ ≤ 4KB；
+- 唤醒链路完整（`wake detected → feed paused → PLAYER: play → prompt done, feed resumed`），无音频链路 ERROR。
+
+**参数**：`--port`、`--no-reset`、`--boot-timeout`、`--volume`（临时调系统音量，结束恢复；上限 50）、`--log`。
+
+**依赖与限制**：PEP 723 内联 `pyserial>=3.5`；脚本**独占串口**（先关 `idf.py monitor`）；需要 Mac 扬声器回放
+（音调 WAV 临时生成在系统临时目录，结束删除，不进仓库）。环境底噪偏高时会自动重试 3 轮。
+
+---
+
 ## ws_mock_server.py —— 本地「云端」WS 模拟服务（T1.5）
 
 **作用**：在真实后端就绪前，用一台电脑模拟云端 WebSocket 服务（握手、心跳、事件下发、TTS 音频流），让端侧 T1.4/T1.6 以及 P2–P4 全部能脱机联调（ROADMAP §2.0 P1 顺序 0：可最早启动，端侧不必等后端）。

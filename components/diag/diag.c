@@ -471,6 +471,154 @@ static int cmd_mic(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- afe 命令（上行 PCM 探针，T2.1） ----------------
+ *
+ * 开发期探针（同 T1.6 `ws send` 先例）：只做观测，不参与产品链路、不改协议。
+ * 读动作放在 console 任务里同步做（不新增任务），按 320 样本（20ms@16k）读，
+ * 顺带验证 T2.2 需要的"精确分帧读出"契约。
+ */
+#define AFE_UPLINK_PROBE_FRAME 320 /* 20ms @ 16k，Opus 帧长 */
+#define AFE_UPLINK_SEG_MS      500 /* 分段 RMS 粒度：抗环境底噪漂移，供对比回放前后 */
+#define AFE_UPLINK_SEG_MAX     20
+
+static void print_uplink_segments(const uint64_t *seg_sq, const uint32_t *seg_n, uint32_t segs)
+{
+    printf("  分段 RMS(%dms):", AFE_UPLINK_SEG_MS);
+    for (uint32_t i = 0; i < segs; i++) {
+        uint32_t v = seg_n[i] ? (uint32_t)lround(sqrt((double)seg_sq[i] / (double)seg_n[i])) : 0;
+        printf(" %u", (unsigned)v);
+    }
+    printf("\n");
+}
+
+static void print_afe_uplink(uint32_t window_ms)
+{
+    static int16_t frame[AFE_UPLINK_PROBE_FRAME];
+    audio_fe_uplink_stats_t st;
+    uint32_t frames = 0;
+    uint32_t samples = 0;
+    uint64_t sum_sq = 0;
+    uint32_t peak = 0;
+    uint32_t rms = 0;
+    int64_t end_us;
+    uint64_t seg_sq[AFE_UPLINK_SEG_MAX];
+    uint32_t seg_n[AFE_UPLINK_SEG_MAX];
+    const uint32_t seg_samples = (uint32_t)AFE_UPLINK_SEG_MS * 16u;
+    uint32_t segs = 0;
+
+    memset(seg_sq, 0, sizeof(seg_sq));
+    memset(seg_n, 0, sizeof(seg_n));
+
+    if (audio_fe_uplink_stats_read(&st) != ESP_OK) {
+        printf("读取上行统计失败\n");
+        return;
+    }
+    if (!st.active) {
+        printf("上行未启动：先执行 `afe uplink on`（否则环形缓冲无数据）\n");
+    }
+
+    end_us = esp_timer_get_time() + (int64_t)window_ms * 1000;
+    while (esp_timer_get_time() < end_us) {
+        int64_t remain_ms = (end_us - esp_timer_get_time()) / 1000;
+        if (remain_ms <= 0) {
+            break;
+        }
+        int got = audio_fe_uplink_read(frame, AFE_UPLINK_PROBE_FRAME, (uint32_t)remain_ms);
+        if (got <= 0) {
+            break;
+        }
+        frames++;
+        uint32_t seg = samples / seg_samples;
+        samples += (uint32_t)got;
+        int64_t seg_sq_acc = 0;
+        for (int i = 0; i < got; i++) {
+            int32_t v = frame[i];
+            if (v < 0) {
+                v = -v;
+            }
+            if ((uint32_t)v > peak) {
+                peak = (uint32_t)v;
+            }
+            seg_sq_acc += (int64_t)v * v;
+        }
+        sum_sq += (uint64_t)seg_sq_acc;
+        if (seg < AFE_UPLINK_SEG_MAX) {
+            seg_sq[seg] += (uint64_t)seg_sq_acc;
+            seg_n[seg] += (uint32_t)got;
+            if (seg + 1 > segs) {
+                segs = seg + 1;
+            }
+        }
+    }
+    if (samples > 0) {
+        rms = (uint32_t)lround(sqrt((double)sum_sq / (double)samples));
+    }
+
+    if (audio_fe_uplink_stats_read(&st) != ESP_OK) {
+        return;
+    }
+
+    printf("上行 PCM（AFE 输出：16k / 单声道 / int16）\n");
+    printf("  环形缓冲: %u 样本（%u ms，%u B PSRAM），历史最高占用 %u 样本\n",
+           (unsigned)st.ring_samples,
+           st.ring_samples ? (unsigned)(st.ring_samples * 1000u / 16000u) : 0u,
+           (unsigned)(st.ring_samples * sizeof(int16_t)), (unsigned)st.high_water);
+    printf("  首帧延迟: %u us（目标 <200000 us）\n", (unsigned)st.first_frame_us);
+    printf("  累计写入 %u / 读取 %u / 丢弃 %u / 读超时 %u 样本\n",
+           (unsigned)st.samples_written, (unsigned)st.samples_read,
+           (unsigned)st.samples_dropped, (unsigned)st.read_timeouts);
+    printf("  本次窗口: %u ms，320 样本帧 %u 个（%u 样本）\n", (unsigned)window_ms,
+           (unsigned)frames, (unsigned)samples);
+    print_db_line("窗口电平 RMS", rms);
+    print_db_line("窗口峰值", peak);
+    if (segs > 0) {
+        print_uplink_segments(seg_sq, seg_n, segs);
+    }
+    if (st.samples_dropped > 0) {
+        printf("  注意: 有丢弃 —— 环形缓冲满（消费端读得太慢或未在读）\n");
+    }
+    if (frames == 0) {
+        printf("  注意: 窗口内没读到数据 —— 确认 `afe uplink on` 且麦克风在收音\n");
+    }
+}
+
+static int cmd_afe(int argc, char **argv)
+{
+    if (argc < 3 || strcmp(argv[1], "uplink") != 0) {
+        printf("用法: afe uplink on | off | stat [ms]\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *sub = argv[2];
+    if (strcmp(sub, "on") == 0) {
+        esp_err_t err = audio_fe_uplink_start();
+        if (err != ESP_OK) {
+            printf("启动上行失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("上行已启动（16k/单声道 PCM → PSRAM 环形缓冲）\n");
+        return ESP_OK;
+    }
+    if (strcmp(sub, "off") == 0) {
+        audio_fe_uplink_stop();
+        printf("上行已停止（残留数据已丢弃）\n");
+        return ESP_OK;
+    }
+    if (strcmp(sub, "stat") == 0) {
+        int ms = (argc > 3) ? atoi(argv[3]) : 1000;
+        if (ms < 100) {
+            ms = 100;
+        } else if (ms > 10000) {
+            ms = 10000;
+        }
+        print_afe_uplink((uint32_t)ms);
+        return ESP_OK;
+    }
+
+    printf("未知子命令: %s（可用: on | off | stat [ms]）\n", sub);
+    return ESP_ERR_INVALID_ARG;
+}
+
 /* ---------------- cfg 命令（配置持久化，T1.1） ---------------- */
 
 /*
@@ -1093,6 +1241,12 @@ static esp_err_t register_commands(void)
             .help = "麦克风统计：mic stat | reset",
             .hint = "stat|reset",
             .func = cmd_mic,
+        },
+        {
+            .command = "afe",
+            .help = "上行 PCM 探针（T2.1）：afe uplink on | off | stat [ms]",
+            .hint = "uplink on|off|stat [ms]",
+            .func = cmd_afe,
         },
         {
             .command = "cfg",

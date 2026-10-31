@@ -13,4 +13,14 @@ menu "Audio Front-End"
             AFE 输入通道格式：M=单麦，MR=单麦+参考，MMR=双麦+参考。
             本期硬件为单麦（INMP441），固定 "M"。
 
+    config AUDIO_FE_UPLINK_RING_MS
+        int "Uplink ring depth (ms of 16k mono audio)"
+        range 0 8000
+        default 2000
+        help
+            上行 PCM 环形缓冲深度（16k/单声道/int16，放 PSRAM）。
+            0 = 关闭上行接口（audio_fe_uplink_* 返回 ESP_ERR_NOT_SUPPORTED）。
+            默认 2000ms → 32768 样本（2.048s，64KB PSRAM）：足够吸收编码/发送
+            任务调度抖动，又能把上行时延限制在可接受范围（架构 §6.4 首帧 <200ms）。
+
 endmenu

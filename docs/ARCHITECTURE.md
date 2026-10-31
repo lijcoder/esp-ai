@@ -405,12 +405,13 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 
 | 资源 | 分配 |
 |---|---|
-| 内部 RAM | TLS ~45KB、WS ~24KB、I2S DMA、任务栈、编码器状态；峰值 ≤ 310KB，保留 ≥ 30KB |
-| PSRAM | AFE 缓冲 ~200KB、播放 ring 1MB（三通道合计）、HTTP 缓冲 128KB、解码器状态、预留 4MB+ |
+| 内部 RAM | WS ~24KB、I2S DMA、任务栈、编码器状态；**TLS 记录缓冲与握手堆自 X3-F 起放 PSRAM**；峰值 ≤ 310KB，保留 ≥ 30KB |
+| PSRAM | TLS 记录缓冲 8K+2K 与握手堆（~26KB 实测）、AFE 缓冲 ~200KB、播放 ring 1MB（三通道合计）、HTTP 缓冲 128KB、解码器状态、预留 4MB+ |
 | Flash | app 2×3M（一槽使用）、model 1.5M、assets 2M、storage 6.25M |
 
 > T1.4 实测（见 STATUS §5 基线）：`ws://` 连接时内部堆峰值 209,252 B；`wss`/TLS 握手期峰值 236,544 B、**最低水位 27,655 B**（略低于上面「保留 ≥30KB」的目标）。
-> WS 发送队列 8KB 已按约定放 PSRAM；内部 RAM 余量的统一优化按 [PRODUCT_IDEAS §8 X3](PRODUCT_IDEAS.md) 排在 P2 前（触发条件已命中）。
+> WS 发送队列 8KB 已按约定放 PSRAM。
+> **X3-F 实测（2026-10-31，见 [PRODUCT_IDEAS §8 X3](PRODUCT_IDEAS.md) 与 STATUS §5）**：`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`（只把 mbedTLS 的堆放 PSRAM，WiFi/lwIP 驱动与数据路径不变，保时延）后，wss 握手期内部堆峰值 238,448→**216,668 B**、最低水位 25,087→**47,051~52,839 B**、最大块 30,720→31,744 B；PSRAM 占用 +25,656 B；TLS 握手耗时、boot→NET_UP、RTT 均无劣化。剩余 X3 项：C（WiFi 动态缓冲裁剪）待 P2 流式实测后判断，E（预算口径改「静态+堆峰值」并定目标值）待拍板。
 
 ### 9.3 任务与核心（确定）
 

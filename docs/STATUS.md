@@ -8,11 +8,11 @@
 
 | 项目 | 内容 |
 |---|---|
-| 当前阶段 | **P0 地基（已完成）→ P1 联网（进行中）** |
-| 当前任务 | P1 T1.4 完成：新增 `components/transport_ws`（L1，ws/wss 客户端：连接 + 退避重连 1/2/5/10/30s + `hello`/`hello_ack` 握手 + 20s ping / 10s pong 心跳 + 8B 二进制帧 + 8KB PSRAM 非阻塞发送队列；自建 `ws` 任务核 0/优先级 5/6KB，TLS 与收包在 `esp_websocket_client` 的 `ws_client` 库任务）+ `diag` 的 `ws status`/`ws reconnect` + `main` 在 `net_init` 后 `ws_init()`/`ws_start()`；`tools/ws_mock_server.py` 补 `hello_ack`（自测 9/9 PASS）。真机 9 项全部 PASS：上电 3.70s 联网→3.65s 握手完成；20s 心跳 RTT 94~234ms；服务端关闭后 1.43s 重建（<5s）；不可达时退避严格 1/2/5/10/30s 且恢复后即连；`wifi reconnect`→`NET_DOWN` 停 WS、`NET_UP` 后 130ms 恢复；token 错误（关闭码 4002）ERROR 后不再自动重试；坏 magic/ver/len/type 与 3021B 超长消息全部丢弃且连接不崩；`--drop-pong` 10s 判离线并重连；公网 `wss://` TLS 握手成功。固件 1,721,744 B（+197.5KB：TLS 握手 + 证书 bundle 为主），内部 RAM 峰值 209,252 B（ws://）/ 236,544 B（wss 握手期，最低水位 27,655 B 略低于 30KB 保留线，优化按 X3 排 P2 前），PSRAM 峰值 702,648 B，任务数 16 |
-| 下一步 | P1：T1.6 联调与基线收口（联网/心跳/断网恢复/mock 收发 + 记录内存增量，产出 P1 验收报告）；T1.2b（唤醒/VAD/播放改走事件）随 P2 的 T2.5/T3.1 落地 |
+| 当前阶段 | **P1 联网（已完成）→ P2 语音闭环（待开工，前置 X3 内存收敛）** |
+| 当前任务 | P1 T1.6 完成（**P1 验收通过**：自测断言 50/50 + 30min soak + 官方 `voice_test.py` 16/16）。补 `diag` 的 `ws send <json>` / `ws sendbin [len]` / `ws rxlog on\|off` 三个开发期探针（P1 还没有 `voice_cloud`、固件没有上行发送方，mock 双向收发无法验收；非阻塞、不改协议、不新增组件）。**A** 联网/握手/心跳/双向收发 16/16：NET_UP 5,680ms→握手 5,790ms（NET_UP 后 110ms）、心跳 ping/pong 1/1 RTT 203ms、上行 2 文本+5 二进制（seq 0~4 连续）、下行 11 文本+100 二进制帧、rx_bad=0/tx_dropped=0；**B** 韧性 18/18：服务端关闭 1.51s 重建（<5s）、退避严格 1000/2000/5000/10000/30000ms、4002→IDLE 且 5s 内 0 重试、`--drop-pong` 30.5s 判离线、`wifi reconnect`→`NET_DOWN` 停 WS 且 `NET_UP` 后 110ms 恢复、坏帧 5/5 丢弃后仍 READY；**C** 公网 wss 5/5（TLS `Certificate validated`、端点标 `wss/TLS`、echo 无 hello_ack → 5s 超时退避）；**D2** 阶段回归 11/11（唤醒 3/3 + R1/R2、10 轮压力回放 10/10、内部堆恒定 61,807 B、无 ERROR）；30min soak READY 30/30、堆 61,787→61,411 后完全持平。固件 1,724,480 B（+2,736 B，bin 口径；`idf.py size` 总镜像 +2,620 B）、DIRAM 193,250 B（+264 B）、PSRAM 峰值 702,472 B、任务数 16 |
+| 下一步 | **P2 前置 X3 内存收敛（0.5d，ROADMAP §4「内部 RAM 超预算立即停下优化」）**：wss 握手期最低水位 25,087 B（比 T1.4 再低 2.6KB），按 PRODUCT_IDEAS §8 X3 的 C（WiFi/lwIP 移 PSRAM，实测 RTT/首包）→ A(动态 RX/TX 裁剪) → E(预算口径改"静态+堆峰值"并在 ARCH §9.2 定目标) 收口；完成后 P2 双轨：上行 T2.1 → T2.2 → T2.5、下行 T2.3 → T2.4，收口 T2.6 |
 | 最后更新 | 2026-10-31 |
-| 阻塞项 | 无（开发板 `/dev/cu.usbmodem5CF90746951` 可烧录）；X1「提示符与日志互冲」仍按 PRODUCT_IDEAS §8 方案 A 接受；**内部 RAM 余量**：wss 握手期最低水位 27,655 B（低于 CONVENTIONS §4 的保留 30KB 线），按 X3 排在 P2 前统一优化；X2 已定稿（本地 ws:// + 线上 wss 双传输） |
+| 阻塞项 | 无硬阻塞（开发板 `/dev/cu.usbmodem5CF90746951` 可烧录）；遗留项 ①**内部 RAM 余量**（wss 25,087 B < 30KB 线约 5KB，已定为 P2 开工前置）；②X1「提示符与日志互冲」仍按 PRODUCT_IDEAS §8 方案 A 接受；③X2 已定稿（本地 ws:// + 线上 wss 双传输）；④异常收尾时非 TCP 错误分支会打印未初始化的握手状态码（`transport_ws` 的 `WEBSOCKET_EVENT_ERROR` type=0 分支），不影响功能，随 T2.5 修 |
 
 ## 2. 任务看板
 
@@ -30,11 +30,11 @@
 | P0 | T0.7a | diag 增 `mic stat`/`mic reset`（基线观测，T0.7 前置） | ☑ |
 | P0 | T0.7b | diag 增 `sys crash`，验证 coredump 落盘/解析链路 | ☑ |
 | P1 | T1.1 | config_store | ☑ |
-| P1 | T1.2 | event_bus（a 事件定义/分发封装；b 业务接线） | ◐ |
+| P1 | T1.2 | event_bus（a 事件定义/分发封装 ☑；b 业务接线延后，随 P2 的 T2.5/T3.1） | ◐ |
 | P1 | T1.3 | net_mgr（WiFi/重连/SNTP） | ☑ |
 | P1 | T1.4 | transport_ws | ☑ |
 | P1 | T1.5 | ws_mock_server.py | ☑ |
-| P1 | T1.6 | P1 联调与基线 | ☐ |
+| P1 | T1.6 | P1 联调与基线（P1 验收报告） | ☑ |
 | P2 | T2.1 | audio_fe 事件化 | ☐ |
 | P2 | T2.2 | codec_enc（Opus） | ☐ |
 | P2 | T2.3 | audio_player MP3 解码 | ☐ |
@@ -91,6 +91,7 @@
 | 2026-10-31 | 工具/文档 | 按用户听感收敛唤醒回放音量：**第一次** 系统音量 70% + `afplay -v 1.5`（相对增益 1.5×，约 +3.5 dB；比第二次响约 10.6 dB/3.4 倍振幅）→ 用户反馈**太响**；**第二次** 系统音量 31%（用户原本的默认值，未改）→ 4/4 唤醒（前 2 次 `-v 1.5`、后 2 次默认增益），用户确认**音量正好**。定稿：**系统音量保持 31% 不变 + `afplay` 默认增益**，`-v 1.5` 为上限，禁止调高系统音量；已写入 `AGENTS.md §3`、`CONVENTIONS.md §8`、`tools/README.md`。**零固件改动**（build/size 不变） |
 | 2026-10-31 | 工具/文档 | 用户澄清音量口径并修正文档（上一行"`-v 1.5` 为上限"表述不准确）：唤醒回放**正常 31%、上限 50%**（均为系统输出音量，50% 不得突破；70% 已否决），默认 `afplay` 增益；`-v` 放大须满足 **系统音量×增益 ≤50%**（31% + `-v 1.5` ≈ 46.5% 仍可，50% + `-v` 不可）。已同步 `AGENTS.md §3`、`CONVENTIONS.md §8`、`tools/README.md`。**零固件改动**（build/size 不变） |
 | 2026-10-31 | 工具/文档（自动语音测试） | 用户新增 2 个交互语音素材 `tools/今天天气如何.wav`（1.60 s）、`tools/今天吃了什么.wav`（1.04 s），均为 24 kHz/16bit/mono；连同 `tools/lexin.wav` 组成"唤醒 + 交互语音"回放素材，agent 测语音不再需要人喊话/说话。新增 `tools/voice_test.py`（PEP 723 + `pyserial`）：一条命令完成复位 → 基线 → 唤醒 ×3 → 交互语音回放 → 健康检查，自动断言唤醒链路（`wake detected`→`feed paused`→`PLAYER: play`→`prompt done`）、交互语音误唤醒 0、回放后 R2 恢复、I2S 读失败 0、无语音相关 ERROR，退出码 0/1；支持 `--volume 50`（临时调音量、结束恢复）、`--dry-run`、`--no-reset`、`--log`。真机验证（固件 1,721,744 B T1.4）：安静环境 31% 唤醒 6/6；环境噪声偏高（底噪 RMS 1,100~1,500）时 31% 5/9、50% 6/6；两个交互语音都被麦克风拾到且 AFE VAD=人声、误唤醒 0、无 ERROR/panic；设备侧电平（31%/50%）与素材属性记入 `tools/README.md`。另发现 3 个 WAV 均为**流式 RIFF 头**（data 长度 `0x7FFFFFxx` 占位，`afplay` 可播，严格解析器需按实际文件大小截断，`voice_test.py` 已处理）。规则同步 `AGENTS.md §3`、`CONVENTIONS.md §8`、`tools/README.md`。**零固件改动**（build/size 不变） |
+| 2026-10-31 | T1.6 | **P1 验收通过**（自测断言 50/50 + 30min soak + 官方 `voice_test.py` 16/16）。代码只动 `diag`：新增 `ws send <json>` / `ws sendbin [len]` / `ws rxlog on\|off` 三个**开发期探针**（P1 还没有 `voice_cloud`、固件没有上行发送方，mock 双向收发无法验收；非阻塞、不解析业务 JSON、不改协议、不新增组件），`ws status` 增联调提示行；`ws` 注册 help/hint 同步。**A** 联网/握手/心跳/双向收发 16/16：NET_UP 5,680ms→握手 5,790ms（NET_UP 后 110ms）、心跳 ping/pong 1/1 RTT 203ms、上行 2 文本+5 二进制（seq 0~4 连续、mock 侧可见）、下行 11 文本+100 二进制帧、rx_bad=0、tx_dropped=0。**B** 韧性 18/18：服务端 `--close-after` 关闭后 1.51s 重建（<5s）、退避严格 1000/2000/5000/10000/30000ms、4002→IDLE 且 5s 内 0 次自动重试、`--drop-pong` 30.5s 判离线、`wifi reconnect`→`NET_DOWN` 停 WS 且 `NET_UP` 后 110ms 恢复、坏帧 5/5（magic/ver/len/未知 type/3021B 超长）丢弃后仍 READY 且能收合法帧。**C** 公网 wss 5/5：`wss://echo.websocket.org/.ws` TLS 握手成功（`Certificate validated`、端点标 `wss/TLS`），echo 不回 hello_ack → 5s 判定超时并退避。**D2** 阶段回归 11/11：唤醒 3/3 + R1/R2 链路完整、10 轮压力回放 10/10 且内部堆恒定 61,807 B、任务数 16、日志无 ERROR；官方 `voice_test.py --wakes 3`（31% 音量）16/16（交互语音 VAD=人声、误唤醒 0、I2S 读失败 0）。**30min soak**：READY 30/30、`connect_count=1`、RTT 11~122ms、rx_bad/tx_dropped 0；内部堆 61,787→61,411（**-376 B 后完全持平 18 分钟**，形态与 `esp_console` 历史缓冲 `max_history_len=32` 封顶一致，判定非泄漏；T5.3 24h 压测以不发 console 命令的方式复核）。`idf.py build` 零警告；固件 1,724,480 B（+2,736 B，bin 口径；`idf.py size` 总镜像 1,724,364 B / +2,620 B）、DIRAM 193,250 B（+264 B）、PSRAM 峰值 702,472 B、任务数 16（`ws` 栈余 3,592 B、`ws_client` 余 4,044 B）。**遗留**：① wss 握手期内部堆最低水位 **25,087 B**（比 T1.4 的 27,655 B 再低 2.6KB，距 30KB 线差约 5KB）→ X3 升级为 P2 开工前置；② 异常收尾（kill mock + 设备立刻复位）时 `WS 错误` 打出未初始化的握手状态码（`WEBSOCKET_EVENT_ERROR` 的 type=0 分支读 `esp_ws_handshake_status_code`），不影响功能，随 T2.5 修。附：测试脚手架自身 2 个 bug（`wake_round` 的 mark 切断同批日志、`sys info` 结束标记少匹配空格）修正后复跑，非固件问题 |
 
 ## 4. 阻塞项
 
@@ -115,6 +116,7 @@
 | 2026-10-31 | P1（T1.3 net_mgr） | 1,524,256 B（+520,320 B：`esp_wifi`/`wpa_supplicant`/`mbedtls`/`lwip`/`esp_netif` + `net_mgr`） | 运行期内部 RAM 峰值占用 192,572 B（`sys heap` 口径 total−min_free，总量 267,327 B，最低水位 74,755 B，剩余 79,459 B，最大空闲块 31,744 B） | PSRAM 峰值占用 693,540 B（剩余 7,693,064 B，最大块 7,602,176 B） | 真机 12/12 PASS；上电 2.28s 起 STA / 5.61s IP / 5.65s SNTP；`wifi reconnect` 4.20s；任务数 9→14（+`wifi`/`sys_evt`/`esp_timer`/`Tmr Svc`/`tiT`）；`sys_evt` 栈剩余 2,172/4,096 B（原 2304 B 只剩 380 B，已加栈）；零警告；**T1.4 TLS 需关注最大空闲块 31.7KB** |
 | 2026-10-31 | P1（T1.4 transport_ws） | 1,721,744 B（+197,488 B：TLS 握手 + 证书 bundle + ws_client/transport_ws 代码；X3 方案 A/B 只动内存配置、不改镜像大小） | 运行期内部 RAM 峰值占用 **209,252 B**（`ws://` 连接稳态）/ **236,544 B**（`wss` TLS 握手期；剩余 76,351 B，最大块 28,672 B，**最低水位 27,655 B**） | PSRAM 峰值占用 702,648 B（剩余 7,684,832 B，最大块 7,602,176 B） | 真机 9 项 PASS（握手/心跳/重连/退避/断网恢复/鉴权失败/坏帧/心跳超时/wss TLS）；固件 1,721,744 B、DIRAM 192,986 B（+3,152 B）、任务数 16（+`ws` 6KB、`ws_client` 6KB 库任务）；`ws` 栈余 3,576 B、`ws_client` 栈余 3,432 B（TLS 后）；`idf.py build` 零警告。**风险**：wss 握手期内部 RAM 最低水位 27,655 B，低于 CONVENTIONS §4 的保留 30KB 线，按 X3 排在 P2 前统一优化 |
 | 2026-10-31 | 工具/文档（语音测试素材 + voice_test.py） | 1,721,744 B（未变，`idf.py build` 通过；`idf.py size` 总镜像 1,721,620 B、DIRAM 192,986 B，与 T1.4 一致） | —（零固件改动，沿用 T1.4 行；本任务未采运行期水位） | —（同上） | 仅 `tools/` 新增 2 个交互语音 wav + `voice_test.py`，文档更新；真机跑通自动语音自测（唤醒 31%/50%、交互语音 VAD/误唤醒 0、I2S 失败 0、无 ERROR）；无固件差异 |
+| 2026-10-31 | P1（T1.6 P1 验收） | 1,724,480 B（bin，+2,736 B；`idf.py size` 总镜像 1,724,364 B / +2,620 B：`diag` 三个 ws 探针命令与回调） | 运行期内部堆峰值 **210,904 B**（`ws://` READY，最低水位 52,815 B、最大块 31,744 B）/ **238,448 B**（wss 握手期，最低水位 **25,087 B**、最大块 30,720 B）；静态 DIRAM 193,250 B（+264 B） | PSRAM 峰值 702,472 B（剩余 7,683,232 B，最大块 7,602,176 B） | P1 验收：A 16/16 + B 18/18 + C 5/5 + D2 11/11 + 官方 `voice_test.py` 16/16 + 30min soak（READY 30/30、堆 -376 B 后持平、无坏帧/丢弃）；任务数 16（`ws` 栈余 3,592 B、`ws_client` 余 4,044 B）；唤醒 3/3 + 10 轮压力回放 10/10；`idf.py build` 零警告。**X3 触发**：wss 最低水位 25,087 B < 30KB 线约 5KB，已定为 P2 开工前置 |
 | — | P2 |  |  |  |  |
 | — | P3 |  |  |  |  |
 | — | P4 |  |  |  |  |

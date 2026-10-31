@@ -58,8 +58,27 @@
 | 坏帧容错 | 坏 magic/ver/len、未知 type、3021B 超长消息 → 全部丢弃 + WARN，连接保持 READY |
 | hello_ack 超时 | 5s 判定失败并退避（日志因同步 teardown 晚约 1s） |
 
+## T1.6 P1 验收复测（2026-10-31）
+
+同一套验收项按 P1 口径重跑，并补了**双向收发**（`diag` 的 `ws send/sendbin/rxlog` 探针）：
+
+| 项 | 实测 |
+|---|---|
+| 上电 → NET_UP → hello_ack | NET_UP 5,680 ms（uptime）/ 握手完成 5,790 ms → NET_UP 后 **110 ms** 完成 WS 握手 |
+| 心跳 | ping/pong 1/1、RTT **203 ms**；`--drop-pong` 下 30.5s 墙钟（20s ping + 10s 超时）判离线 |
+| 断线重连 | mock `--close-after` 关闭后 **1.51s** 重建（< 5s） |
+| 退避 | 实测严格 `[1000, 2000, 5000, 10000, 30000] ms`，恢复后即连 |
+| 断网恢复 | `wifi reconnect` → `NET_DOWN` 停 WS；`NET_UP` 后 **110 ms**（设备侧 98,050→98,160 ms）恢复 READY |
+| 鉴权失败 | 4002 → ERROR + 状态 IDLE，5s 内 0 次自动重连；改回正确 token 后 `ws reconnect` 恢复 |
+| 双向收发 | 上行 2 文本 + 5 二进制（seq 0~4 连续、mock 侧可见）；下行 11 文本 + 100 二进制帧，`rx_bad=0`、`tx_dropped=0` |
+| 坏帧容错 | 坏 magic/ver/len/未知 type/3021B → `rx_bad=5`、连接保持 READY、之后仍能收合法帧 |
+| 公网 wss | `wss://echo.websocket.org/.ws` TLS 握手成功（`Certificate validated`），8.8s uptime 建连；端点显示 `wss/TLS` |
+| 内部 RAM（ws:// READY） | 峰值 210,904 B、最低水位 52,815 B、最大块 31,744 B |
+| 内部 RAM（wss 握手期） | 峰值 **238,448 B**、最低水位 **25,087 B**（低于 30KB 保留线约 5KB）、最大块 30,720 B |
+
 ## 后续
 
 - T2.5 `voice_cloud` 在本层之上解析业务 JSON、按 `sid` 过滤；T2.4 消费下行二进制帧做流式播放。
-- 内存：wss/TLS 握手期内部 RAM 最低水位 27,655 B（略低于 CONVENTIONS §4 的保留 30KB 线），统一优化按 [PRODUCT_IDEAS §8 X3](../../docs/PRODUCT_IDEAS.md) 排在 P2 前（触发条件已命中）。
+- 内存：T1.6 复测 wss 握手期内部 RAM 最低水位 **25,087 B**（比 T1.4 的 27,655 B 再低约 2.6KB，距 CONVENTIONS §4 的保留 30KB 线差约 5KB），统一优化按 [PRODUCT_IDEAS §8 X3](../../docs/PRODUCT_IDEAS.md) 排在 P2 前（触发条件 ② 已命中）。
 - 若 T2.4 的 TTS 帧率高，需评估 `WEBSOCKET_EVENT_DATA` 事件队列与 PSRAM 预缓冲（本层 rx 缓冲 2KB 内部 RAM）。
+- **T1.6 验收遗留（随 T2.5 修）**：`WEBSOCKET_EVENT_ERROR` 的非 TCP 分支打印 `esp_ws_handshake_status_code`，该字段只在握手失败类错误里有效；实测 kill 服务端 / 复位边界会以 `error_type=0`（NONE）进来，打出未初始化值（`握手 HTTP 状态=ESP-ROM:...`）。修法：只在 `WEBSOCKET_ERROR_TYPE_HANDSHAKE_FAILED` 时读该字段，其它类型只打 `type`（不影响功能，仅日志可信度）。

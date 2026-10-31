@@ -41,8 +41,8 @@
 - I2S DMA 缓冲必须内部 RAM：`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`。
 - 内部 RAM 预算（**X3-E 定稿，2026-10-31**）：**静态 DIRAM + 运行期堆峰值 ≤ 440KB**，且**最坏场景（wss/TLS 握手期）`sys heap` 最低水位 ≥ 30KB**；超预算先改设计，不靠砍功能硬压。
   - 口径与实测：`idf.py size` 的 DIRAM 已用 + `sys heap` 的「峰值占用」（internal），两者相加对照 440KB；`sys heap` 的「最低水位」对照 30KB。
-  - 当前值（T2.5 后，2026-10-31）：静态 **196,670 B** + wss 堆峰值 **227,988 B** = **424,658 B**（距 440KB 上限余量约 25.9KB），wss 最低水位 **32,339 B**（距 30KB 线余量 2.3KB）；PSRAM 峰值 902,908 B。T2.2 时为 409,918 B / 47,051~52,839 B，T2.5 的 `vc` 任务 8KB 主要消耗在水位。
-  - 两条必须同时满足；**最坏场景下「最低水位 ≥30KB」是更强约束**（堆总量 ~260,327 B → 堆峰值上限约 229,847 B，折合静态+堆 ≤426.2KB）；440KB 上限用于吸收静态 DIRAM 后续增长。**T2.5 后水位余量只剩 2.3KB，T2.3/T2.4 新增任务栈/缓冲前必须先按本口径估算。**
+  - 当前值（T2.3 后，2026-10-31）：静态 **196,782 B** + wss 堆峰值 **227,724 B** = **424,506 B**（距 440KB 上限余量 26,054 B），wss 最低水位 **32,471~32,643 B**（距 30KB 线余量 2.5~2.6KB）；`ws://` 最低水位 36,535 B；PSRAM 峰值 **2,895,336 B**（MP3 PCM 预分配 1.5MB + 解码状态 27.5KB + 开发期上传探针 512KB）。T2.5 时为 424,658 B / 32,339 B / PSRAM 902,908 B —— MP3 解码状态与临时区（22.9KB）全在 PSRAM，故内部 RAM 只增 112 B；T2.2 时为 409,918 B / 47,051~52,839 B。
+  - 两条必须同时满足；**最坏场景下「最低水位 ≥30KB」是更强约束**（堆总量 ~260,327 B → 堆峰值上限约 229,847 B，折合静态+堆 ≤426.2KB）；440KB 上限用于吸收静态 DIRAM 后续增长。**T2.3 后水位余量只剩 2.5KB：T2.4 流式播放不得新增内部 RAM 任务栈/缓冲（解码临时区已在 PSRAM、`player` 栈 6KB 保持），需要更大缓冲时改 PSRAM 或复用现有任务。**
   - TLS 记录缓冲与握手堆自 X3-F 起在 PSRAM，不计入内部 RAM；旧口径「峰值 ≤310KB」写于 P0（未含 WiFi 栈且只统计堆），已作废。
 - 长时运行场景必须监控堆水位（`diag`），不允许无限增长。
 
@@ -89,6 +89,7 @@ components/<module>/
 - **唤醒/交互语音测试先回放、别喊话**：测"嗨，乐鑫"用 `afplay tools/lexin.wav`（macOS 扬声器 → 设备麦克风）触发 WakeNet，不需要人工喊；测交互语音用 `afplay tools/今天天气如何.wav` / `afplay tools/今天吃了什么.wav`，必须在 `APP: prompt done, feed resumed` **之后**放（R1 播放提示音期间 AFE 吃静音）。设备侧 `idf.py -p <PORT> monitor` 看 `APP: wake detected` → `AFE: feed paused` → `PLAYER: play 12800 samples` → `APP: prompt done, feed resumed`；交互语音在 P1 无 APP 日志，用 `mic stat`（`mic reset` → 回放 → `mic stat`）看 `VAD 人声`/电平、确认 `累计唤醒 0`（不误唤醒）。**音量按用户定稿：系统音量正常 31%、上限 50%（不得突破）+ 默认增益**（70% 已否决）；`-v` 放大须满足 系统音量×增益 ≤50%（31% + `-v 1.5` ≈ 46.5% 可）。**自动回归用 `uv run tools/voice_test.py --volume 50 --wakes 3`**（脚本临时把音量调到上限、结束恢复；断言唤醒链路/误唤醒/I2S 失败/ERROR，退出码 0/1）。回放前确认系统未静音、设备麦克风未被挡；无唤醒时依次查音量/距离/输出路由 → 设备是否在播放（播放中唤醒被忽略）→ `mic stat` 电平。素材属性、实测数据与脚本参数见 `tools/README.md`。
 - **上行音频调试（T2.1 起）**：`afe uplink on|off|stat [ms]` 看写入/读取/丢弃/首帧延迟/500ms 分段 RMS；自动回归 `uv run tools/afe_uplink_test.py --volume 50`（15 项断言，独占串口）。AFE fetch 每帧 512 样本（32ms），与 Opus 20ms 帧不整除，编码前必须按 320 样本重组。
 - **上行 Opus 编码调试（T2.2 起）**：`enc test [ms] [tone|uplink]`（tone=1kHz 正弦测编码数值、uplink=真实链路，默认自动选；uplink 模式会先排空 ring 积压）、`enc stat`、`enc dump on|off`（最多 50 帧 hex，给 PC 侧 PyAV 独立解码）、`enc reset`；自动回归 `uv run tools/opus_enc_test.py`（45 项断言，A=tone 数值基准 / B=语音链路 / C=内存泄漏，独占串口）。固件为 libopus **定点** + VBR（浮点实现实测崩溃、CBR 实测 2.4× CPU，均写进 STATUS 与组件 README）；编码只能串行调用（thread-safe 伪栈按线程各 120KB PSRAM），且**不得在音频任务内调用**。
+- **MP3 播放调试（T2.3 起）**：`player load begin` → 分块 `player load <base64>`（≤240 字符/行，串口无流控）→ `player load end` → `player mp3`（播放任务整段解码后播放）→ `player stat`（帧数/样本/采样率/声道/时长/坏帧/单帧耗时）→ `player pcm <off> <n>`（取回设备解码 PCM 供 PC 侧与 FFmpeg 逐样本对拍）。自动回归 `uv run tools/mp3_test.py`（48 项断言，素材现生成 + 真实电台流，独占串口）。探针、512KB PSRAM 上传缓冲与 console 1024B 行缓冲都由 `CONFIG_DIAG_ENABLE_PLAYER_TEST` 控制，**量产必须关闭**。
 - 云端/WS 问题先跑 mock，别直接上设备：`uv run tools/ws_mock_server.py --self-test`（9 项，不需要硬件）确认协议链路，再起 `uv run tools/ws_mock_server.py` 给设备当服务端；字段口径对照 `docs/PROTOCOL.md`（含待确认项）。
 - 崩溃先看串口 panic 输出，再解析 coredump 分区（`coredump` @0x9a0000/64K，已开 `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`）：
   `idf.py -p <PORT> coredump-info`（寄存器/调用栈/任务列表）、`idf.py -p <PORT> coredump-debug`（gdb）；也可 `-s core.dump` 存盘后 `coredump-info -c core.dump` 离线解析。

@@ -242,3 +242,22 @@
 - **代价**：16kbps 语音场景定点无可感知音质损失（PC 侧 PyAV 独立解码验证）；S3 无 FPU 收益，定点反而更快。
 - **重新评估的触发条件**：① 升级 microOpus 版本（必须先跑 `enc test 500 tone` + `tools/opus_enc_test.py`）；② 需要 32kbps+ 或音乐类上行（评估浮点/更高复杂度）；③ 换芯片（如 P4 等 FPU 更强平台）。
 - **参考**：`components/codec_enc/README.md`「踩坑记录」、STATUS §3 T2.2 行与 §5 基线、`sdkconfig.defaults.esp32s3`、ARCHITECTURE §3.6。
+
+### X5 MP3 解码器选型：minimp3（T2.3 定稿）
+
+- **状态**：已定稿并落地（2026-10-31，T2.3）。ROADMAP 原写 Helix，实测后改为 **minimp3**。
+- **现象/背景**：T2.3 要做下行 MP3 解码（TTS 24k 单声道 + 音乐 44.1k）。本工程内部 RAM 极紧：T2.5 后 wss 握手期最低水位只剩 32,339 B（CONVENTIONS §4 要求 ≥30KB），任何占内部 RAM 的解码器状态都会破线。
+- **候选与实测**：
+
+| 方案 | 解码状态 | 分配方式 | 结论 |
+|---|---|---|---|
+| Helix（`chmorgan/esp-libhelix-mp3` 1.0.3，registry 社区组件） | 8 个结构体合计 **23,856 B**（宿主机实测 sizeof） | `AllocateBuffers()` 7 次裸 `malloc`，托管组件改不了分配器 → 只能落内部堆 | ❌ 会让 wss 水位掉到 ~8.5KB |
+| ADF 的 `mp3_decoder`（同板已跑通的项目 `pipeline_http_mp3` 用的） | 由 ADF `codec_memory_*` 分配，实际走 PSRAM | 运行时用 **PVMP3**（Layer-3），minimp3 只兜底 MP1/MP2；解码任务栈 5KB 也在 PSRAM | ❌ 只有预编译库（16MB `libesp_codec.a` + `libesp_processing.a`），无法摘出来单独用；搬 ADF 与分层架构冲突 |
+| `espressif/esp_audio_codec`（registry 官方托管） | 预编译 4.2MB 静态库，状态大小未知 | 未知，需单独实测 | 备选；flash 增量大 |
+| **minimp3（vendored，CC0）** | `mp3dec_t` **6,668 B** + `mp3dec_scratch_t` **16,256 B** + 单帧 4,608 B | 零 `malloc`，全部调用方提供 → 直接放 PSRAM | ✅ 采用 |
+
+- **落地方式**：`components/audio_player/third_party/minimp3`（commit `ea99364`）+ 3 处补丁把 16.3KB 临时区从任务栈改为调用方注册（否则播放任务 6KB 栈必爆）；解码状态/PCM 缓冲全 PSRAM，内部 RAM 增量 0。
+- **验证**：与 FFmpeg(PyAV) 独立解码逐样本对拍 **max|Δ| ≤ 1 LSB**（24k mono / 44.1k stereo 均样本数完全一致）；真实电台流（44.1k stereo 64kbps，从流中间接入）解码 155 帧、坏帧 0；`tools/mp3_test.py` 48/48。
+- **重新评估触发条件**：① minimp3 在 S3 上解码吞吐不足（当前 44.1k stereo 4.45ms/帧 ≈17% CPU，余量充足）；② 需要 MP3 以外的下行编码（AAC/Opus 音乐），届时评估官方 `esp_audio_codec`；③ 上游 minimp3 补丁需要重放（升级时按 third_party README 操作）。
+- **参考**：ARCHITECTURE §3.7；`components/audio_player/third_party/minimp3/README.md`；STATUS §5 T2.3 基线；同级项目 `../pipeline_http_mp3`（ESP-ADF 例程 + 自定义 I2S 写回调，仅作对照）。
+

@@ -121,7 +121,7 @@
 |---|---|---|
 | T2.1 | `audio_fe`：唤醒/VAD 回调、`set_feed_enabled()`、上行 16k 音频输出接口 | 事件驱动的语音前端 |
 | T2.2 | `codec_enc`：Opus 16k/单声道/16kbps/20ms 帧编码 | 上行编码可输出帧 |
-| T2.3 | `audio_player`：MP3 解码（Helix）、重采样到 48k、单通道播放 | 本地 MP3 可播放 |
+| T2.3 | `audio_player`：MP3 解码（**minimp3**，状态/临时区在 PSRAM）、重采样到 48k、单通道播放（整段解码，T2.4 再流式） | 本地 MP3 可播放 |
 | T2.4 | `audio_player`：流式播放接口（`play_stream` 回调取数据） | TTS 流式播放能力 |
 | T2.5 | `voice_cloud`：`hello` 握手、`audio_start/audio_end`、二进制帧收发、`tts_start/tts_end` 解析 | 端云语音通道打通 |
 | T2.6 | 端到端自测：mock 服务下发 MP3 音频，设备播放 | 完整"说话 → 听回答"链路 |

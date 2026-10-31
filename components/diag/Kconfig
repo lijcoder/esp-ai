@@ -21,4 +21,20 @@ menu "Diagnostics"
             是否能正常落盘、能否用 `idf.py coredump-info` 解析。
             **量产固件必须关闭**（默认 n，sdkconfig.defaults 里显式开启仅供开发板）。
 
+    config DIAG_ENABLE_PLAYER_TEST
+        bool "启用 player MP3 播放探针（仅开发期）"
+        default n
+        help
+            编译进 `player` 命令：`player load begin/chunk/end` 把 PC 侧准备好的
+            MP3（base64 分块，存 PSRAM）传到设备，`player mp3` 交给播放任务解码播放，
+            `player stat` 打印解码/播放统计。用于 T2.3 验收（素材含真实电台码流）。
+            **量产固件必须关闭**（默认 n，sdkconfig.defaults 里显式开启仅供开发板）。
+            开启时 console 行缓冲 128 → 1024 B（约 +1KB 内部堆），上传才不至于太慢。
+
+    config DIAG_PLAYER_TEST_MAX_BYTES
+        int "player 探针的 MP3 上传缓冲上限（PSRAM，字节）"
+        depends on DIAG_ENABLE_PLAYER_TEST
+        default 524288
+        range 16384 2097152
+
 endmenu

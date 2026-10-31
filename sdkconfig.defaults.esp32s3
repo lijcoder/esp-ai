@@ -34,6 +34,9 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 # 开发期：sys crash 用于验证 coredump 落盘/解析；量产固件必须关闭
 CONFIG_DIAG_ENABLE_CRASH_TEST=y
 
+# 开发期（T2.3）：`player` MP3 播放探针（base64 分块上传 + 统计）；量产固件必须关闭
+CONFIG_DIAG_ENABLE_PLAYER_TEST=y
+
 # T1.4（PRODUCT_IDEAS §8 X3 方案 A/B）：WS + TLS 要占用内部 RAM，
 # T1.3 基线空闲堆只剩 79KB、最大连续块 31.7KB，按 X3 先做两件低风险裁剪：
 # A. WiFi 静态 RX 缓冲 10→6（上行 4KB/s、下行 3KB/s 的小流量足够，省约 6.4KB）

@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "audio_fe.h"
+#include "audio_player.h"
 #include "codec_enc.h"
 #include "config_store.h"
 #include "esp_app_desc.h"
@@ -1660,6 +1661,188 @@ static int cmd_evt(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- MP3 播放探针（T2.3，仅开发期） ----------------
+ *
+ * 为什么走 console 上传而不是让设备自己拉流：T2.3 只验证"解码 + 播放"，
+ * 素材由 PC 侧准备（含真实电台码流），链路可重复、不依赖网络与 mock；
+ * 设备侧 HTTP 拉流属于 T4.1 source_http，T2.4 的流式入口走 WS 下行。
+ */
+
+#if CONFIG_DIAG_ENABLE_PLAYER_TEST
+
+static uint8_t *s_pload_buf = NULL; /* PSRAM 上传缓冲 */
+static size_t s_pload_len = 0;
+
+static int b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+    }
+    if (c >= 'a' && c <= 'z') {
+        return c - 'a' + 26;
+    }
+    if (c >= '0' && c <= '9') {
+        return c - '0' + 52;
+    }
+    if (c == '+') {
+        return 62;
+    }
+    if (c == '/') {
+        return 63;
+    }
+    return -1;
+}
+
+/* 标准 base64（容忍 '=' 结束与空白）；返回解码字节数，负值 = 非法输入/超出容量 */
+static int b64_decode(const char *in, uint8_t *out, size_t cap)
+{
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t n = 0;
+
+    for (const char *p = in; *p; p++) {
+        if (*p == '=' || *p == ' ' || *p == '\r' || *p == '\n') {
+            continue;
+        }
+        int v = b64_val(*p);
+        if (v < 0) {
+            return -1;
+        }
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (n >= cap) {
+                return -1;
+            }
+            out[n++] = (uint8_t)(acc >> bits);
+        }
+    }
+    return (int)n;
+}
+
+static void print_player_stat(void)
+{
+    audio_player_stats_t st;
+    if (audio_player_stats_read(&st) != ESP_OK) {
+        printf("读取播放统计失败\n");
+        return;
+    }
+    printf("PLAYERSTAT jobs=%u pcm=%u mp3=%u errors=%u busy=%u vol=%u last_play_ms=%u mp3_ready=%d\n",
+           (unsigned)st.jobs_done, (unsigned)st.pcm_jobs, (unsigned)st.mp3_jobs,
+           (unsigned)st.mp3_errors, audio_player_is_busy() ? 1 : 0,
+           (unsigned)audio_player_get_volume(), (unsigned)st.last_play_ms,
+           audio_player_mp3_ready() ? 1 : 0);
+    printf("MP3STAT frames=%u samples=%u rate=%u ch=%u dur_ms=%u skipped=%u bad=%u "
+           "dec_avg_us=%u dec_max_us=%u\n",
+           (unsigned)st.mp3.frames, (unsigned)st.mp3.samples, (unsigned)st.mp3.rate,
+           (unsigned)st.mp3.channels, (unsigned)st.mp3.duration_ms,
+           (unsigned)st.mp3.skipped_bytes, (unsigned)st.mp3.bad_frames,
+           (unsigned)st.mp3.decode_us_avg, (unsigned)st.mp3.decode_us_max);
+}
+
+static int cmd_player(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: player stat | reset | mp3 | pcm <off> <n> | load begin | load end | load <base64>\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "stat") == 0) {
+        print_player_stat();
+        return ESP_OK;
+    }
+    if (strcmp(sub, "reset") == 0) {
+        audio_player_stats_reset();
+        printf("PLAYERSTAT cleared\n");
+        return ESP_OK;
+    }
+    if (strcmp(sub, "pcm") == 0) {
+        int offset = (argc > 2) ? atoi(argv[2]) : 0;
+        int count = (argc > 3) ? atoi(argv[3]) : 64;
+        if (offset < 0 || count <= 0 || count > 512) {
+            printf("用法: player pcm <offset> <count，count 1~512\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        int16_t tmp[512];
+        esp_err_t err = audio_player_mp3_pcm_read(tmp, (size_t)offset, (size_t)count);
+        if (err != ESP_OK) {
+            printf("PLAYERPCM err=%s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("PLAYERPCM off=%d count=%d\n", offset, count);
+        for (int i = 0; i < count; i++) {
+            printf("%04x", (uint16_t)tmp[i]);
+            if ((i % 16) == 15 || i == count - 1) {
+                printf("\n");
+            }
+        }
+        printf("PLAYERPCMEND\n");
+        return ESP_OK;
+    }
+
+    if (strcmp(sub, "mp3") == 0) {
+        if (!audio_player_mp3_ready()) {
+            printf("MP3 能力不可用（audio_player_init 时 PSRAM 分配失败或 Kconfig 关闭）\n");
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        if (s_pload_len == 0) {
+            printf("没有已加载的 MP3：先 player load begin → 分块 player load <base64> → player load end\n");
+            return ESP_ERR_INVALID_STATE;
+        }
+        esp_err_t err = audio_player_play_mp3(s_pload_buf, s_pload_len);
+        if (err != ESP_OK) {
+            printf("PLAYERPLAY err=%s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("PLAYERPLAY bytes=%u\n", (unsigned)s_pload_len);
+        return ESP_OK;
+    }
+    if (strcmp(sub, "load") == 0) {
+        if (argc < 3) {
+            printf("用法: player load begin | load end | load <base64>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (strcmp(argv[2], "begin") == 0) {
+            if (!s_pload_buf) {
+                s_pload_buf = heap_caps_malloc(CONFIG_DIAG_PLAYER_TEST_MAX_BYTES,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (!s_pload_buf) {
+                    printf("上传缓冲分配失败（PSRAM 不足）\n");
+                    return ESP_ERR_NO_MEM;
+                }
+            }
+            s_pload_len = 0;
+            printf("PLAYERLOAD ready capacity=%u\n", (unsigned)CONFIG_DIAG_PLAYER_TEST_MAX_BYTES);
+            return ESP_OK;
+        }
+        if (strcmp(argv[2], "end") == 0) {
+            printf("PLAYERLOAD bytes=%u\n", (unsigned)s_pload_len);
+            return ESP_OK;
+        }
+        if (!s_pload_buf) {
+            printf("上传缓冲未初始化：先 player load begin\n");
+            return ESP_ERR_INVALID_STATE;
+        }
+        int n = b64_decode(argv[2], s_pload_buf + s_pload_len, CONFIG_DIAG_PLAYER_TEST_MAX_BYTES - s_pload_len);
+        if (n < 0) {
+            printf("PLAYERLOAD err=base64 非法或超出容量（%u B）\n",
+                   (unsigned)CONFIG_DIAG_PLAYER_TEST_MAX_BYTES);
+            return ESP_ERR_INVALID_ARG;
+        }
+        s_pload_len += (size_t)n;
+        printf("PLAYERLOAD chunk total=%u\n", (unsigned)s_pload_len);
+        return ESP_OK;
+    }
+
+    printf("未知子命令: %s（可用: stat | reset | mp3 | load）\n", sub);
+    return ESP_ERR_INVALID_ARG;
+}
+
+#endif /* CONFIG_DIAG_ENABLE_PLAYER_TEST */
+
 /* ---------------- 堆水位周期监控（默认关闭） ---------------- */
 
 #if CONFIG_DIAG_HEAP_MONITOR
@@ -1746,6 +1929,14 @@ static esp_err_t register_commands(void)
             .hint = "status|start|stop|cancel|stat|reset",
             .func = cmd_vc,
         },
+#if CONFIG_DIAG_ENABLE_PLAYER_TEST
+        {
+            .command = "player",
+            .help = "MP3 播放探针（T2.3）：player stat | reset | mp3 | load begin|end|<base64>",
+            .hint = "stat|reset|mp3|pcm|load",
+            .func = cmd_player,
+        },
+#endif
     };
 
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
@@ -1773,7 +1964,12 @@ esp_err_t diag_init(void)
     print_banner();
 
     repl_config.prompt = "esp-ai>";
+#if CONFIG_DIAG_ENABLE_PLAYER_TEST
+    /* T2.3 的 MP3 素材走 base64 分块上传：行太短会让上传慢一个量级 */
+    repl_config.max_cmdline_length = 1024;
+#else
     repl_config.max_cmdline_length = 128;
+#endif
     /* 默认 4096 对纯 console 命令够用，但 `enc test` 会在 REPL 任务里直接调 libopus：
      * 伪栈只放 temp 数组，libopus 本身还有递归/局部栈，实测 4KB 会溢出（T2.2 排查） */
     repl_config.task_stack_size = 8192;

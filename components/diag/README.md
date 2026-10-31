@@ -6,7 +6,7 @@
 
 | 接口 | 说明 |
 |---|---|
-| `diag_init()` | 打印启动横幅 → 在 UART0（115200，GPIO43/44）起 REPL → 注册 `help`/`sys`/`log`/`mic`/`cfg`/`evt`/`wifi`；只能在 `app_main` 最前部调用一次，重复调用返回 `ESP_ERR_INVALID_STATE` |
+| `diag_init()` | 打印启动横幅 → 在 UART0（115200，GPIO43/44）起 REPL → 注册 `help`/`sys`/`log`/`mic`/`cfg`/`evt`/`wifi`/`ws`；只能在 `app_main` 最前部调用一次，重复调用返回 `ESP_ERR_INVALID_STATE` |
 
 ## console 命令（本轮）
 
@@ -32,7 +32,15 @@
 | `evt trace on\|off` | 订阅/取消订阅全部事件，在 `evt` 任务上下文打印收到的每个事件（验证跨任务分发，而不是只看投递） |
 | `wifi status` | 网络状态：state、SSID、IP、RSSI、SNTP 是否对时、累计重连次数与当前退避 |
 | `wifi reconnect` | 主动断开并重连（重置退避）；已联网时先投 `NET_DOWN` 再恢复，用于验证重连链路 |
+| `ws status` | WebSocket 状态：状态机、脱敏端点（不回显 token）、握手次数、心跳 RTT、收发/丢弃/坏帧计数、队列占用 |
+| `ws reconnect` | 重置退避并立即重连（非阻塞） |
+| `ws send <json>` | **开发期探针**：参数用空格拼成 JSON 原样 `ws_send_text()`（如 `ws send {"t":"audio_start","sid":1}`），不解析字段、不造协议 |
+| `ws sendbin [len]` | **开发期探针**：发一帧 `0x01` 上行音频（探针图案，默认 40B，上限 248B），验证 8B 帧头与 `seq` 自增 |
+| `ws rxlog on\|off` | **开发期探针**：注册/注销下行帧打印（文本全量≤200B、二进制只打首帧与每 25 帧） |
 | `sys crash` | **仅开发配置**（`CONFIG_DIAG_ENABLE_CRASH_TEST=y`）：主动触发 panic，验证 coredump 落盘与解析；未编译时明确提示 |
+
+> `ws send/sendbin/rxlog` 是 T1.6 为"P1 还没有 `voice_cloud`、固件里没有上行发送方"补的联调探针，不是业务接口；T2.5 落地后只作调试口保留。
+> **`rxlog` 与 `voice_cloud` 互斥**：两者都走 `ws_register_cb()`（单回调），T2.5 注册后调试时不要同时开 `rxlog`。
 
 `mic stat` 的统计口径是**送 AFE 之前的麦克风真实数据**；半双工暂停收音（R1）时电平仍在累计，可用来确认"麦克风还在采、只是 AFE 吃静音"。RMS 的 `sqrt/log10` 在 console 任务侧计算，音频任务只做整数累加。
 
@@ -53,7 +61,7 @@
 
 ## 依赖
 
-- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计）、`config_store`（`cfg` 读写 NVS）、`event_bus`（`evt` 投递/订阅）、`net_mgr`（`wifi status/reconnect`），均为**私有依赖**，不对外暴露头文件。
+- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计）、`config_store`（`cfg` 读写 NVS）、`event_bus`（`evt` 投递/订阅）、`net_mgr`（`wifi status/reconnect`）、`transport_ws`（`ws status/reconnect/send/sendbin/rxlog`），均为**私有依赖**，不对外暴露头文件。
 - IDF 配置：`CONFIG_FREERTOS_USE_TRACE_FACILITY`（任务枚举）与 `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` + `COUNTER_TYPE_U64`（CPU 占比，64 位计数避免 esp_timer 32 位约 71 分钟回绕）。已固化在 `sdkconfig.defaults.esp32s3`；若关掉 trace facility，`sys tasks` 会提示不可用而不是编译失败。
 - 硬件：UART0 115200，GPIO43/44（见 `docs/HARDWARE.md`）。
 

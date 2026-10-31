@@ -665,7 +665,35 @@ static int cmd_wifi(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
-/* ---------------- ws 命令（WebSocket 观测，T1.4） ---------------- */
+/* ---------------- ws 命令（WebSocket 观测，T1.4；mock 双向联调探针，T1.6） ---------------- */
+
+/*
+ * 为什么要有 send/sendbin/rxlog：P1 还没有 voice_cloud（T2.5），固件里没有任何上行发送方，
+ * 只靠自动心跳证明不了"端侧能发、能收"。这三个命令是**开发期探针**：
+ *   - 不解析业务 JSON、不发明协议字段，把控制台输入原样交给 transport_ws；
+ *   - T2.5 落地后仍可留作调试口，但 rxlog 会占用 ws_register_cb（与 voice_cloud 的回调互斥）。
+ */
+
+static uint32_t s_ws_rxlog_bin; /* rxlog 打开后收到的二进制帧计数（只影响打印频率） */
+
+static void ws_rxlog_cb(const ws_frame_hdr_t *frame, const uint8_t *payload, size_t len, void *arg)
+{
+    (void)arg;
+
+    /* payload 不保证 '\0' 结尾，用精度限长；文本帧是 JSON，直接打印便于肉眼核对字段 */
+    if (frame == NULL) {
+        const int show = (int)(len > 200 ? 200 : len);
+        ESP_LOGI(TAG, "ws rx text（%u B）: %.*s", (unsigned)len, show, (const char *)payload);
+        return;
+    }
+
+    /* 二进制帧是 TTS 流（约 20ms 一帧），只打首帧与每 25 帧，避免刷屏掩盖其它日志 */
+    s_ws_rxlog_bin++;
+    if (s_ws_rxlog_bin == 1 || (s_ws_rxlog_bin % 25) == 0) {
+        ESP_LOGI(TAG, "ws rx bin（第 %u 帧）: type=0x%02X seq=%u len=%u", (unsigned)s_ws_rxlog_bin,
+                 (unsigned)frame->type, (unsigned)frame->seq, (unsigned)len);
+    }
+}
 
 static void print_ws_status(void)
 {
@@ -698,12 +726,113 @@ static void print_ws_status(void)
     printf("  接收: 文本 %u / 二进制 %u，坏帧 %u\n", (unsigned)st.rx_text, (unsigned)st.rx_bin,
            (unsigned)st.rx_bad);
     printf("  说明: 每 20s 发 ping、10s 未收 pong 判离线；掉线按 1/2/5/10/30s 退避\n");
+    printf("  联调: ws send <json> | ws sendbin [len] | ws rxlog on|off\n");
+}
+
+/*
+ * `ws send` 把剩余参数用空格拼成一条 JSON 原样发送（console 按空白分词，含空格的 JSON 也能拼回）。
+ * 长度上限交给 ws_send_text 判（单槽 CONFIG_WS_TX_MSG_BYTES）；未 READY 时返回 INVALID_STATE 属预期。
+ */
+static int ws_cmd_send(int argc, char **argv)
+{
+    char buf[256];
+    size_t used = 0;
+
+    if (argc < 3) {
+        printf("用法: ws send <json>\n"
+               "示例: ws send {\"t\":\"audio_start\",\"sid\":1}\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (int i = 2; i < argc; i++) {
+        const size_t n = strlen(argv[i]);
+        const size_t sep = (i > 2) ? 1 : 0;
+        if (used + sep + n + 1 > sizeof(buf)) {
+            printf("JSON 过长（> %u B），未发送\n", (unsigned)sizeof(buf) - 1);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (sep != 0) {
+            buf[used++] = ' ';
+        }
+        memcpy(buf + used, argv[i], n);
+        used += n;
+    }
+    buf[used] = '\0';
+
+    const esp_err_t err = ws_send_text(buf);
+    if (err != ESP_OK) {
+        printf("发送失败: %s（未 READY 时属预期，先 ws status 看状态）\n", esp_err_to_name(err));
+        return err;
+    }
+    printf("已入队文本帧 %u B（非阻塞；对端是否收到看 mock 日志）\n", (unsigned)used);
+    return ESP_OK;
+}
+
+/*
+ * `ws sendbin [len]` 发一帧 0x01 上行音频（内容是探针图案，不是真 Opus），
+ * 用来验证 8B 帧头与 seq 自增；payload 上限取单槽 256B - 8B 头 = 248B。
+ */
+static int ws_cmd_sendbin(int argc, char **argv)
+{
+    static uint8_t probe[248]; /* 静态缓冲：不放大 console 任务栈 */
+    size_t len = 40;
+
+    if (argc >= 3) {
+        char *end = NULL;
+        errno = 0;
+        const unsigned long value = strtoul(argv[2], &end, 0);
+        if (errno != 0 || end == argv[2] || *end != '\0' || value == 0 ||
+            value > sizeof(probe)) {
+            printf("非法长度: %s（范围 1~%u）\n", argv[2], (unsigned)sizeof(probe));
+            return ESP_ERR_INVALID_ARG;
+        }
+        len = (size_t)value;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        probe[i] = (uint8_t)(0xA0u + (i & 0x0Fu));
+    }
+
+    const esp_err_t err = ws_send_bin(WS_FRAME_TYPE_AUDIO_UP, probe, len);
+    if (err != ESP_OK) {
+        printf("发送失败: %s（未 READY 或长度超过单槽上限）\n", esp_err_to_name(err));
+        return err;
+    }
+    printf("已入队上行二进制帧 %u B（帧头 8B 由 transport_ws 填，seq 自增）\n", (unsigned)len);
+    return ESP_OK;
+}
+
+static int ws_cmd_rxlog(int argc, char **argv)
+{
+    bool on;
+
+    if (argc != 3) {
+        printf("用法: ws rxlog on|off\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(argv[2], "on") == 0) {
+        on = true;
+    } else if (strcmp(argv[2], "off") == 0) {
+        on = false;
+    } else {
+        printf("未知参数: %s（可用: on | off）\n", argv[2]);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const esp_err_t err = ws_register_cb(on ? ws_rxlog_cb : NULL, NULL);
+    if (err != ESP_OK) {
+        printf("设置失败: %s（ws 未初始化）\n", esp_err_to_name(err));
+        return err;
+    }
+    s_ws_rxlog_bin = 0;
+    printf("下行帧打印: %s（文本帧全量≤200B，二进制只打首帧与每 25 帧）\n", on ? "开" : "关");
+    return ESP_OK;
 }
 
 static int cmd_ws(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("用法: ws status | reconnect\n");
+        printf("用法: ws status | reconnect | send <json> | sendbin [len] | rxlog on|off\n");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -726,7 +855,19 @@ static int cmd_ws(int argc, char **argv)
         return ESP_OK;
     }
 
-    printf("未知子命令: %s（可用: status | reconnect）\n", argv[1]);
+    if (strcmp(argv[1], "send") == 0) {
+        return ws_cmd_send(argc, argv);
+    }
+
+    if (strcmp(argv[1], "sendbin") == 0) {
+        return ws_cmd_sendbin(argc, argv);
+    }
+
+    if (strcmp(argv[1], "rxlog") == 0) {
+        return ws_cmd_rxlog(argc, argv);
+    }
+
+    printf("未知子命令: %s（可用: status | reconnect | send | sendbin | rxlog）\n", argv[1]);
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -973,8 +1114,8 @@ static esp_err_t register_commands(void)
         },
         {
             .command = "ws",
-            .help = "WebSocket 状态：ws status | reconnect",
-            .hint = "status|reconnect",
+            .help = "WebSocket：ws status | reconnect | send <json> | sendbin [len] | rxlog on|off",
+            .hint = "status|reconnect|send|sendbin|rxlog",
             .func = cmd_ws,
         },
     };

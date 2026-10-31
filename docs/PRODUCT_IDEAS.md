@@ -228,3 +228,17 @@
   - 落地位置：ARCH §2/§9.2、CONVENTIONS §4、AGENTS 铁律 3、ROADMAP P1 验收；旧口径「峰值 ≤310KB」作废（P0 写定，未含 WiFi 栈且只统计堆）。
 - **重新评估的触发条件**：① T1.4 TLS 握手失败 / `sys heap` 空闲或最大块不足；② T1.6 记录 P1 基线时（**已命中，见上**）；③ P2 流式 TTS/Opus 使峰值再涨；④ 24h 压测出现碎片化或分配失败；⑤ 计划启用 OTA/双 TLS 等额外常驻内存。
 - **参考**：ARCHITECTURE §9.2、CONVENTIONS §4；STATUS.md T1.3 行与 §5 基线；实测方法 `idf.py size-components --format csv` + 设备 `sys heap`/`sys tasks`；X2（TLS 策略）。
+
+### X4 microOpus 浮点实现在本工程崩溃（T2.2 实测暴露，已定位并规避）
+
+- **状态**：**已解决（T2.2，2026-10-31）**：改用定点实现（`# CONFIG_OPUS_FLOATING_POINT is not set`），定点在 S3 上 CPU 更省；落地于 `sdkconfig.defaults.esp32s3`、`components/codec_enc/README.md`「踩坑记录」、STATUS §3 T2.2 行。
+- **现象**：`esphome/micro-opus` 0.4.1 在 S3 上默认浮点实现（`CONFIG_OPUS_FLOATING_POINT=y`），本工程**首次 `enc_encode()` 即崩**，两种伪栈模式都复现：
+  - nonthreadsafe 伪栈 + 浮点：`silk_noise_shape_quantizer_del_dec` 访问 PSRAM 伪栈时报 `MMU entry fault ... (invalid mmu entry)`（访问地址 0x3d9bdb90，超出 8MB PSRAM 的有效映射）；
+  - threadsafe 伪栈 + 浮点：`LoadProhibited`，EXCVADDR=0x44；
+  - 先误判为 pthread TLS 问题（曾把伪栈切到 nonthreadsafe），换定点后两种伪栈模式都正常 → 确认根因在浮点路径。
+- **影响**：不解决则 T2.2 无法交付；若误判为「Opus 库不可用」会触发 ROADMAP §4 的降级 PCM16（上行带宽 ×16，架构/协议都要返工）。
+- **定位过程**：两次崩溃都用 `idf.py coredump-info` 解析（解析时用崩溃当刻的 `build/esp-ai.elf`）；栈回溯定位到 `opus_encode → silk_Encode → silk_encode_frame_FLP → silk_NSQ_del_dec_c`；再用「换定点再测」一次实验排除浮点代码路径。
+- **决策**：**定点 + VBR**（`CODEC_ENC_VBR=y`）；同时实测 CBR 单帧 16.2ms（2.4× VBR），一并排除。thread-safe 伪栈保留（定点下工作正常，每线程 120KB PSRAM）。
+- **代价**：16kbps 语音场景定点无可感知音质损失（PC 侧 PyAV 独立解码验证）；S3 无 FPU 收益，定点反而更快。
+- **重新评估的触发条件**：① 升级 microOpus 版本（必须先跑 `enc test 500 tone` + `tools/opus_enc_test.py`）；② 需要 32kbps+ 或音乐类上行（评估浮点/更高复杂度）；③ 换芯片（如 P4 等 FPU 更强平台）。
+- **参考**：`components/codec_enc/README.md`「踩坑记录」、STATUS §3 T2.2 行与 §5 基线、`sdkconfig.defaults.esp32s3`、ARCHITECTURE §3.6。

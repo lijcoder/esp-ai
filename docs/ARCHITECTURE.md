@@ -36,7 +36,7 @@
 | 音量控制 | 无数字音量（MAX98357A 增益由 SD_MODE 电阻固定） | 软件 16bit 数字音量 + 软限幅 |
 | 拾音 | 单麦全向，远场约 2~3m | 唤醒阈值按实测标定 |
 | 引脚 | MIC: 5/6/4；AMP: 41/42/40；LED: 48；按键: 0 | 避开 26-37/19-20/43-44 |
-| 内部 RAM | 当前固件 DIRAM 已用 137.6KB / 341.8KB（2026-10-30，含 coredump） | 设计目标：峰值占用 ≤ 310KB，保留 ≥ 30KB 内部堆 |
+| 内部 RAM | DIRAM 已用 193,250 B / 341,760 B（2026-10-31，含 coredump） | 设计目标（X3-E 定稿）：**静态 DIRAM + 堆峰值 ≤ 440KB**，且 wss 握手期最低空闲 ≥ 30KB |
 | 分区 | 见第 9.1 节（定稿） | app 双槽位预留给后续 OTA，代码当前版本不实现 |
 
 **结论**：音频链路为 16k 采集 + 48k 播放的双时钟结构；当前不实现 AEC，采用半双工。
@@ -405,13 +405,14 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 
 | 资源 | 分配 |
 |---|---|
-| 内部 RAM | WS ~24KB、I2S DMA、任务栈、编码器状态；**TLS 记录缓冲与握手堆自 X3-F 起放 PSRAM**；峰值 ≤ 310KB，保留 ≥ 30KB |
+| 内部 RAM | WS ~24KB、I2S DMA、任务栈、编码器状态；**TLS 记录缓冲与握手堆自 X3-F 起放 PSRAM**；设计目标（X3-E）：静态 DIRAM + 堆峰值 ≤ 440KB，最坏场景（wss 握手期）最低空闲 ≥ 30KB |
 | PSRAM | TLS 记录缓冲 8K+2K 与握手堆（~26KB 实测）、AFE 缓冲 ~200KB、播放 ring 1MB（三通道合计）、HTTP 缓冲 128KB、解码器状态、预留 4MB+ |
 | Flash | app 2×3M（一槽使用）、model 1.5M、assets 2M、storage 6.25M |
 
 > T1.4 实测（见 STATUS §5 基线）：`ws://` 连接时内部堆峰值 209,252 B；`wss`/TLS 握手期峰值 236,544 B、**最低水位 27,655 B**（略低于上面「保留 ≥30KB」的目标）。
 > WS 发送队列 8KB 已按约定放 PSRAM。
-> **X3-F 实测（2026-10-31，见 [PRODUCT_IDEAS §8 X3](PRODUCT_IDEAS.md) 与 STATUS §5）**：`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`（只把 mbedTLS 的堆放 PSRAM，WiFi/lwIP 驱动与数据路径不变，保时延）后，wss 握手期内部堆峰值 238,448→**216,668 B**、最低水位 25,087→**47,051~52,839 B**、最大块 30,720→31,744 B；PSRAM 占用 +25,656 B；TLS 握手耗时、boot→NET_UP、RTT 均无劣化。剩余 X3 项：C（WiFi 动态缓冲裁剪）待 P2 流式实测后判断，E（预算口径改「静态+堆峰值」并定目标值）待拍板。
+> **X3-E 口径定稿（2026-10-31）**：内部 RAM 预算统一为「静态 DIRAM（`idf.py size`）+ 运行期堆峰值（`sys heap` 峰值占用）≤ 440KB」，并要求最坏场景（wss 握手期）`sys heap` 最低水位 ≥ 30KB；旧口径「峰值 ≤310KB」写于 P0（未含 WiFi 栈、且只统计堆），作废。X3-F 后实测 193,250 + 216,668 = **409,918 B**、wss 最低水位 47,051~52,839 B，余量约 40.6KB / 17~23KB，留给 P2。
+> **X3-F 实测（2026-10-31，见 [PRODUCT_IDEAS §8 X3](PRODUCT_IDEAS.md) 与 STATUS §5）**：`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`（只把 mbedTLS 的堆放 PSRAM，WiFi/lwIP 驱动与数据路径不变，保时延）后，wss 握手期内部堆峰值 238,448→**216,668 B**、最低水位 25,087→**47,051~52,839 B**、最大块 30,720→31,744 B；PSRAM 占用 +25,656 B；TLS 握手耗时、boot→NET_UP、RTT 均无劣化。剩余 X3 项：C（WiFi 动态缓冲裁剪）待 P2 流式实测后判断；E 口径已按上文拍板。
 
 ### 9.3 任务与核心（确定）
 

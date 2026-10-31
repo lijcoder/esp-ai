@@ -79,6 +79,6 @@
 ## 后续
 
 - T2.5 `voice_cloud` 在本层之上解析业务 JSON、按 `sid` 过滤；T2.4 消费下行二进制帧做流式播放。
-- 内存：T1.6 复测 wss 握手期内部 RAM 最低水位 **25,087 B**（比 T1.4 的 27,655 B 再低约 2.6KB，距 CONVENTIONS §4 的保留 30KB 线差约 5KB），统一优化按 [PRODUCT_IDEAS §8 X3](../../docs/PRODUCT_IDEAS.md) 排在 P2 前（触发条件 ② 已命中）。
+- 内存：T1.6 时 wss 握手期内部 RAM 最低水位 **25,087 B**（低于 30KB 线约 5KB）；**已由 X3-F（`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`，TLS 堆移 PSRAM）解决 → 47,051~52,839 B**；预算口径见 CONVENTIONS §4（X3-E）。
 - 若 T2.4 的 TTS 帧率高，需评估 `WEBSOCKET_EVENT_DATA` 事件队列与 PSRAM 预缓冲（本层 rx 缓冲 2KB 内部 RAM）。
 - **T1.6 验收遗留（随 T2.5 修）**：`WEBSOCKET_EVENT_ERROR` 的非 TCP 分支打印 `esp_ws_handshake_status_code`，该字段只在握手失败类错误里有效；实测 kill 服务端 / 复位边界会以 `error_type=0`（NONE）进来，打出未初始化值（`握手 HTTP 状态=ESP-ROM:...`）。修法：只在 `WEBSOCKET_ERROR_TYPE_HANDSHAKE_FAILED` 时读该字段，其它类型只打 `type`（不影响功能，仅日志可信度）。

@@ -41,7 +41,7 @@
 
 1. 只允许上层依赖下层；同层走 `event_bus`；`main/` ≤150 行。
 2. 音频任务内禁止 `malloc` / 网络 / Flash / 阻塞。
-3. 大缓冲放 PSRAM，I2S DMA 放内部 RAM；内部 RAM 峰值 ≤310KB 且保留 ≥30KB。
+3. 大缓冲放 PSRAM，I2S DMA 放内部 RAM；内部 RAM（静态 DIRAM + 堆峰值）≤440KB 且 wss 握手期最低水位 ≥30KB（口径见 CONVENTIONS §4）。
 4. 采样率固定：MIC 16kHz / AMP 48kHz，运行中不切换。
 5. 半双工 R1–R5（ARCHITECTURE §3.3）不得私自改。
 6. 参数走 Kconfig，禁止硬编码 WiFi/服务器/引脚/阈值。

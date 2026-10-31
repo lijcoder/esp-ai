@@ -81,7 +81,8 @@ components/<module>/
 
 - 串口 115200（UART0，GPIO43/44），`idf.py monitor` 直接看日志。
 - 新增调试能力优先做成 console 命令（ARCHITECTURE §10.2），不要留临时打印。
-- 内存问题先 `sys heap`/`sys tasks`；音频问题先 `mic stat`，再 `tools/record_wav.py` 抓 WAV。
+- 内存问题先 `sys heap`/`sys tasks`；音频问题先 `mic stat`，再 `tools/record_wav.py` 抓 WAV（**该脚本 T5.2 才交付，当前不存在**）。
+- **唤醒测试先回放、别喊话**：`afplay tools/lexin.wav`（macOS 扬声器 → 设备麦克风）触发 WakeNet，不需要人工喊"嗨，乐鑫"；设备侧 `idf.py -p <PORT> monitor` 看 `APP: wake detected` → `AFE: feed paused` → `PLAYER: play 12800 samples` → `APP: prompt done, feed resumed`。回放前确认系统未静音、设备麦克风未被挡；无唤醒时依次查音量/距离/输出路由 → 设备是否在播放（播放中唤醒被忽略）→ `mic stat` 电平。素材与实测记录见 `tools/README.md`。
 - 云端/WS 问题先跑 mock，别直接上设备：`uv run tools/ws_mock_server.py --self-test`（9 项，不需要硬件）确认协议链路，再起 `uv run tools/ws_mock_server.py` 给设备当服务端；字段口径对照 `docs/PROTOCOL.md`（含待确认项）。
 - 崩溃先看串口 panic 输出，再解析 coredump 分区（`coredump` @0x9a0000/64K，已开 `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`）：
   `idf.py -p <PORT> coredump-info`（寄存器/调用栈/任务列表）、`idf.py -p <PORT> coredump-debug`（gdb）；也可 `-s core.dump` 存盘后 `coredump-info -c core.dump` 离线解析。

@@ -29,11 +29,12 @@
 | 协议字段细节 | `docs/PROTOCOL.md` | 空壳，P2 补全；此前以 ARCHITECTURE §6 为准 |
 | 文档怎么维护 / 边界 | `docs/CONVENTIONS.md` | §1 文档边界 |
 
-## 3. 构建与烧录
+## 3. 构建、烧录与真机测试
 
 - 直接执行：`idf.py build`、`idf.py -p <PORT> flash monitor`、`idf.py size`。
 - **不要 `source export.sh`**：本机是 EIM 安装方式，PATH 已就绪，source 反而报错。
 - 提交前必须：build 通过 + size 无明显增长。
+- **唤醒别喊话**：测"嗨，乐鑫"用 `afplay tools/lexin.wav`（Mac 扬声器回放、设备麦克风拾音），不需要人工喊；`idf.py -p <PORT> monitor` 侧预期 `APP: wake detected` → `AFE: feed paused` → `PLAYER: play ...` → `APP: prompt done, feed resumed`。用法与注意事项见 `tools/README.md`。
 
 ## 4. 铁律（违反会返工，完整版见 CONVENTIONS）
 

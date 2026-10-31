@@ -32,7 +32,7 @@
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `CONFIG_CFG_VOLUME_DEFAULT` | 60 | NVS 无 `volume` 键时的缺省音量；须与 ARCHITECTURE §3.5 一致 |
+| `CONFIG_CFG_VOLUME_DEFAULT` | 100 | NVS 无 `volume` 键时的缺省音量（2026-10-31 用户听感定稿）；须与 ARCHITECTURE §3.5 一致 |
 
 ## 关键约束
 

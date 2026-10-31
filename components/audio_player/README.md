@@ -49,7 +49,7 @@
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `AUDIO_PLAYER_DEFAULT_VOLUME` | 60 | 默认音量 |
+| `AUDIO_PLAYER_DEFAULT_VOLUME` | 60 | 上电初值（app 启动后由 NVS/`config_store` 覆盖；当前用户默认 **100**，见 ARCH §3.5） |
 | `AUDIO_PLAYER_TAIL_DELAY_MS` | 300 | 完成回调前的尾部延时（R2）；打断/失败不延时 |
 | `AUDIO_PLAYER_ENABLE_MP3` | y | 启用 MP3 解码（关闭后 `play_mp3`/流式返回不可用，提示音链路不受影响，固件约省 40KB Flash） |
 | `AUDIO_PLAYER_MP3_PCM_MAX_BYTES` | 524288（512KB） | **整段**解码路径 PCM 缓冲上限（PSRAM 预分配；流式不走这里）。512KB ≈ 24k 单声道 10.9s；T2.3 的 `mp3_test.py` 48/48 在 512KB 下仍通过 |

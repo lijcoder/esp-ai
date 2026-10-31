@@ -153,6 +153,7 @@ hex，脚本用 **PyAV（libopus）独立解码**后再断言，不采信设备�
 uv run tools/opus_enc_test.py --self-test              # 离线自检（不连串口/设备，12 项，先跑这个）
 uv run tools/opus_enc_test.py --log /tmp/opus_enc.log  # 真机全量（串口独占，默认复位设备）
 uv run tools/opus_enc_test.py --no-reset --window-ms 2000
+uv run tools/opus_enc_test.py --keep-wav /tmp/opus_wavs   # 保留解码 WAV（afplay 试听云端将收到的声音）
 ```
 
 ### 设备侧 console 契约（`codec_enc` 提供，脚本只消费输出）
@@ -247,13 +248,15 @@ PyAV 的 libopus 编码器现场造 1kHz 正弦 Opus 帧（16k/单声道/20ms/16
 ### 参数 / 依赖 / 限制
 
 - 参数：`--port`（默认自动探测唯一的 `/dev/cu.usbmodem*`）、`--window-ms`（默认 2000）、`--no-reset`、
-  `--boot-timeout`、`--log`、`--self-test`。
+  `--boot-timeout`、`--log`、`--keep-wav <dir>`、`--self-test`。
+- `--keep-wav <dir>`：把解码后的 `A_tone.wav`（1kHz 正弦）/ `B_base.wav`（静音基线）/ `B_speech.wav`（回放的交互语音）
+  保存到该目录并在结束前打印路径，可直接 `afplay` 试听「云端将收到的声音」；不加该参数时中间 WAV 落在系统临时目录、跑完删除。
 - PEP 723 内联 `pyserial>=3.5`、`av>=12`，`uv run` 自动安装（首次会下载 PyAV/libopus 轮子，约 18MB）。
 - **脚本独占串口**：运行前关掉 `idf.py monitor`（串口只有一个）；默认复位设备，`--no-reset` 用于设备已在跑。
 - 用例 B 会 `afplay` 外放交互语音；**不改系统音量、默认增益**（音量口径见上文「音量口径」）。
 - 本机 PyAV wheel 未带 numpy，脚本**不调 `to_ndarray()`**（避免 fltp float 值域 [-1,1] 被当 s16 截断成 0、误判全静音）：
   解码后统一重采样成 16k/mono/s16 写临时 WAV，再用标准库 `wave` 读样本做 FFT/RMS（FFT 纯 Python，2s@16k 约 0.05s，
-  中间 WAV 落在系统临时目录、结束删除）。设备帧解码原生输出是 **48k**（单帧 960 样本），时长断言按原生 `sample_rate`
+  中间 WAV 默认落在系统临时目录、结束删除；`--keep-wav` 可留存）。设备帧解码原生输出是 **48k**（单帧 960 样本），时长断言按原生 `sample_rate`
   折算，不写死 16k。
 
 ---

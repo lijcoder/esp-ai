@@ -25,6 +25,7 @@
 真机（**独占串口**，先关掉 idf.py monitor；固件由 T2.2 实现后才有 enc 命令）：
     uv run tools/opus_enc_test.py --port /dev/cu.usbmodemXXXX
     uv run tools/opus_enc_test.py --no-reset --window-ms 2000 --log /tmp/opus_enc.log
+    uv run tools/opus_enc_test.py --keep-wav /tmp/opus_wavs   # 保留解码 WAV（试听 A_tone/B_speech）
 
 设备侧 console 契约（由 components/codec_enc 提供，本工具只消费输出）：
     enc dump on|off                 → `ENC dump on` / `ENC dump off`
@@ -299,6 +300,29 @@ def opus_toc(payload: bytes) -> dict:
 # 本机 av 19 的 wheel 未声明 numpy 依赖，因此这里不用 numpy：
 # 解码 → av.AudioResampler(16k/mono/s16) → 写临时 WAV → 标准库 wave 读样本，
 # FFT 用纯 Python 迭代式 Cooley-Tukey（2s@16k 约 0.05s，足够快，且不多装依赖）。
+
+
+KEEP_WAV_DIR: str | None = None
+
+
+class _WavDir:
+    """解码 WAV 的落地目录：默认临时目录（用完即删）；--keep-wav 时保留给用户试听。"""
+
+    def __init__(self, prefix: str):
+        self.prefix = prefix
+        self._tmp: tempfile.TemporaryDirectory | None = None
+
+    def __enter__(self) -> str:
+        if KEEP_WAV_DIR:
+            os.makedirs(KEEP_WAV_DIR, exist_ok=True)
+            return KEEP_WAV_DIR
+        self._tmp = tempfile.TemporaryDirectory(prefix=self.prefix)
+        return self._tmp.name
+
+    def __exit__(self, *_exc) -> bool:
+        if self._tmp is not None:
+            self._tmp.cleanup()
+        return False
 
 
 def decode_opus_to_wav(payloads: list[bytes], wav_path: str) -> dict:
@@ -930,7 +954,7 @@ def run(args: argparse.Namespace) -> int:
         dump_on = False
         a_parsed = parse_enc_output(a_out)
         a_payloads = dump_payloads(a_parsed)
-        with tempfile.TemporaryDirectory(prefix="opus_enc_A_") as tmp:
+        with _WavDir("opus_enc_A_") as tmp:
             a_info, a_wav = decode_and_read(a_payloads, os.path.join(tmp, "A_tone.wav"))
         a_stats = check_stream(res, "A", "tone", a_parsed, window, a_wav, a_info, start=2)
         spec = spectrum_stats(a_wav["samples"], rate=a_wav["rate"] or DECODE_RATE)
@@ -961,7 +985,7 @@ def run(args: argparse.Namespace) -> int:
         base_out = dev.cmd("enc test 500 uplink", timeout=20)
         base_parsed = parse_enc_output(base_out)
         base_payloads = dump_payloads(base_parsed)
-        with tempfile.TemporaryDirectory(prefix="opus_enc_B_base_") as tmp:
+        with _WavDir("opus_enc_B_base_") as tmp:
             base_info, base_wav = decode_and_read(base_payloads, os.path.join(tmp, "B_base.wav"))
         quiet_rms = rms_of(base_wav["samples"])
         res.check("B2 静音基线可编码/解码（source=uplink、解码无失败）",
@@ -977,7 +1001,7 @@ def run(args: argparse.Namespace) -> int:
                 dev.pump(0.02)
         b_parsed = parse_enc_output(b_out)
         b_payloads = dump_payloads(b_parsed)
-        with tempfile.TemporaryDirectory(prefix="opus_enc_B_") as tmp:
+        with _WavDir("opus_enc_B_") as tmp:
             b_info, b_wav = decode_and_read(b_payloads, os.path.join(tmp, "B_speech.wav"))
         # 固件在 uplink 测试前会排空 ring 积压（打 `ENC TEST: 已丢弃 N 帧积压`，start 行前），
         # 实测 2000ms → 100 帧；±3 吸收调度边界（tone 固定帧数仍 ±2）。
@@ -1052,6 +1076,11 @@ def run(args: argparse.Namespace) -> int:
                   "; ".join(f"#{i + 1} frames={r.get('frames')} errors={r.get('errors')} "
                             f"carry={r.get('carry')}" for i, r in enumerate(runs)))
 
+        if KEEP_WAV_DIR:
+            wavs = sorted(glob.glob(os.path.join(KEEP_WAV_DIR, "*.wav")))
+            print(f"\n解码 WAV 已保留（{KEEP_WAV_DIR}），可直接 afplay 试听：")
+            for w in wavs:
+                print(f"  {w}")
         if args.log:
             write_log(dev, args.log)
             log_written = True
@@ -1076,9 +1105,14 @@ def main() -> int:
     ap.add_argument("--no-reset", action="store_true", help="不复位设备（已在运行时用）")
     ap.add_argument("--boot-timeout", type=float, default=25.0, help="等待启动/就绪的秒数")
     ap.add_argument("--log", help="把串口原始日志写到该文件")
+    ap.add_argument("--keep-wav", metavar="DIR",
+                    help="把解码后的 WAV（A_tone / B_base / B_speech）保存到该目录，默认用完即删")
     ap.add_argument("--self-test", action="store_true",
                     help="离线自检：不需要串口/设备，用 PyAV libopus 造帧跑解码/频谱/解析断言")
-    return run(ap.parse_args())
+    args = ap.parse_args()
+    global KEEP_WAV_DIR
+    KEEP_WAV_DIR = os.path.abspath(args.keep_wav) if args.keep_wav else None
+    return run(args)
 
 
 if __name__ == "__main__":

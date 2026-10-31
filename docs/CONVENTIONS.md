@@ -94,6 +94,7 @@ components/<module>/
 - 云端/WS 问题先跑 mock，别直接上设备：`uv run tools/ws_mock_server.py --self-test`（**13 项**，不需要硬件）确认协议链路，再起 `uv run tools/ws_mock_server.py` 给设备当服务端；字段口径对照 `docs/PROTOCOL.md`（含待确认项）。**mock 已默认对每条连接开 `TCP_NODELAY`**：Nagle + 端侧 delayed ACK 会把均匀 TTS 帧攒批 ~200ms，造成端侧假欠载；真实云端同样必须关 Nagle。
 - 崩溃先看串口 panic 输出，再解析 coredump 分区（`coredump` @0x9a0000/64K，已开 `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`）：
   `idf.py -p <PORT> coredump-info`（寄存器/调用栈/任务列表）、`idf.py -p <PORT> coredump-debug`（gdb）；也可 `-s core.dump` 存盘后 `coredump-info -c core.dump` 离线解析。
+- **端到端链路自测（T2.6 起）**：`uv run tools/e2e_voice_test.py` 走真实用户路径（afplay 唤醒 → 提示音 → 自动起轮 → 交互语音 → mock 真实 MP3 流式播放 → R2），10 轮逐轮断言（P2 三条 + 半双工/拾音/堆/PSRAM/任务/无 ERROR）；`--dry-run` 不连设备。与 `voice_cloud_test`（协议/事件、合成帧、`vc start` 手动触发）、`tts_stream_test`（`vc start/stop` + 真实 MP3 播放硬指标、含 abort/stall/late-bin）三方分工。拾音判据带环境噪声兜底（baseline=min(播放前后静音峰)，≥800 重试→WARN），**不要用重试掩盖固件 bug**。
 - **解析 coredump 必须用崩溃那一刻的 ELF**（`build/esp-ai.elf`，含符号与地址布局）：崩溃后先备份该文件再改代码/重建；要交付或现场测试的固件需把 elf 与 commit 一起归档，否则 coredump 无法还原调用栈。
 
 ## 9. 禁止事项

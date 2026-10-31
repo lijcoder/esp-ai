@@ -32,6 +32,7 @@
 #include "nvs.h"
 #include "sdkconfig.h"
 #include "transport_ws.h"
+#include "voice_cloud.h"
 
 static const char *TAG = "DIAG";
 
@@ -592,6 +593,10 @@ static int cmd_afe(int argc, char **argv)
 
     const char *sub = argv[2];
     if (strcmp(sub, "on") == 0) {
+        if (vc_is_busy()) {
+            printf("vc 轮次进行中，上行接口被 voice_cloud 占用；先 `vc cancel` 或等轮次结束\n");
+            return ESP_ERR_INVALID_STATE;
+        }
         esp_err_t err = audio_fe_uplink_start();
         if (err != ESP_OK) {
             printf("启动上行失败: %s\n", esp_err_to_name(err));
@@ -879,6 +884,13 @@ static int cmd_enc(int argc, char **argv)
     }
 
     const char *sub = argv[1];
+    /* 编码器同一时刻只能有一个使用者：vc 轮次进行中时拒绝会动编码器状态的子命令
+     * （stat/dump/reset 只读统计，允许） */
+    if ((strcmp(sub, "test") == 0 || strcmp(sub, "open") == 0 || strcmp(sub, "close") == 0) &&
+        vc_is_busy()) {
+        printf("vc 轮次进行中，编码器被 voice_cloud 占用；先 `vc cancel` 或等轮次结束\n");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (strcmp(sub, "test") == 0) {
         int ms = (argc > 2) ? atoi(argv[2]) : 1000;
         if (ms < 100) {
@@ -1126,10 +1138,12 @@ static int cmd_wifi(int argc, char **argv)
  * 为什么要有 send/sendbin/rxlog：P1 还没有 voice_cloud（T2.5），固件里没有任何上行发送方，
  * 只靠自动心跳证明不了"端侧能发、能收"。这三个命令是**开发期探针**：
  *   - 不解析业务 JSON、不发明协议字段，把控制台输入原样交给 transport_ws；
- *   - T2.5 落地后仍可留作调试口，但 rxlog 会占用 ws_register_cb（与 voice_cloud 的回调互斥）。
+ *   - rxlog 从 T2.5 起走 ws_subscribe() 附加订阅，与 voice_cloud 的主回调**并存**（都看到下行帧）；
+ *     关掉 rxlog 不会影响业务回调。
  */
 
-static uint32_t s_ws_rxlog_bin; /* rxlog 打开后收到的二进制帧计数（只影响打印频率） */
+static uint32_t s_ws_rxlog_bin;  /* rxlog 打开后收到的二进制帧计数（只影响打印频率） */
+static uint32_t s_ws_rxlog_token; /* 附加订阅令牌；0 表示未打开 */
 
 static void ws_rxlog_cb(const ws_frame_hdr_t *frame, const uint8_t *payload, size_t len, void *arg)
 {
@@ -1274,13 +1288,33 @@ static int ws_cmd_rxlog(int argc, char **argv)
         return ESP_ERR_INVALID_ARG;
     }
 
-    const esp_err_t err = ws_register_cb(on ? ws_rxlog_cb : NULL, NULL);
-    if (err != ESP_OK) {
-        printf("设置失败: %s（ws 未初始化）\n", esp_err_to_name(err));
-        return err;
+    esp_err_t err;
+    if (on) {
+        if (s_ws_rxlog_token != 0) {
+            printf("下行帧打印已开启（令牌 %" PRIu32 "），无需重复订阅\n", s_ws_rxlog_token);
+            return ESP_OK;
+        }
+        uint32_t token = 0;
+        err = ws_subscribe(ws_rxlog_cb, NULL, &token);
+        if (err != ESP_OK) {
+            printf("订阅失败: %s%s\n", esp_err_to_name(err),
+                   err == ESP_ERR_NO_MEM ? "（附加订阅槽位已满）" : "（ws 未初始化）");
+            return err;
+        }
+        s_ws_rxlog_token = token;
+    } else {
+        if (s_ws_rxlog_token != 0) {
+            err = ws_unsubscribe(s_ws_rxlog_token);
+            if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+                printf("取消订阅失败: %s\n", esp_err_to_name(err));
+                return err;
+            }
+            s_ws_rxlog_token = 0;
+        }
     }
     s_ws_rxlog_bin = 0;
-    printf("下行帧打印: %s（文本帧全量≤200B，二进制只打首帧与每 25 帧）\n", on ? "开" : "关");
+    printf("下行帧打印: %s（文本帧全量≤200B，二进制只打首帧与每 25 帧；与 voice_cloud 回调并存）\n",
+           on ? "开" : "关");
     return ESP_OK;
 }
 
@@ -1326,6 +1360,101 @@ static int cmd_ws(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- vc 命令（voice_cloud 观测与手动起轮，T2.5） ---------------- */
+
+static void print_vc_status(void)
+{
+    vc_stats_t st;
+    ws_status_t wst;
+
+    printf("voice_cloud: %s（当前 sid=%u）%s\n", vc_state_name(vc_get_state()),
+           (unsigned)vc_current_sid(), vc_is_busy() ? "  [busy]" : "");
+    printf("  WS: %s\n", ws_is_ready() ? "READY（可发起轮次）" : "未 READY（vc start 会被拒绝）");
+    if (ws_status_read(&wst) == ESP_OK && wst.url_configured) {
+        printf("  端点: %s（%s）\n", wst.endpoint, wst.tls ? "wss/TLS" : "ws 明文");
+    }
+    if (vc_stats_read(&st) != ESP_OK) {
+        printf("  读取统计失败\n");
+        return;
+    }
+
+    const double bytes_per_frame =
+        st.up_frames > 0 ? (double)st.up_bytes / (double)st.up_frames : 0.0;
+    printf("  轮次: 发起 %" PRIu32 " / 完成 %" PRIu32 " / 中止 %" PRIu32
+           "；最近 sid=%u 用时 %" PRIu32 " ms（收尾=%s）\n",
+           st.rounds_started, st.rounds_done, st.rounds_aborted, (unsigned)st.last_sid,
+           st.last_round_ms, st.last_sid == 0 ? "—" : (st.last_round_vad_end ? "VAD 静音" : "时长上限"));
+    printf("  上行: %" PRIu32 " 帧 / %" PRIu32 " 字节（%.1f B/帧）；编码失败 %" PRIu32
+           " 入队失败 %" PRIu32 " 读超时 %" PRIu32 "；首帧 %" PRIu32 " us\n",
+           st.up_frames, st.up_bytes, bytes_per_frame, st.up_encode_errors, st.up_send_errors,
+           st.up_read_timeouts, st.first_frame_us);
+    printf("  下行: 文本 %" PRIu32 " / 音频帧 %" PRIu32 "；sid 丢弃 %" PRIu32 " 解析失败 %" PRIu32
+           " 云端 error %" PRIu32 "\n",
+           st.rx_text, st.rx_audio_frames, st.rx_dropped_sid, st.rx_parse_errors,
+           st.rx_cloud_errors);
+    printf("  说明: 唤醒后由 APP 自动起一轮；手动调试用 vc start [sid] / stop / cancel\n");
+}
+
+static int cmd_vc(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: vc status | start [sid] | stop | cancel | stat | reset\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *sub = argv[1];
+    if (strcmp(sub, "status") == 0 || strcmp(sub, "stat") == 0) {
+        print_vc_status();
+        return ESP_OK;
+    }
+
+    if (strcmp(sub, "start") == 0) {
+        esp_err_t err;
+        if (argc >= 3) {
+            char *end = NULL;
+            errno = 0;
+            const unsigned long value = strtoul(argv[2], &end, 10);
+            if (errno != 0 || end == argv[2] || *end != '\0' || value > 0xFFFFUL) {
+                printf("非法 sid: %s（范围 0~65535）\n", argv[2]);
+                return ESP_ERR_INVALID_ARG;
+            }
+            err = vc_start((uint16_t)value);
+        } else {
+            err = vc_start_auto();
+        }
+        if (err != ESP_OK) {
+            printf("发起失败: %s（云端未 READY 时属预期，先 ws status 看状态）\n",
+                   esp_err_to_name(err));
+            return err;
+        }
+        printf("已请求发起一轮（sid=%s），2s 后用 vc status 看上行帧数\n",
+               argc >= 3 ? argv[2] : "auto");
+        return ESP_OK;
+    }
+
+    if (strcmp(sub, "stop") == 0) {
+        esp_err_t err = vc_stop();
+        printf("%s\n", err == ESP_OK ? "已请求优雅收尾（补尾帧 + audio_end）" :
+                                      esp_err_to_name(err));
+        return err;
+    }
+
+    if (strcmp(sub, "cancel") == 0) {
+        esp_err_t err = vc_cancel();
+        printf("%s\n", err == ESP_OK ? "已请求立即放弃当前轮次" : esp_err_to_name(err));
+        return err;
+    }
+
+    if (strcmp(sub, "reset") == 0) {
+        esp_err_t err = vc_stats_reset();
+        printf("vc 统计已清零（保留最近 sid/用时）\n");
+        return err;
+    }
+
+    printf("未知子命令: %s（可用: status | start | stop | cancel | stat | reset）\n", sub);
+    return ESP_ERR_INVALID_ARG;
+}
+
 /* ---------------- evt 命令（事件总线观测，T1.2a） ---------------- */
 
 /*
@@ -1335,7 +1464,9 @@ static int cmd_ws(int argc, char **argv)
 
 static bool evt_has_payload(app_evt_t evt)
 {
-    return evt == APP_EVT_NET_UP || evt == APP_EVT_NET_DOWN;
+    /* 带 payload 的事件：P1 的网络事件 + T2.5 定的语音事件（见 event_bus.h） */
+    return evt == APP_EVT_NET_UP || evt == APP_EVT_NET_DOWN || evt == APP_EVT_ASR_PARTIAL ||
+           evt == APP_EVT_ASR_FINAL || evt == APP_EVT_TTS_START || evt == APP_EVT_TTS_END;
 }
 
 static bool evt_parse(const char *text, app_evt_t *out)
@@ -1366,6 +1497,18 @@ static void evt_fill_sample_payload(app_evt_t evt, app_evt_data_t *data)
     } else if (evt == APP_EVT_NET_DOWN) {
         data->net_down.reason = 2; /* 示例值：模拟鉴权过期类断开原因 */
         data->net_down.retry_ms = 1000;
+    } else if (evt == APP_EVT_ASR_PARTIAL || evt == APP_EVT_ASR_FINAL) {
+        const char *sample = "示例识别文本";
+        data->asr.sid = 1;
+        data->asr.len = (uint16_t)strlen(sample);
+        memcpy(data->asr.text, sample, data->asr.len);
+    } else if (evt == APP_EVT_TTS_START) {
+        data->tts_start.sid = 1;
+        data->tts_start.codec = APP_EVT_CODEC_MP3;
+        data->tts_start.sr = 24000;
+    } else if (evt == APP_EVT_TTS_END) {
+        data->tts_end.sid = 1;
+        data->tts_end.frames = 100;
     }
 }
 
@@ -1378,6 +1521,18 @@ static void evt_trace_cb(void *arg, app_evt_t evt, const app_evt_data_t *data)
     } else if (evt == APP_EVT_NET_DOWN && data != NULL) {
         ESP_LOGI(TAG, "evt trace: %s reason=%u retry=%u ms", app_evt_name(evt),
                  (unsigned)data->net_down.reason, (unsigned)data->net_down.retry_ms);
+    } else if ((evt == APP_EVT_ASR_PARTIAL || evt == APP_EVT_ASR_FINAL) && data != NULL) {
+        ESP_LOGI(TAG, "evt trace: %s sid=%u len=%u text=%.*s", app_evt_name(evt),
+                 (unsigned)data->asr.sid, (unsigned)data->asr.len,
+                 (int)(data->asr.len > APP_EVT_TEXT_MAX ? APP_EVT_TEXT_MAX : data->asr.len),
+                 data->asr.text);
+    } else if (evt == APP_EVT_TTS_START && data != NULL) {
+        ESP_LOGI(TAG, "evt trace: %s sid=%u codec=%u sr=%" PRIu32, app_evt_name(evt),
+                 (unsigned)data->tts_start.sid, (unsigned)data->tts_start.codec,
+                 data->tts_start.sr);
+    } else if (evt == APP_EVT_TTS_END && data != NULL) {
+        ESP_LOGI(TAG, "evt trace: %s sid=%u frames=%u", app_evt_name(evt),
+                 (unsigned)data->tts_end.sid, (unsigned)data->tts_end.frames);
     } else {
         ESP_LOGI(TAG, "evt trace: %s", app_evt_name(evt));
     }
@@ -1584,6 +1739,12 @@ static esp_err_t register_commands(void)
             .help = "WebSocket：ws status | reconnect | send <json> | sendbin [len] | rxlog on|off",
             .hint = "status|reconnect|send|sendbin|rxlog",
             .func = cmd_ws,
+        },
+        {
+            .command = "vc",
+            .help = "语音云：vc status | start [sid] | stop | cancel | stat | reset（T2.5）",
+            .hint = "status|start|stop|cancel|stat|reset",
+            .func = cmd_vc,
         },
     };
 

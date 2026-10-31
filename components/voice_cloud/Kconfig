@@ -1,0 +1,60 @@
+menu "Voice Cloud (上行语音链路)"
+
+    config VC_TASK_STACK
+        int "`vc` 任务栈（字节）"
+        range 4096 12288
+        default 8192
+        help
+            按 ARCHITECTURE §9.3：核 0 / 优先级 4 / 8KB。上行循环与 Opus 编码都在本任务里串行，
+            libopus 的临时数组走 PSRAM 伪栈（codec_enc Kconfig），任务栈只需容纳调用链与
+            JSON 小缓冲，8KB 有余量；改小前先看 `sys tasks` 的栈余量。
+
+    config VC_TASK_PRIORITY
+        int "`vc` 任务优先级"
+        range 1 9
+        default 4
+        help
+            低于 ws/evt（5），高于纯后台任务。编码每 20ms 约 6~7ms，留足余量给网络任务。
+
+    config VC_TASK_CORE
+        int "`vc` 任务绑核（0=协议核，1=音频核）"
+        range 0 1
+        default 0
+        help
+            核 1 只跑音频实时路径（afe_feed/afe_fetch/player），编码与收发放核 0，
+            避免与 AFE 抢核导致 I2S 欠载。
+
+    config VC_VAD_SILENCE_MS
+        int "VAD 静音多久结束一轮（毫秒）"
+        range 200 3000
+        default 800
+        help
+            ARCHITECTURE §3.6/§7：VAD 判定静音持续 800ms 发 audio_end。
+            口径：至少出现过一次人声（vad_active）后，AFE 连续静音达到该时长才收尾；
+            若用户一直不说话，由 VC_MAX_UTTER_MS 兜底。
+
+    config VC_MAX_UTTER_MS
+        int "单轮累计收音上限（毫秒）"
+        range 1000 15000
+        default 8000
+        help
+            ARCHITECTURE §3.6：累计收音 8s 上限，到点强制 audio_end，防止服务端无限等待。
+            该值同时决定"用户不说话时一轮最长占用上行"。
+
+    config VC_READ_TIMEOUT_MS
+        int "上行 PCM 读超时（毫秒）"
+        range 10 200
+        default 50
+        help
+            audio_fe_uplink_read() 的等待上限。AFE 每帧 32ms 输出，50ms 足够且能让
+            vc_stop()/断链在 ~50ms 内被响应；不要设 0（会退化成忙轮询）。
+
+    config VC_RESPONSE_TIMEOUT_MS
+        int "audio_end 后等云端响应的超时（毫秒）"
+        range 1000 60000
+        default 10000
+        help
+            ARCHITECTURE §7：THINKING 阶段 10s 超时。超时后本轮结束（T3.1 落地后由
+            voice_session 播错误提示音），本组件只回到 IDLE。
+
+endmenu

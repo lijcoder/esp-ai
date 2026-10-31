@@ -1,7 +1,8 @@
 /*
  * 应用入口：只做模块初始化编排与事件接线，不放业务逻辑。
- * 当前为最小可用版本（P0 MVP）：
- *   唤醒"嗨，乐鑫" -> 播放提示音"我在呢" -> 恢复收音（半双工）
+ * 当前链路（P2/T2.5）：
+ *   唤醒"嗨，乐鑫" -> 播放提示音"我在呢" -> 恢复收音 -> 起一轮端云语音会话
+ *   （voice_cloud 上行 Opus；未联网/未配置 WS_URL 时自动跳过，本地功能不受影响）
  */
 #include "audio_fe.h"
 #include "audio_io.h"
@@ -14,6 +15,7 @@
 #include "net_mgr.h"
 #include "prompt_assets.h"
 #include "transport_ws.h"
+#include "voice_cloud.h"
 
 static const char *TAG = "APP";
 
@@ -23,6 +25,14 @@ static void on_play_done(void *arg)
     /* R2：播放结束（含尾部延时）后恢复收音 */
     audio_fe_set_feed_enabled(true);
     ESP_LOGI(TAG, "prompt done, feed resumed");
+
+    /* 提示音播完、收音已恢复，才是"用户开始说话"的起点：发起一轮端云会话。
+     * 云端未 READY 时 vc_start_auto() 返回 INVALID_STATE 并只打 WARN —— 启动顺序
+     * 不能假设 WiFi/握手已经完成（唤醒是本地能力，早于联网）。 */
+    esp_err_t err = vc_start_auto();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "cloud round skipped: %s", esp_err_to_name(err));
+    }
 }
 
 static void on_afe_event(audio_fe_event_t evt, void *arg)
@@ -101,6 +111,10 @@ void app_main(void)
      * 未配置 WS_URL 时 ws_init 只 WARN 并降级离线，本地功能不受影响 */
     ESP_ERROR_CHECK(ws_init());
     ws_start();
+
+    /* 语音云协议（T2.5）放在 ws 之后：vc_init 要注册 WS 主接收回调；
+     * 未 READY 时按轮次跳过，不影响本地唤醒/提示音 */
+    ESP_ERROR_CHECK(vc_init());
 
     ESP_LOGI(TAG, "ready, say \"Hi Lexin\"");
 }

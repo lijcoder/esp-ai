@@ -18,9 +18,12 @@
 |---|---|
 | `APP_EVT_NET_UP` | `app_evt_net_up_t { ip[16], rssi }` |
 | `APP_EVT_NET_DOWN` | `app_evt_net_down_t { reason, retry_ms }` |
+| `APP_EVT_ASR_PARTIAL` / `APP_EVT_ASR_FINAL` | `app_evt_asr_t { sid, len, char text[28] }`（T2.5 定稿；超长截断） |
+| `APP_EVT_TTS_START` | `app_evt_tts_start_t { sid, codec(1=mp3), sr }` |
+| `APP_EVT_TTS_END` | `app_evt_tts_end_t { sid, frames }`（本轮下行音频帧数） |
 | 其余 11 个事件 | 暂无（post 时传 `NULL`），使用方落地时补定义并同步 ARCHITECTURE §4.2 |
 
-payload 统一装进定长 32 字节的 `app_evt_data_t`：投递时整块拷贝，**发布方不需要保活数据**，处理器拿到的 `data` 只在本次回调内有效。文本类 payload（ASR/LLM/TTS）的所有权语义留给 T2.5/T3.1 定稿，不要自行往 union 里加变长字段。
+payload 统一装进定长 32 字节的 `app_evt_data_t`：投递时整块拷贝，**发布方不需要保活数据**，处理器拿到的 `data` 只在本次回调内有效。文本类 payload 的定长/截断口径已由 T2.5 定稿（ASR 文本最多 28B，完整文本走 `voice_cloud` 日志/回调）；**不要自行往 union 里加变长字段**，新增字段先改 ARCHITECTURE §4.2。
 
 ## 依赖
 

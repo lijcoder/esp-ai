@@ -85,8 +85,21 @@ typedef enum {
 static bool s_inited;
 static bool s_started;                    /* 上层是否请求保持在线 */
 static ws_state_t s_state = WS_STATE_IDLE;
-static ws_recv_cb_t s_recv_cb;
-static void *s_recv_arg;
+
+/*
+ * 入站回调槽：语音业务（T2.5 voice_cloud）与 console 观测（`ws rxlog`）都要看下行帧，
+ * 单回调会被后注册者覆盖、业务事件静默丢失。slot 0 保留 ws_register_cb() 的覆盖语义，
+ * slot 1..3 给 ws_subscribe() 追加订阅（两者互不影响）。
+ */
+#define WS_RECV_SLOTS 4
+typedef struct {
+    ws_recv_cb_t cb;
+    void *arg;
+    uint32_t token; /* 0 = 空槽 */
+} ws_recv_slot_t;
+static ws_recv_slot_t s_recv_slots[WS_RECV_SLOTS];
+static portMUX_TYPE s_recv_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_recv_token_next = 1;
 
 static char s_uri[512];                   /* 实际连接 URI（含 query；不打印） */
 static char s_endpoint[96];               /* 脱敏端点，只用于日志/状态 */
@@ -300,6 +313,25 @@ static bool build_uri(void)
 
 /* ---------------- 接收：分片重组 + 帧校验 ---------------- */
 
+/*
+ * 在临界区外回调：回调里可能再调用 ws_register_cb/ws_subscribe/ws_unsubscribe
+ * （例如 diag 的 rxlog 自行关闭），临界区内重入会死锁。
+ */
+static void dispatch_recv(const ws_frame_hdr_t *frame, const uint8_t *payload, size_t len)
+{
+    ws_recv_slot_t snap[WS_RECV_SLOTS];
+
+    portENTER_CRITICAL(&s_recv_mux);
+    memcpy(snap, s_recv_slots, sizeof(snap));
+    portEXIT_CRITICAL(&s_recv_mux);
+
+    for (size_t i = 0; i < WS_RECV_SLOTS; i++) {
+        if (snap[i].cb != NULL) {
+            snap[i].cb(frame, payload, len, snap[i].arg);
+        }
+    }
+}
+
 static void on_rx_message(uint8_t opcode, const uint8_t *buf, size_t len)
 {
     if (opcode == 0x2) { /* 二进制：ARCHITECTURE §6.2 */
@@ -324,10 +356,8 @@ static void on_rx_message(uint8_t opcode, const uint8_t *buf, size_t len)
             return;
         }
         s_rx_bin++;
-        if (s_recv_cb != NULL) {
-            const ws_frame_hdr_t hdr = {.ver = buf[2], .type = type, .seq = seq};
-            s_recv_cb(&hdr, buf + WS_FRAME_HEADER_LEN, plen, s_recv_arg);
-        }
+        const ws_frame_hdr_t hdr = {.ver = buf[2], .type = type, .seq = seq};
+        dispatch_recv(&hdr, buf + WS_FRAME_HEADER_LEN, plen);
         return;
     }
 
@@ -348,9 +378,7 @@ static void on_rx_message(uint8_t opcode, const uint8_t *buf, size_t len)
             return;
         }
     }
-    if (s_recv_cb != NULL) {
-        s_recv_cb(NULL, buf, len, s_recv_arg);
-    }
+    dispatch_recv(NULL, buf, len);
 }
 
 static void handle_data_event(const esp_websocket_event_data_t *ed)
@@ -426,8 +454,8 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
                 ESP_LOGD(TAG, "主动断开期间的客户端错误（已忽略）");
                 break;
             }
-            /* 注意：只有 TCP_TRANSPORT 类错误才会填 esp_tls_* 字段，
-             * 其它类型读它们是未初始化值（真机首次联调打出过垃圾数字） */
+            /* 注意：只有 TCP_TRANSPORT / HANDSHAKE 类错误才会填对应字段，
+             * 其它类型读它们是未初始化值（T1.6 异常收尾真机打出过垃圾数字） */
             if (ed->error_handle.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT) {
                 ESP_LOGE(TAG,
                          "WS 错误：TCP/TLS 失败（tls_err=0x%x stack=%d verify=0x%x sock_errno=%d）",
@@ -435,10 +463,11 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
                          ed->error_handle.esp_tls_stack_err,
                          ed->error_handle.esp_tls_cert_verify_flags,
                          ed->error_handle.esp_transport_sock_errno);
-            } else {
-                ESP_LOGE(TAG, "WS 错误：type=%d，握手 HTTP 状态=%d",
-                         (int)ed->error_handle.error_type,
+            } else if (ed->error_handle.error_type == WEBSOCKET_ERROR_TYPE_HANDSHAKE) {
+                ESP_LOGE(TAG, "WS 错误：握手失败（HTTP 状态=%d）",
                          ed->error_handle.esp_ws_handshake_status_code);
+            } else {
+                ESP_LOGE(TAG, "WS 错误：type=%d", (int)ed->error_handle.error_type);
             }
         }
         post_cmd(WS_CMD_CLIENT_DISCONNECTED);
@@ -932,9 +961,64 @@ esp_err_t ws_register_cb(ws_recv_cb_t cb, void *arg)
     if (!s_inited) {
         return ESP_ERR_INVALID_STATE;
     }
-    s_recv_cb = cb;
-    s_recv_arg = arg;
+    portENTER_CRITICAL(&s_recv_mux);
+    s_recv_slots[0].cb = cb;
+    s_recv_slots[0].arg = arg;
+    s_recv_slots[0].token = (cb != NULL) ? s_recv_token_next++ : 0;
+    portEXIT_CRITICAL(&s_recv_mux);
     return ESP_OK;
+}
+
+esp_err_t ws_subscribe(ws_recv_cb_t cb, void *arg, uint32_t *token)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (cb == NULL || token == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = ESP_ERR_NO_MEM; /* 附加槽位全满 */
+    portENTER_CRITICAL(&s_recv_mux);
+    for (size_t i = 1; i < WS_RECV_SLOTS; i++) {
+        if (s_recv_slots[i].cb == NULL) {
+            if (s_recv_token_next == 0) {
+                s_recv_token_next = 1; /* 0 保留给空槽 */
+            }
+            s_recv_slots[i].cb = cb;
+            s_recv_slots[i].arg = arg;
+            s_recv_slots[i].token = s_recv_token_next++;
+            *token = s_recv_slots[i].token;
+            err = ESP_OK;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_recv_mux);
+    return err;
+}
+
+esp_err_t ws_unsubscribe(uint32_t token)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (token == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    portENTER_CRITICAL(&s_recv_mux);
+    for (size_t i = 0; i < WS_RECV_SLOTS; i++) {
+        if (s_recv_slots[i].cb != NULL && s_recv_slots[i].token == token) {
+            s_recv_slots[i].cb = NULL;
+            s_recv_slots[i].arg = NULL;
+            s_recv_slots[i].token = 0;
+            err = ESP_OK;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_recv_mux);
+    return err;
 }
 
 static esp_err_t tx_enqueue_msg(ws_tx_msg_t *msg)

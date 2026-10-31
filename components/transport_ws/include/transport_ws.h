@@ -101,11 +101,29 @@ esp_err_t ws_start(void);
 esp_err_t ws_stop(void);
 
 /**
- * @brief 注册入站回调（可多次调用覆盖，传 NULL 取消）
+ * @brief 注册**主**入站回调（覆盖语义：可多次调用覆盖 slot 0，传 NULL 取消）
+ *
+ * 业务方（T2.5 voice_cloud）用它；console 观测（`ws rxlog`）用 ws_subscribe() 追加订阅，
+ * 两者共存、互不覆盖。
  *
  * @note 回调在 `ws_client` 任务上下文执行，见文件头线程模型说明。
  */
 esp_err_t ws_register_cb(ws_recv_cb_t cb, void *arg);
+
+/**
+ * @brief 追加一个入站回调订阅（与主回调并存，最多 3 个附加槽位）
+ *
+ * @param[out] token 订阅令牌（非 0），用于 ws_unsubscribe()
+ * @return ESP_OK / ESP_ERR_INVALID_STATE（未初始化）/ ESP_ERR_INVALID_ARG /
+ *         ESP_ERR_NO_MEM（附加槽位已满）
+ *
+ * @note 同一回调重复订阅会占多个槽位；调用方自行保证只订一次。
+ * @note 回调在 `ws_client` 任务上下文执行；回调内可以再调用本组件的订阅 API。
+ */
+esp_err_t ws_subscribe(ws_recv_cb_t cb, void *arg, uint32_t *token);
+
+/* 取消一个附加订阅（主回调不受影响） */
+esp_err_t ws_unsubscribe(uint32_t token);
 
 /**
  * @brief 发送文本帧（JSON），**非阻塞入队**

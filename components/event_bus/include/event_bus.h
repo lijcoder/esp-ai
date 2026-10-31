@@ -31,10 +31,10 @@ typedef enum {
     APP_EVT_WAKE_DETECTED,          /* 唤醒词命中，无 payload */
     APP_EVT_VAD_SPEECH_START,       /* 人声开始，无 payload */
     APP_EVT_VAD_SPEECH_END,         /* 人声结束，无 payload */
-    APP_EVT_ASR_PARTIAL,            /* ASR 中间结果，payload 待 T2.5 定稿 */
-    APP_EVT_ASR_FINAL,              /* ASR 最终结果，payload 待 T2.5 定稿 */
-    APP_EVT_TTS_START,              /* 云端 TTS 起播，payload 待 T2.5 定稿 */
-    APP_EVT_TTS_END,                /* 云端 TTS 结束，payload 待 T2.5 定稿 */
+    APP_EVT_ASR_PARTIAL,            /* ASR 中间结果，payload: app_evt_asr_t（T2.5 定稿） */
+    APP_EVT_ASR_FINAL,              /* ASR 最终结果，payload: app_evt_asr_t（T2.5 定稿） */
+    APP_EVT_TTS_START,              /* 云端 TTS 起播，payload: app_evt_tts_start_t（T2.5 定稿） */
+    APP_EVT_TTS_END,                /* 云端 TTS 结束，payload: app_evt_tts_end_t（T2.5 定稿） */
     APP_EVT_VOICE_STATE_CHANGED,    /* 会话状态迁移，payload 待 T3.1 定稿 */
     APP_EVT_BUTTON,                 /* 按键动作，payload 待 T3.4 定稿 */
     APP_EVT_MUSIC_STATE_CHANGED,    /* 音乐状态变化，payload 待 T4.3 定稿 */
@@ -57,14 +57,48 @@ typedef struct {
     uint32_t retry_ms; /* net_mgr 的下次重连延时（退避 1s→30s）；0 表示不再重试 */
 } app_evt_net_down_t;
 
+/* ---------------- 语音事件 payload（T2.5 定稿，见 ARCHITECTURE §4.2） ---------------- */
+
+/* ASR 文本最大字节数：payload 定长 32B − sid(2) − len(2) = 28。
+ * 中文 UTF-8 每字 3B，约 9 个汉字；更长的文本会被截断，完整文本只在 VC 侧 INFO 日志里。 */
+#define APP_EVT_TEXT_MAX 28
+
+/* APP_EVT_ASR_PARTIAL / APP_EVT_ASR_FINAL：识别文本（可能截断，len 为实际拷贝字节数） */
+typedef struct {
+    uint16_t sid;                /* 所属会话 */
+    uint16_t len;                /* text 有效字节数（≤ APP_EVT_TEXT_MAX） */
+    char text[APP_EVT_TEXT_MAX]; /* UTF-8，不保证 '\0' 结尾（按 len 读） */
+} app_evt_asr_t;
+
+/* TTS codec 取值（ARCHITECTURE §3.7：端侧只实现 MP3） */
+#define APP_EVT_CODEC_UNKNOWN 0
+#define APP_EVT_CODEC_MP3 1
+
+/* APP_EVT_TTS_START：云端开始下发 TTS（binary 帧随后到达，T2.4 解码播放） */
+typedef struct {
+    uint16_t sid;
+    uint8_t codec; /* APP_EVT_CODEC_* */
+    uint8_t reserved;
+    uint32_t sr; /* 采样率（Hz），契约里 tts_start.sr */
+} app_evt_tts_start_t;
+
+/* APP_EVT_TTS_END：本轮 TTS 下发结束（frames = 本轮收到的下行音频帧数） */
+typedef struct {
+    uint16_t sid;
+    uint16_t frames;
+} app_evt_tts_end_t;
+
 /*
- * 事件 payload 统一容器（P1 只定义网络事件，其余事件暂无 payload，post 时传 NULL）。
- * 新增字段时不得让 union 超过 APP_EVT_DATA_MAX；文本类 payload（ASR/LLM）的
- * 所有权语义留给 T2.5/T3.1 定稿，届时先改 ARCHITECTURE §4.2 再改代码。
+ * 事件 payload 统一容器：定长 32 字节，跨任务投递时整块拷贝，发布方无需保活。
+ * 新增字段时不得让 union 超过 APP_EVT_DATA_MAX；payload 超过 32B 的文本类数据
+ * （完整 ASR 文本）不放事件，改由发布方日志/组件 API 提供（T3.1 再定所有权）。
  */
 typedef union {
     app_evt_net_up_t net_up;
     app_evt_net_down_t net_down;
+    app_evt_asr_t asr;
+    app_evt_tts_start_t tts_start;
+    app_evt_tts_end_t tts_end;
     uint8_t raw[APP_EVT_DATA_MAX];
 } app_evt_data_t;
 

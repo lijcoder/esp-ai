@@ -12,7 +12,8 @@
 | `ws_init()` | 解析 URL、建 PSRAM 发送队列与 `ws` 任务、订阅 `APP_EVT_NET_UP/NET_DOWN`；URL 未配置/非法时**降级离线**（只 WARN，本地功能不受影响） |
 | `ws_start()` | 请求保持在线：有网即建连，之后自动重连（幂等、非阻塞） |
 | `ws_stop()` | 主动下线并停止自动重连（非阻塞） |
-| `ws_register_cb(cb, arg)` | 注册入站回调（文本帧 `frame == NULL`，二进制帧带 `{ver,type,seq}`） |
+| `ws_register_cb(cb, arg)` | 注册**主**入站回调（覆盖语义；文本帧 `frame == NULL`，二进制帧带 `{ver,type,seq}`）。T2.5 `voice_cloud` 用它 |
+| `ws_subscribe(cb, arg, &token)` / `ws_unsubscribe(token)` | 追加订阅入站回调（最多 3 个附加槽位，与主回调并存）。`diag` 的 `ws rxlog` 用它，**不再抢占业务回调**（T2.5 改） |
 | `ws_send_text(json)` | 文本帧**非阻塞入队**；未 READY 返回 `ESP_ERR_INVALID_STATE`，队列满返回 `ESP_ERR_TIMEOUT` |
 | `ws_send_bin(type, payload, len)` | 上行二进制帧，自动填 8B 帧头与自增 `seq`；`type` 只接受 `0x01` |
 | `ws_reconnect()` | 重置退避、立即重连（`diag` 的 `ws reconnect`） |
@@ -81,4 +82,5 @@
 - T2.5 `voice_cloud` 在本层之上解析业务 JSON、按 `sid` 过滤；T2.4 消费下行二进制帧做流式播放。
 - 内存：T1.6 时 wss 握手期内部 RAM 最低水位 **25,087 B**（低于 30KB 线约 5KB）；**已由 X3-F（`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`，TLS 堆移 PSRAM）解决 → 47,051~52,839 B**；预算口径见 CONVENTIONS §4（X3-E）。
 - 若 T2.4 的 TTS 帧率高，需评估 `WEBSOCKET_EVENT_DATA` 事件队列与 PSRAM 预缓冲（本层 rx 缓冲 2KB 内部 RAM）。
-- **T1.6 验收遗留（随 T2.5 修）**：`WEBSOCKET_EVENT_ERROR` 的非 TCP 分支打印 `esp_ws_handshake_status_code`，该字段只在握手失败类错误里有效；实测 kill 服务端 / 复位边界会以 `error_type=0`（NONE）进来，打出未初始化值（`握手 HTTP 状态=ESP-ROM:...`）。修法：只在 `WEBSOCKET_ERROR_TYPE_HANDSHAKE_FAILED` 时读该字段，其它类型只打 `type`（不影响功能，仅日志可信度）。
+- **T1.6 遗留已修（T2.5，2026-10-31）**：`WEBSOCKET_EVENT_ERROR` 只在 `WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT` 读 `esp_tls_*`、只在 `WEBSOCKET_ERROR_TYPE_HANDSHAKE` 读 `esp_ws_handshake_status_code`，其它类型只打 `type`（原先 `type=0` 会打出未初始化值）。
+- **T2.5 新增**：入站回调改多订阅（主回调 + 3 个附加槽位），`ws_register_cb` 语义不变；调度时先拷贝槽位快照、在临界区外回调，避免回调内重入订阅 API 死锁。

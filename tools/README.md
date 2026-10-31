@@ -10,6 +10,7 @@
 | `今天天气如何.wav` | 交互语音素材（模拟用户提问），**替代人工说话** | `afplay tools/今天天气如何.wav`，见下文 |
 | `今天吃了什么.wav` | 交互语音素材（模拟用户提问） | `afplay tools/今天吃了什么.wav`，见下文 |
 | `opus_enc_test.py` | 上行 Opus 编码真机自测（T2.2）：串口抓帧 + PyAV 独立解码断言 + 内存/泄漏 | `uv run tools/opus_enc_test.py --self-test`，见下文 |
+| `voice_cloud_test.py` | 语音云端到端真机自测（T2.5）：起 mock → 唤醒 → 上行 Opus → 下行事件 → sid/统计断言 | `uv run tools/voice_cloud_test.py`，见下文 |
 | `record_wav.py` | 串口采集 WAV，用于唤醒/AEC 实测（**T5.2 计划，尚未实现**） | — |
 
 ## 语音测试素材 —— lexin.wav + 两个交互语音
@@ -113,6 +114,20 @@ uv run tools/voice_test.py --no-reset --wakes 1   # 设备已在跑、不想复�
 唤醒响应耗时（实测 1.7~2.0 s）含 `afplay` 启动开销，只作相对参考，不是端侧唤醒时延。
 
 ---
+
+## voice_cloud_test.py —— 语音云端到端真机自测（T2.5）
+
+**作用**：一条命令完成「起本地 mock → 复位设备 → 回放唤醒词 → 回放交互语音 → 断言上行/下行/统计 → 测 `vc stop`/`vc cancel`」，覆盖 T2.5 的端到端链路。脚本会自己拉起 `ws_mock_server.py`（端口被占用时复用并跳过 mock 侧断言），独占串口；音量默认临时调到 50% 上限、结束恢复。
+
+```bash
+uv run tools/voice_cloud_test.py                        # 默认 --volume 50，全量 43 项
+uv run tools/voice_cloud_test.py --inject-late          # 让 mock 注入 sid+1 的迟到事件，验证端侧过滤
+uv run tools/voice_cloud_test.py --volume 31 --log /tmp/vc.log
+uv run tools/voice_cloud_test.py --no-mock              # 已有 mock 在跑（跳过 mock 侧断言）
+uv run tools/voice_cloud_test.py --dry-run              # 只检查素材/音量/串口
+```
+
+**断言**：设备启动 + `hello_ack`；唤醒链路（`wake detected`→`feed paused`→`PLAYER: play`→`prompt done`）；`round start` / 上行首帧 <200ms / `audio_end` 原因 `vad-silence` / `tts_start`(mp3/24000) / `tts_end` / `round done`；event_bus 收到 `ASR_FINAL`/`TTS_START`/`TTS_END`；上行帧数 ≥60、平均帧长 20~60B、首帧耗时、下行 100 帧与 `tts_end` 计数一致、`sid` 丢弃/解析失败/云端 error 为 0；mock 侧 sid 一致、逐帧收到、`seq` 无跳变、无坏帧；`vc stop` 收尾原因 `stop-request`、`vc cancel` 立即放弃；内部堆最低水位 ≥30KB、`vc` 任务栈剩余 ≥1KB、无 ERROR。**T2.5 真机实测 43/43 PASS**（含 `--inject-late`）。
 
 ## afe_uplink_test.py —— 上行 PCM 接口真机自测（T2.1）
 
@@ -360,6 +375,7 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 | `--drop-pong` | 关 | 收到 `ping` 不回，测端侧 10s 心跳超时判定 |
 | `--close-after S` | 0（关） | 到点主动断开（code 1000），测端侧断线重连 |
 | `--save-upload DIR` | 空 | 把上行 payload 按 `c<连接>-sid<sid>-seq<seq>.bin` 落盘（P2 核对"真的在发音频"） |
+| `--inject-late` | 关 | 每轮先注入一个 `sid+1` 的 `asr_final`，验证端侧迟到帧过滤（T2.5） |
 | `--verbose` | 关 | 打印上行 payload 前 16 字节（库自身的握手 DEBUG 已压到 WARNING） |
 | `--self-test` | — | 进程内自测，不需要硬件 |
 
@@ -370,11 +386,11 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 - 服务端**不主动**发 WS 协议层 ping（`ping_interval=None`），也**不主动**发应用层 `{"t":"ping"}`：§6.1 只定义了端侧 20s 上行心跳，避免出现两份心跳互相干扰。
 - 坏帧（magic/ver/len/type 不符、非 JSON 文本帧）一律 WARN + 计数 + 丢弃，但**不断开连接**——联调时希望看到问题累积，而不是一次错误就把会话踢掉。
 - `scenario=music` 只回 `music_track`，`url` 不可播放（T1.5 不提供 HTTP 音频服务，P4 前补）；`music_status` 只记日志。
-- T1.4 已定稿的 4 条契约（`hello_ack`、鉴权关闭码 4001/4002、`pong` 字段与 RTT 口径、`ws://`/`wss://` 双传输）已同步到 ARCHITECTURE §6.1/§6.3 与本脚本，见 PROTOCOL.md「已定稿口径」；剩余缺口（二进制帧无 `sid`、音乐事件 `sid` 归属、`error` 码表）继续登记在 PROTOCOL.md，P2 补 `voice_cloud` 时定稿。
+- 契约已由 T2.5 全部定稿并回填 [PROTOCOL.md](../docs/PROTOCOL.md)：`hello_ack` / 鉴权关闭码 / `pong` 口径 / 双传输 / 二进制帧 `sid` 关联（P-2）/ `error` 码表（P-4）；只剩音乐事件 `sid` 归属留 T4.2（P-3）。mock 的 `error` 用 `code=1`（通用）。
 
 ## 后续（未做）
 
-- `voice_test.py` 按阶段扩展断言：P2 起配合 `ws_mock_server.py` 做 ASR → LLM → TTS 端到端（唤醒 → 提示音结束 → 回放交互语音 → 断言 mock 收到上行音频帧/下发 TTS）；P3 起增加会话状态机、半双工、打断断言；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
+- `voice_cloud_test.py` 已承接 P2 端到端断言（唤醒 → 上行 Opus → ASR/LLM/TTS → 收尾/中止 + sid 过滤）；后续 T2.3/T2.4 加「下行音频可解码/可出声」断言，P3 起增加会话状态机、半双工、打断断言；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
 - 真实 MP3 素材 + 断言可解码（T2.3/T2.4）。
 - HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求），P4（T4.1/T4.2）前补。
 - `wss` + 自签证书（T1.4 决定证书策略后）。

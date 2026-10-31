@@ -124,6 +124,7 @@ class Config:
     max_tts_frames: int = 100    # 一轮 TTS 帧数上限，100 帧 ≈ 2s
     tts_text: str = "今天天气不错，我们来试试端云联调。"
     no_tts: bool = False         # 只发 JSON，不发二进制帧
+    inject_late: bool = False    # 每轮先发一个 sid+1 的迟到事件，测端侧 sid 过滤
     drop_pong: bool = False      # 故意不回 pong，测端侧 10s 心跳超时
     close_after: float = 0.0     # >0 时到点主动断开，测端侧重连
     save_upload: str = ""        # 非空则把上行 payload 落盘到该目录
@@ -386,6 +387,17 @@ class Session:
             if self.cfg.think_ms > 0:
                 await asyncio.sleep(self.cfg.think_ms / 1000)
 
+            # 迟到帧注入：端侧必须丢弃 sid 不匹配的事件（ARCH §6.3 / PROTOCOL P-2）
+            if self.cfg.inject_late:
+                late = 1 if sid is None else (sid + 1) & 0xFFFF
+                await self._send_json(
+                    {"t": "asr_final", "sid": late, "text": "迟到帧（端侧应丢弃）"}
+                )
+                self._log(
+                    logging.INFO,
+                    f"已注入迟到事件 asr_final sid={late}（当前轮 sid={sid}，端侧应丢弃并计数）",
+                )
+
             if self.cfg.scenario == "error":
                 self.stats.errors += 1
                 await self._send_json(
@@ -393,7 +405,7 @@ class Session:
                 )
                 self._log(
                     logging.WARNING,
-                    "error 码表契约未定义（§6.3 只有 '错误码与描述'），P2/T2.5 补 PROTOCOL 后再统一",
+                    "error 码表已由 PROTOCOL.md 定稿：1=通用/未知（T2.5）",
                 )
                 return
 
@@ -902,6 +914,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tts-frames", type=int, default=100, help="一轮 TTS 的二进制帧上限")
     parser.add_argument("--tts-text", default=Config.tts_text, help="模拟识别的文本")
     parser.add_argument("--no-tts", action="store_true", help="只发 JSON 事件，不发二进制帧")
+    parser.add_argument("--inject-late", action="store_true",
+                        help="每轮先发一个 sid+1 的 asr_final（测端侧迟到帧过滤）")
     parser.add_argument("--drop-pong", action="store_true", help="收到 ping 不回 pong（测端侧超时）")
     parser.add_argument("--close-after", type=float, default=0.0, help=">0 时到点主动断开（测重连）")
     parser.add_argument("--save-upload", default="", help="把上行 payload 落盘到该目录")
@@ -924,6 +938,7 @@ def main(argv: list[str] | None = None) -> int:
         max_tts_frames=max(1, args.max_tts_frames),
         tts_text=args.tts_text,
         no_tts=args.no_tts,
+        inject_late=args.inject_late,
         drop_pong=args.drop_pong,
         close_after=args.close_after,
         save_upload=args.save_upload,

@@ -16,7 +16,8 @@
  * 与本组件的三个使用约束：
  *   1. 编码器按轮次 open/close（`enc test` 等 console 探针在 IDLE 时可用，轮次中会被拒绝）；
  *   2. 上行接口（`audio_fe_uplink_*`）同一时刻只有一个消费方：轮次中 `afe uplink on` 无效；
- *   3. 下行二进制帧（TTS 音频）本任务只统计并丢弃（T2.4 接入解码播放），不消费 payload。
+ *   3. 下行二进制帧（TTS 音频，0x02）在 `tts_start`→`tts_end` 窗口内交给 `audio_player`
+ *      流式播放（`audio_player_stream_*`，T2.4）；窗口外/播放器不可用只计数并丢弃。
  */
 #pragma once
 
@@ -71,7 +72,10 @@ typedef struct {
     uint32_t up_send_errors;   /* 入队失败次数（未 READY / 队列满） */
     uint32_t up_read_timeouts; /* 上行读超时次数（音频还没到） */
     uint32_t rx_text;          /* 收到的下行文本帧数（业务事件，传输层已滤掉 pong/hello_ack） */
-    uint32_t rx_audio_frames;  /* 收到的下行音频帧数（T2.5 只统计，T2.4 播放） */
+    uint32_t rx_audio_frames;  /* 成功交给播放器的下行音频帧数（=本轮实际播放的数据） */
+    uint32_t rx_audio_bytes;   /* 收到的下行音频 payload 总字节数（含被丢弃的帧） */
+    uint32_t rx_audio_dropped; /* 丢弃的下行音频帧数（窗口外/收尾后/播放器不可用/ring 满） */
+    uint32_t rx_audio_dropped_bytes; /* 丢弃的下行音频字节数 */
     uint32_t rx_dropped_sid;   /* 因 sid 不匹配/无会话而丢弃的迟到事件数 */
     uint32_t rx_parse_errors;  /* 下行 JSON 解析失败数 */
     uint32_t rx_cloud_errors;  /* 云端 error 事件数 */

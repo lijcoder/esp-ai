@@ -1390,9 +1390,9 @@ static void print_vc_status(void)
            st.up_frames, st.up_bytes, bytes_per_frame, st.up_encode_errors, st.up_send_errors,
            st.up_read_timeouts, st.first_frame_us);
     printf("  下行: 文本 %" PRIu32 " / 音频帧 %" PRIu32 "；sid 丢弃 %" PRIu32 " 解析失败 %" PRIu32
-           " 云端 error %" PRIu32 "\n",
+           " 云端 error %" PRIu32 "；音频丢弃 %" PRIu32 " 帧 字节 %" PRIu32 "\n",
            st.rx_text, st.rx_audio_frames, st.rx_dropped_sid, st.rx_parse_errors,
-           st.rx_cloud_errors);
+           st.rx_cloud_errors, st.rx_audio_dropped, st.rx_audio_dropped_bytes);
     printf("  说明: 唤醒后由 APP 自动起一轮；手动调试用 vc start [sid] / stop / cancel\n");
 }
 

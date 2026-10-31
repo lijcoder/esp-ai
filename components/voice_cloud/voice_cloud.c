@@ -12,6 +12,12 @@
  *             └─ vc_cancel()/断链   → 直接丢弃，不发 audio_end
  *        └─ 等 asr_…/llm_delta/tts_start/tts_end/error（sid 过滤）→ event_bus + vc_register_cb
  *
+ * 下行 TTS 音频（T2.4）：`tts_start` 里 audio_player_stream_open(1, sr) 成功即暂停收音（R1），
+ * `tts_end` 前的 0x02 帧全部 audio_player_stream_write()；`tts_end` → stream_end 排空收尾；
+ * vc_cancel/云端 error/断链/新轮次/响应超时 → stream_abort 立即停声。收音恢复（R2）不在
+ * vc 任务里做，而是由 audio_player 的完成回调（附加订阅槽，src=TTS_STREAM）恢复——成功、
+ * 失败、打断都会回调，且回调发生在 player 任务上下文（只做一次原子标志赋值，不阻塞）。
+ *
  * 为什么编码不另建任务：内部 RAM 只剩十几 KB（CONVENTIONS §4），codec_enc 的调用约定
  * 就是"由调用方任务串行调用"，libopus 的临时数组已由伪栈放 PSRAM（T2.2），8KB 栈足够。
  *
@@ -25,6 +31,7 @@
 #include <string.h>
 
 #include "audio_fe.h"
+#include "audio_player.h"
 #include "codec_enc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -56,6 +63,11 @@ static volatile bool s_finish_req;    /* 请求优雅收尾（vc_stop） */
 static volatile bool s_tts_end_seen;  /* 本轮已收到 tts_end（ws_client 任务写） */
 static volatile bool s_pending_start; /* 有待处理的 vc_start */
 static volatile uint16_t s_pending_sid;
+
+/* 下行 TTS 音频（T2.4）：以下标志跨 ws_client / vc / player 任务 */
+static bool s_done_subscribed;      /* audio_player 完成回调订阅成功（R2 依赖） */
+static volatile bool s_audio_attempted; /* 本轮 tts_start 尝试过开流（用于 tts_end 日志） */
+static int64_t s_audio_drop_warn_us;    /* 窗口外/写失败丢弃日志限频（1/秒） */
 
 /* 以下只由 vc 任务读写 */
 static int64_t s_round_start_us;
@@ -467,6 +479,115 @@ static void vc_stop_waiting(void)
     }
 }
 
+/* ---------------- 下行 TTS 音频（T2.4，0x02 → audio_player 流式播放） ---------------- */
+
+/* 丢弃 1 帧 0x02：计数 + 限频日志（窗口外/收尾后/播放器不可用都会走到这里） */
+static void vc_audio_drop(size_t len, const char *why)
+{
+    stat_add(&s_stats.rx_audio_dropped, 1);
+    stat_add(&s_stats.rx_audio_dropped_bytes, (uint32_t)len);
+
+    const int64_t now = esp_timer_get_time();
+    if (now - s_audio_drop_warn_us >= 1000000) {
+        s_audio_drop_warn_us = now;
+        ESP_LOGW(TAG, "丢弃下行音频帧（%s，%u B；累计丢弃 %u 帧 / %u B）", why, (unsigned)len,
+                 (unsigned)s_stats.rx_audio_dropped, (unsigned)s_stats.rx_audio_dropped_bytes);
+    }
+}
+
+/*
+ * 打断流式播放：立刻关 TX（无淡出），未播数据丢弃；player 之后回调 ok=false → R2 恢复收音。
+ * 未开流时 audio_player_stream_abort() 返回 ESP_ERR_INVALID_STATE，按无操作处理（不刷屏）。
+ * 可在任意任务调用（vc_cancel 在 console/main 上下文，error/tts_end 在 ws_client 上下文）。
+ */
+static void vc_audio_abort(const char *why)
+{
+    if (!audio_player_stream_active()) {
+        return; /* 没开流/已收尾：abort 无事可做，这不是错误 */
+    }
+    esp_err_t err = audio_player_stream_abort();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "stream abort（%s）→ 立即停声", why);
+    } else if (err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "stream abort 失败（%s）: %s", why, esp_err_to_name(err));
+    }
+}
+
+/* audio_player 完成回调（player 任务上下文）：流式播放结束（成功/失败/打断）→ R2 恢复收音 */
+static void vc_stream_done_cb(audio_player_src_t src, bool ok, void *arg)
+{
+    (void)arg;
+
+    if (src != AUDIO_PLAYER_SRC_TTS_STREAM) {
+        return;
+    }
+    if (audio_player_stream_active()) {
+        /* 极端竞态：上一路回调前新流已经打开并自己暂停了 feed，这里不能恢复 */
+        ESP_LOGD(TAG, "stream done 但新流已开始，跳过 R2");
+        return;
+    }
+    audio_fe_set_feed_enabled(true);
+    ESP_LOGI(TAG, "stream done → feed resumed（ok=%d）", (int)ok);
+}
+
+/* tts_start：开流（codec=1/mp3）；成功即暂停收音（R1），失败则本轮音频只计数丢弃 */
+static void vc_audio_start(uint8_t codec_id, uint32_t sample_rate)
+{
+    s_audio_attempted = true;
+
+    if (codec_id != APP_EVT_CODEC_MP3) {
+        ESP_LOGW(TAG, "tts_start 非 MP3 音频，本轮不播放（只计数丢弃）");
+        return;
+    }
+    if (sample_rate == 0) {
+        ESP_LOGW(TAG, "tts_start 缺采样率，本轮不播放（只计数丢弃）");
+        return;
+    }
+    if (audio_player_stream_active()) {
+        /* 上一路流还在收尾/被打断中：open 会失败，先请求 abort 再试一次 */
+        ESP_LOGW(TAG, "上一路 TTS 流未收尾，先 abort 再开流");
+        (void)audio_player_stream_abort();
+    }
+    if (!audio_player_mp3_ready()) {
+        ESP_LOGW(TAG, "MP3 能力不可用，本轮 TTS 音频不播放（只计数丢弃）");
+        return;
+    }
+    if (audio_player_is_busy()) {
+        ESP_LOGW(TAG, "播放器忙（提示音/本地播放），本轮 TTS 音频不播放（只计数丢弃）");
+        return;
+    }
+
+    esp_err_t err = audio_player_stream_open(1, sample_rate);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "流式播放 open 失败（%s），本轮 TTS 音频不播放（只计数丢弃）",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    /* R1：流式播放期间暂停收音，避免扬声器回采自激（R2 由完成回调恢复） */
+    if (s_done_subscribed) {
+        audio_fe_set_feed_enabled(false);
+    } else {
+        ESP_LOGE(TAG, "未订阅播放完成回调，跳过 R1（否则流结束后无法恢复收音）");
+    }
+    ESP_LOGI(TAG, "stream open codec=mp3 sr=%u，feed paused (R1)", (unsigned)sample_rate);
+}
+
+/* tts_end：排空已收数据后收尾（100ms fade + 静音冲刷 + 300ms 尾部延时后回调 ok=true） */
+static void vc_audio_end(void)
+{
+    if (!audio_player_stream_active()) {
+        if (s_audio_attempted) {
+            ESP_LOGW(TAG, "tts_end 但本轮没有打开的流（开流失败/无可播数据）");
+        }
+        return;
+    }
+    esp_err_t err = audio_player_stream_end();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "stream end 失败: %s", esp_err_to_name(err));
+    }
+}
+
 /* 下行文本帧（在 `ws_client` 任务上下文） */
 static void vc_handle_text(const uint8_t *payload, size_t len)
 {
@@ -543,15 +664,18 @@ static void vc_handle_text(const uint8_t *payload, size_t len)
         }
         if (strcmp(codec, "mp3") != 0) {
             codec_id = APP_EVT_CODEC_UNKNOWN;
-            ESP_LOGW(TAG, "tts_start codec=%s 非 mp3（端侧只实现 MP3），T2.4 将无法播放", codec);
+            ESP_LOGW(TAG, "tts_start codec=%s 非 mp3（端侧只实现 MP3），本轮音频将无法播放", codec);
         }
         ESP_LOGI(TAG, "TTS start sid=%u codec=%s sr=%d", (unsigned)sid, codec, (int)sr_raw);
+        vc_audio_start(codec_id, (uint32_t)sr_raw);
         vc_post_tts_start(sid, codec_id, (uint32_t)sr_raw);
         vc_emit(VC_EVT_TTS_START, sid, NULL, 0, codec_id, (uint32_t)sr_raw, 0);
         return;
     }
 
     if (strcmp(t, "tts_end") == 0) {
+        /* 先请求排空收尾再记账：保证脚本看到的日志顺序是 tts_end → stream end */
+        vc_audio_end();
         const uint32_t frames = s_stats.rx_audio_frames;
         ESP_LOGI(TAG, "TTS end sid=%u（本轮下行音频 %u 帧）", (unsigned)sid, (unsigned)frames);
         vc_post_tts_end(sid, (uint16_t)frames);
@@ -575,26 +699,46 @@ static void vc_handle_text(const uint8_t *payload, size_t len)
         stat_add(&s_stats.rx_cloud_errors, 1);
         ESP_LOGE(TAG, "云端 error sid=%u code=%d msg=%s（本轮结束，同轮不重试）", (unsigned)sid,
                  (int)code, msg);
+        vc_audio_abort("cloud error");
         vc_emit(VC_EVT_CLOUD_ERROR, sid, msg, (uint16_t)strlen(msg), 0, 0, code);
         vc_stop_waiting();
     }
 }
 
-/* 下行二进制帧（TTS 音频）：T2.5 只统计，解码播放由 T2.4 接管 */
-static void vc_handle_audio(const ws_frame_hdr_t *frame, size_t len)
+/* 下行二进制帧（TTS 音频 0x02）：窗口内 write 给播放器，窗口外/播放器不可用丢弃并计数 */
+static void vc_handle_audio(const ws_frame_hdr_t *frame, const uint8_t *payload, size_t len)
 {
     (void)frame;
 
-    /* 帧头里没有 sid（ARCH §6.2，P-2 定稿为"按 audio_start→tts_end 顺序归属"），
-     * 只在"已发 audio_end、等响应"的窗口里记账；IDLE 时到达的是上一轮迟到帧，直接丢。 */
-    if (s_state != VC_STATE_WAIT_RESPONSE) {
+    stat_add(&s_stats.rx_audio_bytes, (uint32_t)len);
+
+    /* 帧头里没有 sid（ARCH §6.2，P-2 定稿为"按 audio_start→tts_end 顺序归属"）：
+     * 合法窗口 = 已发 audio_end、还没收到 tts_end（tts_end 之后到达的都是迟到帧）。 */
+    if (s_state != VC_STATE_WAIT_RESPONSE || s_tts_end_seen) {
+        vc_audio_drop(len, "窗口外");
         return;
     }
+    /* 窗口内但播放器还没开流（tts_start 未到/开流失败/播放器忙）：本帧无法播放 */
+    if (!audio_player_stream_active()) {
+        vc_audio_drop(len, "播放器未开流");
+        return;
+    }
+    if (payload == NULL || len == 0 || len > 2048) {
+        /* 契约 §1.2.2：单次 write ≤2KB；超限/空帧属于对端违约，按丢弃处理 */
+        vc_audio_drop(len, "帧长非法");
+        return;
+    }
+
+    esp_err_t err = audio_player_stream_write(payload, len);
+    if (err != ESP_OK) {
+        vc_audio_drop(len, err == ESP_ERR_NO_MEM ? "ring 满" : esp_err_to_name(err));
+        return;
+    }
+
     stat_add(&s_stats.rx_audio_frames, 1);
     const uint32_t count = s_stats.rx_audio_frames;
     if (count == 1 || (count % 25) == 0) {
-        ESP_LOGI(TAG, "下行音频帧 #%u len=%u（T2.5 只统计，T2.4 接入播放）", (unsigned)count,
-                 (unsigned)len);
+        ESP_LOGI(TAG, "下行音频帧 #%u len=%u", (unsigned)count, (unsigned)len);
     }
 }
 
@@ -607,7 +751,7 @@ static void vc_ws_cb(const ws_frame_hdr_t *frame, const uint8_t *payload, size_t
         vc_handle_text(payload, len);
         return;
     }
-    vc_handle_audio(frame, len);
+    vc_handle_audio(frame, payload, len);
 }
 
 /* ---------------- 一轮上行 ---------------- */
@@ -696,11 +840,15 @@ static void vc_begin_round(uint16_t sid)
     s_abort = false;
     s_finish_req = false;
     s_tts_end_seen = false;
+    s_audio_attempted = false;
     s_sid = sid;
     s_round_frames = 0;
     s_round_bytes = 0;
     stat_set(&s_stats.first_frame_us, 0);
     s_state = VC_STATE_IDLE;
+
+    /* 新轮次覆盖旧轮次：上一路 TTS 若还在收尾/播放，立刻打断（R2 由完成回调恢复） */
+    vc_audio_abort("new round");
 
     if (!ws_is_ready()) {
         ESP_LOGW(TAG, "云端未就绪，跳过本轮（sid=%u）", (unsigned)sid);
@@ -823,6 +971,7 @@ static void vc_abort_round(vc_finish_t why)
     audio_fe_uplink_stop();
     enc_close();
     s_state = VC_STATE_IDLE;
+    vc_audio_abort(vc_finish_name(why)); /* 上行阶段一般没有流，防御性处理 */
     stat_add(&s_stats.rounds_aborted, 1);
     ESP_LOGW(TAG, "round aborted sid=%u（%s，未发 audio_end）", (unsigned)s_sid,
              vc_finish_name(why));
@@ -830,10 +979,15 @@ static void vc_abort_round(vc_finish_t why)
 
 static void vc_wait_response(void)
 {
-    bool got_end = false;
+    bool link_lost = false;
 
     while (s_state == VC_STATE_WAIT_RESPONSE) {
         if (s_abort || s_pending_start) { /* 新唤醒/取消：立即结束本轮等待 */
+            s_state = VC_STATE_IDLE;
+            break;
+        }
+        if (!ws_is_ready()) { /* 断链：本轮不可能再收到 tts_end，立刻打断在播音频 */
+            link_lost = true;
             s_state = VC_STATE_IDLE;
             break;
         }
@@ -852,14 +1006,22 @@ static void vc_wait_response(void)
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
     }
 
-    got_end = s_tts_end_seen;
-    if (got_end) {
+    if (s_tts_end_seen) {
         stat_add(&s_stats.rounds_done, 1);
         ESP_LOGI(TAG, "round done sid=%u", (unsigned)s_sid);
         return;
     }
-    if (!s_abort) {
-        stat_add(&s_stats.rounds_aborted, 1);
+
+    /* 没有 tts_end 就结束：在播的 TTS 音频立刻打断（契约 §2.4），再按原因记账/打日志 */
+    vc_audio_abort("no tts_end");
+    stat_add(&s_stats.rounds_aborted, 1);
+    if (s_pending_start) {
+        ESP_LOGW(TAG, "round aborted sid=%u（new-round）", (unsigned)s_sid);
+    } else if (s_abort) {
+        ESP_LOGW(TAG, "round aborted sid=%u（cancel）", (unsigned)s_sid);
+    } else if (link_lost) {
+        ESP_LOGW(TAG, "round aborted sid=%u（link-lost）", (unsigned)s_sid);
+    } else {
         ESP_LOGW(TAG, "等待云端响应超时（%d ms），sid=%u 结束", CONFIG_VC_RESPONSE_TIMEOUT_MS,
                  (unsigned)s_sid);
     }
@@ -914,10 +1076,23 @@ esp_err_t vc_init(void)
         return err;
     }
 
+    /* R2：订阅播放完成回调（附加槽，只注册一次）。src==TTS_STREAM 时恢复收音；
+     * 订阅失败不致命，但 TTS 播放期间就不能暂停收音（否则没有恢复路径）。 */
+    err = audio_player_subscribe_done(vc_stream_done_cb, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "订阅播放完成回调失败: %s（TTS 播放将不暂停收音）", esp_err_to_name(err));
+    } else {
+        s_done_subscribed = true;
+    }
+
     BaseType_t ok = xTaskCreatePinnedToCore(vc_task, "vc", CONFIG_VC_TASK_STACK, NULL,
                                             CONFIG_VC_TASK_PRIORITY, &s_task, CONFIG_VC_TASK_CORE);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "创建 vc 任务失败（栈 %d B）", CONFIG_VC_TASK_STACK);
+        if (s_done_subscribed) {
+            (void)audio_player_unsubscribe_done(vc_stream_done_cb);
+            s_done_subscribed = false;
+        }
         return ESP_ERR_NO_MEM;
     }
 
@@ -986,6 +1161,9 @@ esp_err_t vc_cancel(void)
         return ESP_ERR_INVALID_STATE;
     }
     s_abort = true;
+    /* 先在调用方上下文立即打断在播 TTS（不改状态/不阻塞），保证"喊停即停"；
+     * vc 任务醒来后还会再防御性 abort 一次（已 active=false 时是 no-op）。 */
+    vc_audio_abort("cancel");
     if (s_state == VC_STATE_WAIT_RESPONSE) {
         vc_stop_waiting();
     }

@@ -2,7 +2,8 @@
 
 **作用（一句话）**：把 `audio_fe` 的上行 PCM、`codec_enc` 的 Opus、`transport_ws` 的 WS 传输串成**一轮真实可跑的端云语音会话**：
 发 `audio_start` → 20ms Opus 帧上行 → VAD 静音 800ms / 累计 8s → `audio_end`；同时解析下行
-`asr_*` / `llm_delta` / `tts_*` / `error`，按 `sid` 丢弃迟到帧并分发（`event_bus` 事件 + 业务回调）。
+`asr_*` / `llm_delta` / `tts_*` / `error`，按 `sid` 丢弃迟到帧并分发（`event_bus` 事件 + 业务回调），
+并把 `tts_start`~`tts_end` 窗口内的 0x02 帧交给 `audio_player` **流式解码播放**（T2.4，半双工 R1/R2）。
 
 契约依据：[ARCHITECTURE.md](../../docs/ARCHITECTURE.md) §3.6、§4.1、§6、§9.3；字段/码表见 [PROTOCOL.md](../../docs/PROTOCOL.md)。
 
@@ -12,7 +13,8 @@
 |---|---|
 | 一轮上行链路（读 PCM → 编码 → 发帧 → 收尾） | 会话状态机 `IDLE/LISTENING/THINKING/SPEAKING`（T3.1 `voice_session`） |
 | `audio_start` / `audio_end` 报文与 `sid` 生成（T2.5 简化版） | VAD/唤醒事件接线、半双工 R1–R5（T2.5 用 stats 轮询静音，T3.1 接管） |
-| 下行语音事件解析、`sid` 过滤、事件/回调分发 | 下行 TTS 音频播放（T2.4）、错误提示音（T3.6）、打断（T3.2） |
+| 下行语音事件解析、`sid` 过滤、事件/回调分发 | 错误提示音（T3.6）、按键打断（T3.2） |
+| 下行 0x02 → `audio_player` 流式播放的接线（开流/写帧/收尾/打断 + R1/R2） | MP3 解码与 I2S 输出本身（`audio_player`，T2.4-A） |
 | 上行/下行统计（`vc status`） | 音乐协议（T4.2） |
 
 ## 对外接口（`include/voice_cloud.h`）
@@ -25,7 +27,7 @@
 | `vc_cancel()` | 立即放弃：不补尾帧、不发 `audio_end` |
 | `vc_is_busy()` / `vc_get_state()` / `vc_state_name()` / `vc_current_sid()` | 三态观测（`IDLE` / `UPLINK` / `WAIT_RESPONSE`） |
 | `vc_register_cb(cb, arg)` | 业务回调（覆盖语义），与 `event_bus` 事件同时分发；回调在 `ws_client` 任务上下文，**禁止阻塞**，`text` 只在回调内有效 |
-| `vc_stats_read()` / `vc_stats_reset()` | 轮次/上行帧/字节/首帧耗时/下行事件/`sid` 丢弃/解析失败等统计（`diag` 的 `vc status` 使用） |
+| `vc_stats_read()` / `vc_stats_reset()` | 轮次/上行帧/字节/首帧耗时/下行事件/`sid` 丢弃/解析失败/下行音频播放与丢弃等统计（`diag` 的 `vc status` 使用） |
 
 ## 一轮的时序
 
@@ -40,9 +42,13 @@ APP（提示音播完，收音已恢复）
                  └─ vc_cancel() / WS 掉线 → 直接放弃（不发 audio_end）
             └─ 收尾：enc_flush 尾帧 → ws "audio_end" → enc_close → uplink_stop
             └─ WAIT_RESPONSE：等 asr/llm/tts 事件（10s 超时）
-                 ├─ tts_end → round done，回 IDLE
-                 ├─ error   → ERROR 日志，回 IDLE（不重试）
-                 └─ 超时    → WARN，回 IDLE
+                 ├─ tts_start → audio_player_stream_open(1, sr) + 暂停收音（R1）
+                 │    └─ 窗口内 0x02 帧 → audio_player_stream_write()（≤2KB/次）
+                 ├─ tts_end   → audio_player_stream_end()（排空 + 100ms fade + 300ms 尾部）
+                 │    └─ 播放完成回调（src=TTS_STREAM）→ 恢复收音（R2）→ round done，回 IDLE
+                 ├─ error / 断链 / 新轮次 / 响应超时 / vc_cancel()
+                 │    └─ audio_player_stream_abort()（立即停声，回调 ok=false → R2）
+                 └─ 超时      → WARN，回 IDLE
 ```
 
 ## 下行事件处理
@@ -51,16 +57,17 @@ APP（提示音播完，收音已恢复）
 |---|---|
 | `asr_partial` / `asr_final` | 投 `APP_EVT_ASR_PARTIAL/FINAL`（`app_evt_asr_t`，文本截断到 28B）+ `vc_register_cb` 回调；完整文本打 INFO 日志 |
 | `llm_delta` | 仅回调 + DEBUG 日志（ARCH §4.2 未定义对应 event_bus 事件） |
-| `tts_start` | 校验 `codec=mp3`、记 `sr`；投 `APP_EVT_TTS_START` + 回调；打开下行 0x02 接收窗口 |
-| `tts_end` | 投 `APP_EVT_TTS_END`（带本轮下行帧数）+ 回调；关闭窗口，本轮结束 |
-| `error` | ERROR 日志（码表见 PROTOCOL §4）+ 回调；结束本轮，不自动重试 |
-| 下行 0x02 帧 | T2.5 **只统计并丢弃**（窗口内计数，日志打首帧/每 25 帧）；T2.4 接管解码播放 |
+| `tts_start` | 校验 `codec=mp3`、记 `sr`；`audio_player_stream_open(1, sr)` 成功 → `audio_fe_set_feed_enabled(false)`（R1），失败只 WARN；投 `APP_EVT_TTS_START` + 回调；打开下行 0x02 接收窗口 |
+| `tts_end` | `audio_player_stream_end()` 排空收尾；投 `APP_EVT_TTS_END`（带本轮下行帧数）+ 回调；关闭窗口，本轮结束 |
+| `error` | ERROR 日志（码表见 PROTOCOL §4）+ `audio_player_stream_abort()` + 回调；结束本轮，不自动重试 |
+| 下行 0x02 帧 | 窗口内（`WAIT_RESPONSE` 且未收 `tts_end`）→ `audio_player_stream_write()`（成功计入「音频帧」）；窗口外/收尾后/播放器未开流/ring 满 → 丢弃 + 计入「音频丢弃」帧/字节（限频 WARN） |
 | 其它 `t` | WARN 后忽略（契约外事件，如 T2.5 阶段的 `music_track`） |
 | 无/非法 `sid`、`sid ≠ 当前` | 丢弃 + 计数（`vc status` 的「sid 丢弃」），不结束本轮 |
 
 ## 依赖
 
-- `audio_fe`（上行 PCM 环形缓冲，T2.1）
+- `audio_fe`（上行 PCM 环形缓冲 + 半双工 feed 开关，T2.1）
+- `audio_player`（流式播放 API / 完成回调附加订阅槽，T2.4-A）
 - `codec_enc`（Opus 编码，T2.2）
 - `transport_ws`（发送队列、8B 帧头、`seq` 自增、主接收回调，T1.4）
 - `event_bus`（ASR/TTS 应用事件，L1）
@@ -85,6 +92,9 @@ APP（提示音播完，收音已恢复）
 5. **`sid` 由本组件维护（T2.5 简化）**：T3.1 落地后改为调用方传入，迟到帧规则不变（PROTOCOL §3.3）。
 6. **文本截断**：event_bus payload 定长 32B，ASR 文本最多 28B（约 9 个汉字）；完整文本在 VC 日志/回调里。
 7. `vc_start*` 是异步的：返回 `ESP_OK` 只表示已受理，真正开轮要看 `vc status` / 日志。
+8. **流式播放的写帧在 `ws_client` 任务上下文**（下行回调里）：`audio_player_stream_write()` 只做 PSRAM ring 拷贝（单次 ≤2KB，非阻塞）；ring 满返回 `ESP_ERR_NO_MEM`，本组件计入「音频丢弃」并限频 WARN，不重试。
+9. **R2 恢复收音靠完成回调，不在 `vc` 任务里做**：`vc_init()` 里 `audio_player_subscribe_done()` 注册一次（附加槽，≤3 个，不要重复注册）；回调在 `player` 任务上下文，只做一次 `audio_fe_set_feed_enabled(true)`，禁止阻塞/耗时。成功、失败、打断都会回调。
+10. **打断是立即关 TX（无淡出）**：`vc_cancel`/云端 error/断链/新轮次/响应超时都调 `audio_player_stream_abort()`；未开流时返回 `ESP_ERR_INVALID_STATE` 按无操作处理，不刷屏。
 
 ## 真机验收（T2.5，2026-10-31）
 
@@ -92,6 +102,24 @@ APP（提示音播完，收音已恢复）
 - **迟到帧过滤**：`uv run tools/voice_cloud_test.py --inject-late`（mock 每轮注入 `sid+1` 的 `asr_final`）**43/43 PASS**，端侧 `dropped_sid=1`。
 - **回归**：`voice_test.py --volume 50` 16/16；`ws_mock_server.py --self-test` 9/9。
 - **资源**：静态 DIRAM 196,670 B；wss 握手期内部堆峰值 227,988 B、最低水位 32,339 B（静态+峰值 424,658 B ≤ 440KB）；PSRAM 峰值 902,908 B；任务数 16→17（+`vc`）。
+
+## 真机验收（T2.4-B，2026-10-31）
+
+- **下行流式播放**：`uv run tools/tts_stream_test.py` **193/193 PASS**（mock 真实 24k 单声道 MP3、
+  202 帧/19392 B）：`first_sound_us` 20~29 ms（< 150 ms）、稳态 `underrun=0`、`decoded==fed==202`
+  == PyAV 参考、`dur≈4850 ms`、`bad=0`、`ring_ms=0`；`vc` 窗口内 `音频帧 202`、窗口外
+  `音频丢弃 2 帧 字节 192`（`--tts-late-bin`）；abort（`vc cancel`）停声延迟 **51 ms**（≤150 ms，
+  目标 100 ms），打断后不再解码、回调 ok=false；stall 场景 `underrun=1` 且恢复、`rounds_done=1`；
+  合成帧降级无 ERROR/panic、`tts_end` 正常收尾、R2 收音恢复；连续 10 轮内部堆波动 88 B、
+  PSRAM 首末差 0 B。
+- **回归**：`voice_cloud_test.py` **43/43**（含 stop/cancel/中止计数）、`voice_test.py
+  --volume 50 --wakes 3` **16/16**。
+- **起播门槛**：`AUDIO_PLAYER_STREAM_PREROLL_FRAMES` 默认 2 → **4**（T2.4-B 真机迭代，中间验证过 3：
+  2 帧时 I2S DMA 预填 40 ms 后仅剩 ~8 ms 余量，偶发一次起播 `underrun=1`；4 帧 96 ms 后余量
+  56 ms，20 轮 heap-only + 全量 193 项稳定 0 underrun；首声仍 20~29 ms < 150 ms）。
+- **测试环境坑**：mock 侧 TCP 未关 Nagle + 端侧 delayed ACK 会让 0x02 帧攒批 ~200 ms 再交付，
+  造成假欠载（`tts_stream_test.py` 曾随机 FAIL underrun=0）；mock 已对每条 accept 连接设
+  `TCP_NODELAY=1`（T2.4-C2）。真实云端同样应关闭 Nagle。
 
 ## 踩坑记录
 
@@ -104,6 +132,5 @@ APP（提示音播完，收音已恢复）
 ## 后续（T3.1 起）
 
 - 会话状态机接管 `vc_start` 的 `sid` 分配与超时/错误提示（T3.1/T3.6）；
-- 下行 0x02 帧交给 `audio_player` 流式解码播放（T2.3/T2.4），`vc` 不再丢弃 payload；
 - 按键打断走 `vc_cancel()` + `interrupt` 报文（T3.2）；
 - VAD/唤醒改走 `event_bus`（T1.2b），本组件去掉 stats 轮询。

@@ -63,6 +63,8 @@ INMP441 ──I2S0 RX 16k──> audio_io(32bit→int16) ──> audio_fe 环形
 - AFE 配置：`afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST)`；
 - 模型：`wn9_hilexin` + `vadnet1_medium`（已在 model 分区）；
 - 采集分帧由 AFE `get_feed_chunksize()` 决定，采集任务只做 I2S 读 + 格式转换 + `feed()`。
+- 上行取数：`fetch` 输出（16k/单声道/int16）写入 PSRAM 环形缓冲（`AUDIO_FE_UPLINK_RING_MS`，默认 2s），
+  消费端按 320 样本精确读取。**AFE fetch 每帧 512 样本（32ms，T2.1 实测）与 Opus 20ms 帧不整除，编码端必须自行重组。**
 
 ### 3.2 播放
 
@@ -145,7 +147,7 @@ TTS(MP3) ─┐
 | `net_mgr` | L1 基础服务 | WiFi STA 连接、退避重连、SNTP 对时、网络事件（无独立任务：事件回调 + 一次性定时器） | `net_init()`, `net_is_up()`, `net_wait_ready(ms)`, `net_is_time_synced()`, `net_get_info()`, `net_reconnect()` |
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发 | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
-| `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 回调（上行音频读取随 P2 增加） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()` |
+| `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 回调、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
 | `audio_player` | L2 音频引擎 | 播放引擎：PCM 播放 + 重采样到 48k + 软件音量 + 淡入淡出（多通道/MP3/HTTP 随 P2–P4 增加） | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_register_done_cb()`, `audio_player_set_volume()` |
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms） | `enc_open()`, `enc_encode(pcm, out, len)`, `enc_close()` |
 | `voice_cloud` | L3 能力 | 语音云协议：会话建立、上行音频、下行事件解析与分发 | `vc_start()`, `vc_send_audio()`, `vc_cancel()`, `vc_register_cb()` |

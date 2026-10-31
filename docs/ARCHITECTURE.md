@@ -151,12 +151,12 @@ TTS(MP3) ─┐
 | `audio_io` | L0 板级/驱动 | I2S0 RX（16k 采集）/ I2S1 TX（48k 播放）HAL | `audio_io_init()`, `audio_io_read_mic()`, `audio_io_write_spk()`, `audio_io_spk_enable()` |
 | `config_store` | L1 基础服务 | NVS 读写（音量、设备状态）+ 独占 `nvs_flash_init`；编译期常量（WiFi/WS/设备参数）走 Kconfig | `cfg_init()`, `cfg_get_int()`, `cfg_get_int_or()`, `cfg_set_int()`, `cfg_get_str()`, `cfg_set_str()`, `cfg_get_volume()`, `cfg_set_volume()`, `cfg_erase_key()` |
 | `net_mgr` | L1 基础服务 | WiFi STA 连接、退避重连、SNTP 对时、网络事件（无独立任务：事件回调 + 一次性定时器） | `net_init()`, `net_is_up()`, `net_wait_ready(ms)`, `net_is_time_synced()`, `net_get_info()`, `net_reconnect()` |
-| `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发 | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
+| `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发；入站回调支持主回调 + 附加订阅（T2.5，业务与 console 观测并存） | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_subscribe()`, `ws_unsubscribe()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
 | `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 回调、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
 | `audio_player` | L2 音频引擎 | 播放引擎：PCM 播放 + 重采样到 48k + 软件音量 + 淡入淡出（多通道/MP3/HTTP 随 P2–P4 增加） | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_register_done_cb()`, `audio_player_set_volume()` |
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms，定点实现 + VBR，状态/伪栈在 PSRAM，不建任务） | `enc_open()`, `enc_encode(pcm, samples, out, cap, &out_len)`, `enc_flush()`, `enc_reset()`, `enc_close()`, `enc_stats_read()` |
-| `voice_cloud` | L3 能力 | 语音云协议：会话建立、上行音频、下行事件解析与分发 | `vc_start()`, `vc_send_audio()`, `vc_cancel()`, `vc_register_cb()` |
+| `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发；**不含会话状态机**（归 T3.1 `voice_session`） | `vc_init()`, `vc_start()`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_is_busy()`, `vc_register_cb()`, `vc_stats_read()` |
 | `music_cloud` | L3 能力 | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
 | `dev_ctrl` | L3 能力 | 按键事件（短按/长按）、LED 状态模式、静音切换 | `dev_init()`, `dev_register_cb()` |
 | `diag` | L3 能力 | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
@@ -183,12 +183,15 @@ typedef enum {
 } app_evt_t;
 ```
 
-**payload**：统一装进定长 32 字节的 `app_evt_data_t`（union），投递时整块拷贝，发布方无需保活；处理器拿到的指针只在回调内有效。P1 只定义网络事件，其余事件投递 `NULL`，由使用方落地时补定义（文本类 payload 的所有权语义随 T2.5/T3.1 定稿）：
+**payload**：统一装进定长 32 字节的 `app_evt_data_t`（union），投递时整块拷贝，发布方无需保活；处理器拿到的指针只在回调内有效。T2.5 起语音事件也带 payload（文本超过 32B 的按定长截断，完整文本由 `voice_cloud` 日志/回调提供）：
 
 | 事件 | payload 结构 |
 |---|---|
 | `APP_EVT_NET_UP` | `app_evt_net_up_t { char ip[16]; int8_t rssi; }` |
 | `APP_EVT_NET_DOWN` | `app_evt_net_down_t { uint8_t reason; uint32_t retry_ms; }` |
+| `APP_EVT_ASR_PARTIAL` / `APP_EVT_ASR_FINAL` | `app_evt_asr_t { uint16_t sid; uint16_t len; char text[28]; }`（T2.5 定稿；`len` 为实际拷贝字节数，UTF-8 中文约 9 字，超出截断） |
+| `APP_EVT_TTS_START` | `app_evt_tts_start_t { uint16_t sid; uint8_t codec; uint8_t reserved; uint32_t sr; }`（`codec=1` 为 MP3） |
+| `APP_EVT_TTS_END` | `app_evt_tts_end_t { uint16_t sid; uint16_t frames; }`（`frames` = 本轮收到的下行音频帧数） |
 
 **投递与线程约束**：
 
@@ -289,6 +292,9 @@ esp-ai/
 | 0x01 | ↑ | 上行麦克风音频（Opus 16k/16kbps/20ms） |
 | 0x02 | ↓ | 下行 TTS 音频（MP3 24k 单声道） |
 
+- `seq`：每端独立、按帧自增（uint16 回绕），由 `transport_ws` 维护，业务层不参与；
+- **帧头不带 `sid`**（T2.5 定稿 P-2）：同一连接内音频帧按 `audio_start → tts_end` 的顺序归属当前轮次。端侧实现只在"已发 `audio_end`、等待响应"的窗口内接收下行 0x02 帧，窗口外的迟到帧（上一轮残留）直接丢弃；`tts_end` 归零该窗口。这样既不扩帧头、也不让跨轮迟到帧混入。
+
 ### 6.3 文本帧（JSON）
 
 **上行**
@@ -296,7 +302,7 @@ esp-ai/
 |---|---|
 | `hello` | 连接后握手，带 device_id/ver |
 | `audio_start` | 开始一轮上行，带 `sid` |
-| `audio_end` | 上行结束（VAD 静音或超时） |
+| `audio_end` | 上行结束（VAD 静音或超时），带 `sid` |
 | `interrupt` | 用户打断，带 `sid` |
 | `ping` | 心跳 |
 | `music_request` | 请求曲目：`{"t":"music_request","action":"play","id":..,"index":..}` |
@@ -308,12 +314,12 @@ esp-ai/
 | `hello_ack` | 握手应答（T1.4 定稿），带 `ver`；5s 内未收到按建连失败处理 |
 | `asr_partial` / `asr_final` | ASR 中间/最终结果，带 `sid`、`text` |
 | `llm_delta` | LLM 增量文本，带 `sid`、`text` |
-| `tts_start` / `tts_end` | TTS 起止，带 `sid`、`codec`、`sr` |
+| `tts_start` / `tts_end` | TTS 起止，带 `sid`、`codec`、`sr`（`tts_end` 只带 `sid`） |
 | `music_track` | 曲目信息：`{"t":"music_track","sid":..,"url":"https://...mp3","codec":"mp3","duration_ms":..,"title":..}` |
-| `error` | 错误码与描述 |
+| `error` | 错误码与描述：`{"t":"error","sid":..,"code":..,"msg":..}`，码表见 PROTOCOL.md §4 |
 | `pong` | 心跳应答：`{"t":"pong"}`（不带其它字段） |
 
-规则：所有下行事件都带 `sid`；端侧丢弃 `sid` 不匹配当前会话的迟到帧。
+规则：所有下行事件都带 `sid`；端侧丢弃 `sid` 不匹配当前会话的迟到帧（`voice_cloud` 计数并在 DEBUG 日志里记录）。**错误码表（T2.5 定稿 P-4）**：`1`=通用/未知、`1001`=鉴权、`2001/2002`=ASR 失败/超时、`3001/3002`=TTS 失败/超时、`9001`=服务端内部；端侧统一"ERROR 日志 + 结束本轮（不发 audio_end 重试）"，提示音由 T3.6 负责。
 
 ### 6.4 时延目标（端侧可达性约定）
 
@@ -421,7 +427,8 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 > WS 发送队列 8KB 已按约定放 PSRAM。
 > **X3-E 口径定稿（2026-10-31）**：内部 RAM 预算统一为「静态 DIRAM（`idf.py size`）+ 运行期堆峰值（`sys heap` 峰值占用）≤ 440KB」，并要求最坏场景（wss 握手期）`sys heap` 最低水位 ≥ 30KB；旧口径「峰值 ≤310KB」写于 P0（未含 WiFi 栈、且只统计堆），作废。X3-F 后实测 193,250 + 216,668 = **409,918 B**、wss 最低水位 47,051~52,839 B，余量约 40.6KB / 17~23KB，留给 P2。
 > **X3-F 实测（2026-10-31，见 [PRODUCT_IDEAS §8 X3](PRODUCT_IDEAS.md) 与 STATUS §5）**：`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`（只把 mbedTLS 的堆放 PSRAM，WiFi/lwIP 驱动与数据路径不变，保时延）后，wss 握手期内部堆峰值 238,448→**216,668 B**、最低水位 25,087→**47,051~52,839 B**、最大块 30,720→31,744 B；PSRAM 占用 +25,656 B；TLS 握手耗时、boot→NET_UP、RTT 均无劣化。剩余 X3 项：C（WiFi 动态缓冲裁剪）待 P2 流式实测后判断；E 口径已按上文拍板。
-> **T2.2 实测（2026-10-31，见 STATUS §5）**：加入 libopus 定点编码器后，静态 DIRAM **196,462 B**；`ws://` 内部堆峰值 208,012 B、最低水位 52,675 B；**wss 握手期峰值 220,784 B、最低水位 39,763 B** → 静态 + 堆峰值 = **417,246 B ≤ 440KB（余 33.3KB）**，最低水位高于 30KB 线 9.7KB。PSRAM 峰值 902,676 B（编码器状态 15,364 + 伪栈 120,000 + 上行 ring 64KB + dump 探针 25,600 等）。**PSRAM 余量 7.5MB，后续 T2.5/T2.3 的直接解码缓冲不构成压力；内部 RAM 的余量主要留给 T2.5 的 `voice_cloud` 任务栈（预计 8KB，届时 wss 最低水位会降到 ~31KB，仍在 30KB 线上）。**
+> **T2.2 实测（2026-10-31，见 STATUS §5）**：加入 libopus 定点编码器后，静态 DIRAM **196,462 B**；`ws://` 内部堆峰值 208,012 B、最低水位 52,675 B；**wss 握手期峰值 220,784 B、最低水位 39,763 B** → 静态 + 堆峰值 = **417,246 B ≤ 440KB（余 33.3KB）**，最低水位高于 30KB 线 9.7KB。PSRAM 峰值 902,676 B（编码器状态 15,364 + 伪栈 120,000 + 上行 ring 64KB + dump 探针 25,600 等）。
+> **T2.5 实测（2026-10-31，见 STATUS §5）**：加入 `voice_cloud`（`vc` 任务 8KB）后，静态 DIRAM **196,670 B**（+208 B）；`ws://` 内部堆峰值 223,620 B / 最低水位 38,451 B；**wss 握手期（公网 `wss://`）峰值 227,988 B、最低水位 32,339 B、最大块 31,744 B** → 静态 + 堆峰值 = **424,658 B ≤ 440KB（余 25.9KB）**，wss 最低水位高于 30KB 线 2.3KB（预计 ~31KB，实测 32.3KB，符合预期但余量不大）。PSRAM 峰值 902,908 B；`vc` 任务栈 8KB，编码/上行轮次中的历史最低剩余 3,212 B（IDLE 时 7,436 B）。**T2.3/T2.4 加 MP3 解码任务栈与解码缓冲后需再按本口径复核。**
 
 ### 9.3 任务与核心（确定）
 
@@ -432,6 +439,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `player` | 1 | 5 | 6KB | MP3 解码 + 重采样 + 混音 + I2S 写 |
 | `evt` | 0 | 5 | 4KB | 事件分发（`event_bus` 自建 esp_event 循环，T1.2a 起） |
 | `ws` | 0 | 5 | 6KB | WS 状态机/退避/心跳/发送队列（TLS 收发在库任务 `ws_client`） |
+| `vc` | 0 | 4 | 8KB | 上行 Opus 编码 + 发送、`audio_start/audio_end`、下行事件解析与 `sid` 过滤（T2.5；编码在本任务内串行，伪栈在 PSRAM，见 §3.6） |
 | `music_http` | 0 | 4 | 6KB | HTTP 拉流 |
 | `voice_session` | 0 | 4 | 4KB | 状态机事件循环 |
 | `dev` | 0 | 3 | 3KB | 按键扫描 + LED 驱动 |
@@ -470,6 +478,8 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `log <tag> <level>` | 运行时调整日志级别 |
 | `wifi status` / `wifi reconnect` | 查看/重连 WiFi |
 | `ws status` / `ws reconnect` | WebSocket 观测：状态/脱敏端点/握手与重连计数/心跳 RTT/收发送与丢弃计数/队列水位；主动重连（T1.4 提前交付） |
+| `ws send <json>` / `ws sendbin [len]` / `ws rxlog on\|off` | WebSocket 双向联调探针（T1.6）：原样发送文本/上行二进制帧、打印下行帧（T2.5 起 rxlog 走附加订阅，与 voice_cloud 并存） |
+| `vc status` / `vc start [sid]` / `vc stop` / `vc cancel` / `vc stat` / `vc reset` | 语音云观测与手动起轮（T2.5）：链路状态/sid、轮次与上行帧统计、首帧耗时、下行事件与 `sid` 丢弃计数；手动起一轮、优雅收尾（补尾帧 + audio_end）、立即放弃 |
 | `net ping <host>` | 网络连通性 |
 | `mic stat` | 麦克风 RMS/峰值、VAD 状态 |
 | `enc test [ms] [tone\|uplink]` / `enc stat` / `enc dump on\|off` / `enc reset` | 上行 Opus 编码观测（T2.2）：tone=1kHz 正弦、uplink=真实链路（自动排空 ring 积压）；输出帧数/字节/码率/单帧耗时/内存增量；dump 最多 50 帧 hex 供 PC 侧独立解码 |

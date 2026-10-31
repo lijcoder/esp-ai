@@ -26,7 +26,7 @@
 | 引脚 / 接线 / 电源 / 自检 | `docs/HARDWARE.md` | §2 引脚、§3 接线、§5 电源、§8 自检 |
 | 新功能要不要做 / 已知技术问题怎么取舍 | `docs/PRODUCT_IDEAS.md` | §5 优先级矩阵、§6 决策记录、§8 技术调研记录 |
 | 暂缓功能预留了什么 | `docs/ARCHITECTURE.md` | 附录 A（预留点）、附录 B（待定输入） |
-| 协议字段细节 | `docs/PROTOCOL.md` | 空壳，P2 补全；此前以 ARCHITECTURE §6 为准 |
+| 协议字段细节 | `docs/PROTOCOL.md` | 完整契约（T2.5 定稿）：握手/帧头/上下行字段表/错误码表/版本兼容/样例；设计概览见 ARCHITECTURE §6 |
 | 文档怎么维护 / 边界 | `docs/CONVENTIONS.md` | §1 文档边界 |
 
 ## 3. 构建、烧录与真机测试
@@ -36,6 +36,7 @@
 - 提交前必须：build 通过 + size 无明显增长。
 - **唤醒别喊话**：测"嗨，乐鑫"用 `afplay tools/lexin.wav`（Mac 扬声器回放、设备麦克风拾音），不需要人工喊；`idf.py -p <PORT> monitor` 侧预期 `APP: wake detected` → `AFE: feed paused` → `PLAYER: play ...` → `APP: prompt done, feed resumed`。**音量按用户定稿：系统音量正常 31%、上限 50%（不得超过；70% 已否决）、`afplay` 默认增益**；`-v` 放大须满足 系统音量×增益 ≤50%（如 31% + `-v 1.5` ≈ 46.5% 可）。用法与注意事项见 `tools/README.md`。
 - **交互语音也回放**：唤醒提示音结束（`feed resumed`）之后用 `afplay tools/今天天气如何.wav` / `afplay tools/今天吃了什么.wav` 模拟用户说话；**自动回归一条命令**：`uv run tools/voice_test.py --volume 50`（覆盖 3 个素材 + 串口断言，音量临时调到上限后自动恢复）。实测与参数见 `tools/README.md`。
+- **端云链路自动回归（T2.5 起）**：`uv run tools/voice_cloud_test.py` 自己拉起 mock、复位设备、回放唤醒+交互语音，断言上行 Opus/下行 ASR-TTS 事件/`sid` 过滤/收尾与内存，43 项 PASS 才算过；`--inject-late` 额外验证迟到帧丢弃。参数见 `tools/README.md`。
 
 ## 4. 铁律（违反会返工，完整版见 CONVENTIONS）
 

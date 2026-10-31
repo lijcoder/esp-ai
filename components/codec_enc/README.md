@@ -72,6 +72,11 @@
    因此默认 VBR，验收看"平均码率/平均帧长"而不是每帧固定 40B。
 3. **console 任务栈**：`esp_console` 默认 4096B，`enc test` 直接在 REPL 任务里调 libopus 会栈溢出；
    `diag` 已把 `task_stack_size` 提到 8192B（其余命令无影响）。
+4. **构建不是「绝对零警告」**：libopus 第三方源 `silk/NLSF2A.c` 有 1 条 `-Wmaybe-uninitialized`
+   （vendor 代码，不改 `managed_components` 无法消除）；**自有代码零警告**。升级 microOpus 后若出现新告警，先区分归属。
+5. **PSRAM 常驻**：thread-safe 伪栈按线程分配、随任务退出释放；`console_repl` 与 T2.5 的 `voice_cloud`
+   都是常驻任务，因此**每个用过的线程各常驻 120KB PSRAM**（当前最多 2 个 = 240KB，PSRAM 余 7.5MB 可接受）。
+   若未来 PSRAM 紧张，可下调 `CONFIG_OPUS_PSEUDOSTACK_SIZE`（下限 60000）或改回非线程安全模式（须保证串行调用）。
 
 ## 后续（T2.5）
 

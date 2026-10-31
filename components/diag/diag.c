@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "audio_fe.h"
+#include "codec_enc.h"
 #include "config_store.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
@@ -616,6 +617,312 @@ static int cmd_afe(int argc, char **argv)
     }
 
     printf("未知子命令: %s（可用: on | off | stat [ms]）\n", sub);
+    return ESP_ERR_INVALID_ARG;
+}
+
+/* ---------------- enc 命令（Opus 上行编码探针，T2.2） ----------------
+ *
+ * 开发期探针（同 `afe uplink` / `ws send` 先例）：只做编码观测与帧 dump，
+ * 不参与产品链路（产品路径由 T2.5 的 voice_cloud 任务调用 codec_enc）。
+ *
+ * 为什么"先编码进 PSRAM、循环结束再打 hex"：115200 串口每帧 hex 约 80B，
+ * 边编边打会把 console 任务钉在 UART 上（11.5KB/s），上行环形缓冲随即溢出、
+ * 编码统计失真；dump 先缓冲到 PSRAM、循环后再统一打印，此时已不读音频，
+ * 串口阻塞不影响统计。PC 侧用 tools/opus_enc_test.py（PyAV 独立解码）。
+ */
+#define ENC_DUMP_FRAMES 50     /* 50 × 20ms = 1s，够 PC 侧做频率/RMS 判定 */
+#define ENC_TONE_HZ 1000
+#define ENC_TONE_AMPLITUDE 8000 /* ≈ -12 dBFS，不削波 */
+
+static uint8_t *s_enc_dump; /* PSRAM：ENC_DUMP_FRAMES × CODEC_ENC_MAX_PACKET */
+static uint16_t s_enc_dump_len[ENC_DUMP_FRAMES];
+static uint32_t s_enc_dump_count;
+static uint32_t s_enc_dump_missed;
+static bool s_enc_dump_on;
+
+static esp_err_t enc_dump_set(bool on)
+{
+    if (on) {
+        if (s_enc_dump == NULL) {
+            size_t bytes = (size_t)ENC_DUMP_FRAMES * CODEC_ENC_MAX_PACKET;
+            s_enc_dump = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+            if (s_enc_dump == NULL) {
+                printf("PSRAM 分配 dump 缓冲失败（%u B）\n", (unsigned)bytes);
+                return ESP_ERR_NO_MEM;
+            }
+        }
+        s_enc_dump_on = true;
+        printf("ENC dump on（最多 %d 帧，%u B PSRAM）\n", ENC_DUMP_FRAMES,
+               (unsigned)((size_t)ENC_DUMP_FRAMES * CODEC_ENC_MAX_PACKET));
+    } else {
+        s_enc_dump_on = false;
+        s_enc_dump_count = 0;
+        s_enc_dump_missed = 0;
+        if (s_enc_dump != NULL) {
+            heap_caps_free(s_enc_dump);
+            s_enc_dump = NULL;
+        }
+        printf("ENC dump off\n");
+    }
+    return ESP_OK;
+}
+
+/* 每次 enc_encode() 最多产出一帧（调用方每次只喂 ≤320 样本），按调用切分即可 */
+static void enc_dump_capture(const uint8_t *frame, size_t len)
+{
+    if (!s_enc_dump_on || s_enc_dump == NULL) {
+        return;
+    }
+    if (s_enc_dump_count >= ENC_DUMP_FRAMES) {
+        s_enc_dump_missed++;
+        return;
+    }
+    if (len > CODEC_ENC_MAX_PACKET) {
+        len = CODEC_ENC_MAX_PACKET;
+    }
+    memcpy(s_enc_dump + (size_t)s_enc_dump_count * CODEC_ENC_MAX_PACKET, frame, len);
+    s_enc_dump_len[s_enc_dump_count] = (uint16_t)len;
+    s_enc_dump_count++;
+}
+
+static void enc_dump_print(void)
+{
+    static const char k_hex[] = "0123456789abcdef";
+    static char hex[CODEC_ENC_MAX_PACKET * 2 + 1];
+
+    if (!s_enc_dump_on || s_enc_dump == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < s_enc_dump_count; i++) {
+        const uint8_t *frame = s_enc_dump + (size_t)i * CODEC_ENC_MAX_PACKET;
+        uint32_t len = s_enc_dump_len[i];
+        for (uint32_t j = 0; j < len; j++) {
+            hex[j * 2] = k_hex[frame[j] >> 4];
+            hex[j * 2 + 1] = k_hex[frame[j] & 0x0F];
+        }
+        hex[len * 2] = '\0';
+        printf("ENCDUMP %u %u %s\n", (unsigned)i, (unsigned)len, hex);
+    }
+    if (s_enc_dump_missed > 0) {
+        printf("ENC dump missed: %u 帧（超出缓冲未记录）\n", (unsigned)s_enc_dump_missed);
+    }
+    printf("ENC dump done: n=%u\n", (unsigned)s_enc_dump_count);
+}
+
+static double enc_bitrate_kbps(const codec_enc_stats_t *st)
+{
+    if (st->samples == 0) {
+        return 0.0;
+    }
+    /* 按音频时长（不是墙钟）算码率：tone 模式是尽可能快地压完固定帧数 */
+    return (double)st->bytes * 8.0 * (double)CODEC_ENC_SAMPLE_RATE / (double)st->samples / 1000.0;
+}
+
+static void print_enc_stat(void)
+{
+    codec_enc_stats_t st;
+
+    if (enc_stats_read(&st) != ESP_OK) {
+        printf("读取编码统计失败\n");
+        return;
+    }
+    double bpf = st.frames ? (double)st.bytes / (double)st.frames : 0.0;
+    uint32_t avg_us = st.frames ? st.encode_us_sum / st.frames : 0;
+    printf("ENC stat: open=%d frames=%u samples=%u bytes=%u bytes_per_frame=%.1f "
+           "bitrate_kbps=%.1f encode_avg_us=%u encode_max_us=%u max_packet=%u errors=%u carry=%u\n",
+           enc_is_open() ? 1 : 0, (unsigned)st.frames, (unsigned)st.samples, (unsigned)st.bytes,
+           bpf, enc_bitrate_kbps(&st), (unsigned)avg_us, (unsigned)st.encode_us_max,
+           (unsigned)st.max_packet, (unsigned)st.errors, (unsigned)st.carry_samples);
+}
+
+static int enc_run_test(uint32_t window_ms, const char *source)
+{
+    static int16_t pcm[CODEC_ENC_FRAME_SAMPLES];
+    uint8_t out[CODEC_ENC_MAX_PACKET];
+    const double two_pi = 6.28318530717958647692;
+    bool use_uplink;
+    uint32_t read_timeouts = 0;
+    esp_err_t err;
+
+    if (source == NULL) {
+        use_uplink = audio_fe_uplink_active(); /* 不指定音源：上行在跑就用真实链路 */
+    } else if (strcmp(source, "uplink") == 0) {
+        use_uplink = true;
+    } else if (strcmp(source, "tone") == 0) {
+        use_uplink = false;
+    } else {
+        printf("未知音源: %s（可用: tone | uplink）\n", source);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (use_uplink && !audio_fe_uplink_active()) {
+        printf("上行未启动：先 `afe uplink on`，或指定 `enc test %u tone`\n", (unsigned)window_ms);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    size_t internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    err = enc_open();
+    if (err != ESP_OK) {
+        printf("打开编码器失败: %s\n", esp_err_to_name(err));
+        return err;
+    }
+    enc_stats_reset();
+    if (s_enc_dump_on) {
+        s_enc_dump_count = 0;
+        s_enc_dump_missed = 0;
+    }
+
+    if (use_uplink) {
+        /* 先排空 start 前积压的音频：ring 有 2s 深度，不排空会把旧数据也编进本次窗口
+         * （T2.2 实测 2000ms 窗口编出 108 帧而不是 100 帧）。timeout=0 只取现成数据。 */
+        int drained = 0;
+        while (audio_fe_uplink_read(pcm, CODEC_ENC_FRAME_SAMPLES, 0) > 0) {
+            drained++;
+        }
+        if (drained > 0) {
+            printf("ENC TEST: 已丢弃 %d 帧积压（start 前采集的旧数据）\n", drained);
+        }
+    }
+
+    printf("ENC TEST start: source=%s window_ms=%u dump=%s\n", use_uplink ? "uplink" : "tone",
+           (unsigned)window_ms, s_enc_dump_on ? "on" : "off");
+
+    int64_t t0 = esp_timer_get_time();
+    int64_t end_us = t0 + (int64_t)window_ms * 1000;
+    uint32_t tone_frames = window_ms / CODEC_ENC_FRAME_MS;
+    uint32_t tone_done = 0;
+    double phase = 0.0;
+
+    for (;;) {
+        size_t n;
+        if (use_uplink) {
+            int64_t now = esp_timer_get_time();
+            if (now >= end_us) {
+                break;
+            }
+            int64_t remain_ms = (end_us - now) / 1000;
+            if (remain_ms <= 0) {
+                remain_ms = 1;
+            } else if (remain_ms > 200) {
+                remain_ms = 200;
+            }
+            int got = audio_fe_uplink_read(pcm, CODEC_ENC_FRAME_SAMPLES, (uint32_t)remain_ms);
+            if (got <= 0) {
+                read_timeouts++;
+                vTaskDelay(pdMS_TO_TICKS(2)); /* 不空转：把 CPU 让给 afe_fetch */
+                continue;
+            }
+            n = (size_t)got;
+        } else {
+            if (tone_done >= tone_frames) {
+                break; /* tone 模式压固定帧数：测编码吞吐，不受墙钟影响 */
+            }
+            for (int i = 0; i < CODEC_ENC_FRAME_SAMPLES; i++) {
+                pcm[i] = (int16_t)lround(sin(phase) * (double)ENC_TONE_AMPLITUDE);
+                phase += two_pi * (double)ENC_TONE_HZ / (double)CODEC_ENC_SAMPLE_RATE;
+                if (phase >= two_pi) {
+                    phase -= two_pi;
+                }
+            }
+            n = CODEC_ENC_FRAME_SAMPLES;
+            tone_done++;
+        }
+
+        size_t out_len = 0;
+        err = enc_encode(pcm, n, out, sizeof(out), &out_len);
+        if (err != ESP_OK) {
+            printf("编码失败: %s\n", esp_err_to_name(err));
+            break;
+        }
+        if (out_len > 0) {
+            enc_dump_capture(out, out_len);
+        }
+    }
+
+    /* 会话收尾：carry 残余补零成尾帧（T2.5 的 audio_end 用同一口径，不丢最后半帧） */
+    size_t tail_len = 0;
+    if (enc_flush(out, sizeof(out), &tail_len) == ESP_OK && tail_len > 0) {
+        enc_dump_capture(out, tail_len);
+    }
+
+    uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    codec_enc_stats_t st;
+    enc_stats_read(&st);
+    enc_close();
+
+    size_t internal_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    enc_dump_print();
+
+    double bpf = st.frames ? (double)st.bytes / (double)st.frames : 0.0;
+    double avg_ms = st.frames ? (double)st.encode_us_sum / (double)st.frames / 1000.0 : 0.0;
+    printf("ENC TEST done: source=%s frames=%u samples=%u bytes=%u bytes_per_frame=%.1f "
+           "bitrate_kbps=%.1f encode_avg_ms=%.2f encode_max_ms=%.2f max_packet=%u errors=%u "
+           "carry=%u elapsed_ms=%u internal_free_delta=%d psram_free_delta=%d read_timeouts=%u "
+           "stack_free=%u\n",
+           use_uplink ? "uplink" : "tone", (unsigned)st.frames, (unsigned)st.samples,
+           (unsigned)st.bytes, bpf, enc_bitrate_kbps(&st), avg_ms,
+           (double)st.encode_us_max / 1000.0, (unsigned)st.max_packet, (unsigned)st.errors,
+           (unsigned)st.carry_samples, (unsigned)elapsed_ms,
+           (int)internal_before - (int)internal_after, (int)psram_before - (int)psram_after,
+           (unsigned)read_timeouts, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    return err;
+}
+
+static int cmd_enc(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: enc test [ms] [tone|uplink] | stat | dump on|off | open | close | reset\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *sub = argv[1];
+    if (strcmp(sub, "test") == 0) {
+        int ms = (argc > 2) ? atoi(argv[2]) : 1000;
+        if (ms < 100) {
+            ms = 100;
+        } else if (ms > 10000) {
+            ms = 10000;
+        }
+        return enc_run_test((uint32_t)ms, (argc > 3) ? argv[3] : NULL);
+    }
+    if (strcmp(sub, "stat") == 0) {
+        print_enc_stat();
+        return ESP_OK;
+    }
+    if (strcmp(sub, "reset") == 0) {
+        esp_err_t err = enc_stats_reset();
+        printf("ENC stats reset\n");
+        return err;
+    }
+    if (strcmp(sub, "dump") == 0) {
+        if (argc < 3) {
+            printf("用法: enc dump on|off\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (strcmp(argv[2], "on") == 0) {
+            return enc_dump_set(true);
+        }
+        if (strcmp(argv[2], "off") == 0) {
+            return enc_dump_set(false);
+        }
+        printf("未知参数: %s（可用: on | off）\n", argv[2]);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(sub, "open") == 0) {
+        esp_err_t err = enc_open();
+        printf("%s\n", (err == ESP_OK) ? "编码器已打开" : esp_err_to_name(err));
+        return err;
+    }
+    if (strcmp(sub, "close") == 0) {
+        esp_err_t err = enc_close();
+        printf("%s\n", (err == ESP_OK) ? "编码器已关闭" : esp_err_to_name(err));
+        return err;
+    }
+
+    printf("未知子命令: %s（可用: test | stat | dump | open | close | reset）\n", sub);
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -1249,6 +1556,12 @@ static esp_err_t register_commands(void)
             .func = cmd_afe,
         },
         {
+            .command = "enc",
+            .help = "Opus 上行编码探针（T2.2）：enc test [ms] [tone|uplink] | stat | dump on|off | open | close | reset",
+            .hint = "test|stat|dump|open|close|reset",
+            .func = cmd_enc,
+        },
+        {
             .command = "cfg",
             .help = "配置持久化：cfg info | get <key> | set <key> <int> | setstr <key> <value> | erase <key>",
             .hint = "info|get|set|setstr|erase",
@@ -1300,6 +1613,9 @@ esp_err_t diag_init(void)
 
     repl_config.prompt = "esp-ai>";
     repl_config.max_cmdline_length = 128;
+    /* 默认 4096 对纯 console 命令够用，但 `enc test` 会在 REPL 任务里直接调 libopus：
+     * 伪栈只放 temp 数组，libopus 本身还有递归/局部栈，实测 4KB 会溢出（T2.2 排查） */
+    repl_config.task_stack_size = 8192;
 
     err = esp_console_new_repl_uart(&uart_config, &repl_config, &repl);
     if (err != ESP_OK) {

@@ -48,3 +48,27 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
 # WiFi/lwIP 的驱动缓冲与数据路径保持内部 RAM —— 不引入 PSRAM 拷贝时延（PRODUCT_IDEAS §8 X3-F）。
 # 实测：wss 握手期内部 RAM 最低水位 25,087 → 47,051~52,839 B；TLS 握手耗时 / boot→NET_UP 无劣化。
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# T2.2（codec_enc）：上行 Opus 编码走 microOpus（esphome/micro-opus 0.4.1）。
+# 它的 Ogg 解容器是 C++；IDF 5.x 的 C++ 支持默认编入（无 COMPILER_CXX 开关），无需额外配置
+# 编码器状态与临时内存（伪栈）全部放 PSRAM：内部 RAM 只剩约 16KB 硬余量
+# （CONVENTIONS §4；libopus 固定点在栈上要 ~10KB，直接放任务栈会超预算）
+CONFIG_OPUS_STATE_PREFER_PSRAM=y
+CONFIG_OPUS_PSEUDOSTACK_PREFER_PSRAM=y
+# 伪栈模式：保持 microOpus 默认的 thread-safe 版（C11 _Thread_local + pthread TLS）。
+# T2.2 实测它在 FreeRTOS 任务（console/voice_cloud，非 pthread）里工作正常，
+# 每个调用线程独立 120KB PSRAM 伪栈（本工程最多 2 个），换来"可并发调用"的安全性。
+# 注：曾误判为 TLS 崩溃 —— 实际是浮点实现的问题（见下面 FLOATING_POINT 注释）。
+# 伪栈 120KB/线程：16k/单声道/20ms 编码实际约 25~30KB，先按默认留余量；
+# T2.2 实测 PSRAM 余 7.5MB，若要压缩再下调（Kconfig 范围下限 60000）
+CONFIG_OPUS_PSEUDOSTACK_SIZE=120000
+# 定点实现（T2.2 实测）：浮点实现（S3 默认 y）在本工程首次编码即崩溃 ——
+# nonthreadsafe+float 报 MMU fault（silk_noise_shape_quantizer_del_dec 访问 PSRAM
+# 伪栈 invalid mmu entry）；threadsafe+float 报 LoadProhibited（EXCVADDR 0x44）。
+# 改成定点后两种伪栈模式都正常；S3 上定点 CPU 更省，选定点（详见 STATUS T2.2 排查记录）
+# CONFIG_OPUS_FLOATING_POINT is not set
+CONFIG_OPUS_ENABLE_XTENSA_OPTIMIZATIONS=y
+# 编码器参数（codec_enc 的 Kconfig）显式写死，避免 sdkconfig 重生成时回默认
+CONFIG_CODEC_ENC_BITRATE=16000
+CONFIG_CODEC_ENC_VBR=y
+CONFIG_CODEC_ENC_COMPLEXITY=3

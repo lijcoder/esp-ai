@@ -1,0 +1,7 @@
+## codec_enc 的托管依赖：microOpus（libopus 的 ESP-IDF 封装，Apache-2.0）。
+## 评估记录见 components/codec_enc/README.md「依赖评估」：
+## 选它而不是 78/esp-opus 的关键原因是「临时内存走 PSRAM 伪栈」——
+## libopus 固定点编码在 silk/fixed/encode_frame_FIX.c 里用 VDECL 在栈上开
+## ~10KB 的 sLPC，本工程内部 RAM 只剩十几 KB（CONVENTIONS §4），直接放栈会超预算。
+dependencies:
+  esphome/micro-opus: "^0.4.1"

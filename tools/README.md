@@ -9,6 +9,7 @@
 | `lexin.wav` | 唤醒词"嗨，乐鑫"测试音频，**替代人工喊话** | `afplay tools/lexin.wav`，见下文 |
 | `今天天气如何.wav` | 交互语音素材（模拟用户提问），**替代人工说话** | `afplay tools/今天天气如何.wav`，见下文 |
 | `今天吃了什么.wav` | 交互语音素材（模拟用户提问） | `afplay tools/今天吃了什么.wav`，见下文 |
+| `opus_enc_test.py` | 上行 Opus 编码真机自测（T2.2）：串口抓帧 + PyAV 独立解码断言 + 内存/泄漏 | `uv run tools/opus_enc_test.py --self-test`，见下文 |
 | `record_wav.py` | 串口采集 WAV，用于唤醒/AEC 实测（**T5.2 计划，尚未实现**） | — |
 
 ## 语音测试素材 —— lexin.wav + 两个交互语音
@@ -142,6 +143,121 @@ uv run tools/afe_uplink_test.py --no-reset          # 设备已在跑、不想�
 
 ---
 
+## opus_enc_test.py —— 上行 Opus 编码真机自测（T2.2）
+
+**作用**：验证 `codec_enc` 的上行 Opus 输出（16k / 单声道 / 20ms，目标 16kbps；最终选型 VBR，实测平均约 13~14kbps，ARCHITECTURE §3）。设备把编码帧 dump 成
+hex，脚本用 **PyAV（libopus）独立解码**后再断言，不采信设备自报数值。一条命令覆盖：tone 源数值基准 → uplink 真实链路
+（回放交互语音）→ 连续多次调用的内存/泄漏，共 40+ 项 PASS/FAIL，退出码 0/1。
+
+```bash
+uv run tools/opus_enc_test.py --self-test              # 离线自检（不连串口/设备，12 项，先跑这个）
+uv run tools/opus_enc_test.py --log /tmp/opus_enc.log  # 真机全量（串口独占，默认复位设备）
+uv run tools/opus_enc_test.py --no-reset --window-ms 2000
+```
+
+### 设备侧 console 契约（`codec_enc` 提供，脚本只消费输出）
+
+| 命令 | 输出 |
+|---|---|
+| `enc dump on\|off` | `ENC dump on` / `ENC dump off` |
+| `enc test <ms> [tone\|uplink]` | 起始行 + dump 行（每帧一行）+ 结束行，见下 |
+| `enc stat` / `enc reset` | `ENC stat: open=.. frames=.. ...` / `ENC stats reset` |
+
+- 起始行：`ENC TEST start: source=tone|uplink window_ms=N dump=on|off`
+- dump 行（`enc dump on` 时每帧一行）：`ENCDUMP <seq> <len> <hex>`，`seq` 从 0 递增、`hex` 小写无分隔；
+- 结束行：`ENC TEST done: source=.. frames=.. samples=.. bytes=.. bytes_per_frame=.. bitrate_kbps=.. encode_avg_ms=.. encode_max_ms=.. max_packet=.. errors=.. carry=.. elapsed_ms=.. internal_free_delta=.. psram_free_delta=..`
+  （当前固件该行还多 `read_timeouts=..`、`stack_free=..`（REPL 任务栈余量）等额外字段，脚本忽略未知字段、不判失败）；
+- **dump 缓冲上限**（当前固件 `ENC_DUMP_FRAMES=50`，即 1s）：窗口超过 1s 时只 dump 前 50 帧，随后打印
+  `ENC dump missed: N 帧（超出缓冲未记录）` 与 `ENC dump done: n=50`。脚本对账口径是
+  `dump 帧数 + missed == done.frames`（两者相等或截断均可），**解码/频谱/时长断言用实际抓到的帧（1s）**，
+  结构性数值门槛（frames、bytes/frame、bitrate、耗时）用整窗口的 `done.frames`。
+  若要 2000ms 全帧抓取，需固件把 `ENC_DUMP_FRAMES` 提到 ≥ `window_ms/20 + 1`（如 128/200），或把 `--window-ms` 降到 1000。
+- **uplink 测试前排空 ring 积压**：固件在 `enc test ... uplink` 开始时用 timeout=0 循环丢弃 start 前采集的旧数据，
+  并打印 `ENC TEST: 已丢弃 N 帧积压（start 前采集的旧数据）`。该行出现在 `ENC TEST start` **之前**，脚本忽略；
+  因此 uplink 窗口帧数应 ≈ `window_ms/20`（实测 2000ms → 100 帧），B 用例容差 ±3 只吸收调度边界。
+
+### 设备侧输出字段含义（工具断言口径）
+
+| 字段 | 含义 / 断言口径 |
+|---|---|
+| `source` | 编码源：`tone`（设备内置 1kHz 正弦）/ `uplink`（`audio_fe` 上行 PCM）；起始行与结束行必须一致 |
+| `window_ms` | 编码窗口毫秒数；帧数期望 `window_ms/20`（tone ±2；uplink ±3，固件测试前排空 ring 积压） |
+| `frames` | 实际编码帧数（整窗口）；与 dump 行数对账 `dump + missed == frames`（允许 dump 缓冲截断） |
+| `samples` | 消费的输入样本数（16k 单声道，20ms=320） |
+| `bytes` / `bytes_per_frame` | 编码总字节 / 平均每帧字节；avg 期望 **26~46 B**（VBR 实测 33~35 B） |
+| `bitrate_kbps` | 设备自算码率；期望 **11~18 kbps**（VBR 实测 13~14 kbps） |
+| `encode_avg_ms` / `encode_max_ms` | 单帧编码耗时；期望 **≤10ms / ≤15ms**（VBR 实测 5.3~6.7 / 7.9~8.6ms） |
+| `max_packet` | 最大 Opus 包长（字节），仅记录（Opus 包上限 1275B） |
+| `errors` / `carry` | 编码错误数 / 未凑满 320 样本的余数；两者必须为 **0** |
+| `elapsed_ms` | 整个 `enc test` 的墙钟时长（≈window_ms），仅记录 |
+| `internal_free_delta` / `psram_free_delta` | 本次 test 前后内部 RAM / PSRAM 剩余变化（正=占用增加），用于泄漏判断 |
+
+**为什么是 VBR（2026-10-31 真机实测）**：CBR 单帧编码 **16.2ms**（rate loop 反复重编码），VBR 仅 **6.7ms**（2.4×），
+20ms 帧预算下选 VBR；代价是 VBR 平均码率实测约 **13~14kbps**（tone 34.5B/frame、语音 33.2B/frame，低于 16kbps 目标，
+属正常 VBR 行为）。因此 `bytes_per_frame` / `bitrate_kbps` / `encode_avg_ms` 阈值按实测放宽为 26~46B / 11~18kbps / ≤10ms。
+
+### 断言口径
+
+- **A. tone 源数值基准**：`enc dump on` → `enc test <ms> tone` → 抓 `ENCDUMP` → PyAV 独立解码断言：
+  解码失败帧 0（含 corrupt）；**解码帧率 ∈ {16000, 48000}**（Opus 原生输出，设备实测 **48000 / 单帧 960 样本**，不是
+  16k/320——16k 只是我们重采样后的分析采样率）；Opus TOC 单声道 + 20ms 帧（设备实测首字节 `0x48` = config 9
+  SILK NB 20ms + mono；PyAV 对裸 Opus 包解码时原生 layout 可能显示 `stereo`——无容器 extradata 时 libopus
+  默认按 2ch 输出，单声道以 TOC 为准，重采样 downmix 后 RMS/FFT 正常）；**总时长 ≈ 抓帧数×20ms（±5%，
+  按解码帧原生 `sample_rate` 折算）**；
+  1kHz FFT 主峰 **1000±20Hz** 且 [980,1020]Hz 能量占比 **>50%**（频率轴按分析 PCM 实际采样率算）；
+  frames ≈ window_ms/20±2；avg bytes/frame **26~46 B**；bitrate **11~18 kbps**；`encode_avg_ms ≤10`、
+  `encode_max_ms ≤15`；`errors=0`、`carry=0`。另校验 `ENCDUMP` 的 seq 连续、`len` 与 hex 字节数自洽、hex 小写。
+  设备 dump 缓冲不足时按上述截断口径对账（不因截断判失败）。
+- **B. uplink 源真实链路**：`afe uplink on` → 静音基线 `enc test 500 uplink` → 后台 `afplay tools/今天天气如何.wav`
+  （默认增益、不改系统音量）→ `enc test <ms> uplink`。数值门槛同 A（无 1kHz 频谱断言，改为音频证据）。
+  **"有语音"用三条 OR 自适应判据**（不设绝对音量地板，见下文「解码量纲与 B 语音判据」）：
+  ① 最高 100ms 分段 RMS ≥ max(静音基线×3, 30)；② 最高段 > 全段中位数×1.3；③ 300~3400Hz 语音频带能量占比 > 0.6；
+  另有整段解码 RMS > 静音基线×1.5；
+  `frames` 应 ≈ `window_ms/20`：固件在 uplink 测试前用 timeout=0 循环**排空 ring 积压**（并打印
+  `ENC TEST: 已丢弃 N 帧积压`，位于 start 行之前、脚本忽略），实测 2000ms → **100 帧**；容差 **±3**
+  吸收调度边界（tone 源压固定帧数，仍严格 ±2）；
+  日志无 **I2S 读失败**、无 **ERROR/panic**（网络/WS 重连噪音按 `voice_test.py` 口径忽略，`读失败 0 次` 统计行不算失败）；
+  结束务必 `enc dump off` + `afe uplink off`（异常退出时脚本也会在 finally 里补发）。
+- **C. 内存/泄漏**：连续 3 次 `enc test 1000 tone`，记录每次 `internal_free_delta`/`psram_free_delta` 与
+  `sys heap` 前后差值。断言内部 RAM 总增量 **≤8KB**、第 2/3 次内部 Δ **≤4KB**（无单调下降）；
+  PSRAM 首次分配 **≤64KB**、后续 Δ **≤4KB**（不持续下降）；三次均 `errors=0`/`carry=0`、frames 50±2。
+
+### 解码量纲与 B 语音判据
+
+- **分析 PCM 量纲**：解码帧原生是 48k `fltp`（值域 [-1,1]），脚本把它重采样为 16k/mono/s16 写 WAV。
+  量纲核对：`fltp × 32768 == libopus 解码器原生 s16`，分析 PCM 与之一致（**没有** downmix 0.5 或写 WAV 再除 32768）。
+  - 设备 A tone（`ENC_TONE_AMPLITUDE=8000` ≈ 0.244FS）实测：分析 PCM **RMS 5556 / peak 8210**，
+    与 libopus s16 解码 5555 / 8229 一致；`--self-test` 的 **S12** 用 libopus 原生 s16 交叉校验（比值 1.000，判据 ±10%）。
+- **B 段绝对电平取决于 Mac 系统输出音量**（脚本按任务约定**不改系统音量**，默认增益）：两份真机日志里
+  B dump 解码 RMS 仅 **49~58**（≈ -56dBFS）、峰值 168~428（音量小），但 100ms 分段包络随回放出现明显起伏，
+  帧长 30B 左右（B12 已作为"有声"的独立证据）。因此 B17 只做**定性**判据、不设 150 这类绝对电平地板；
+  三条 OR 判据在低音量下仍能稳定通过（实测最高段 79~108、中位 54~57、静音基线 7~10）。
+- 注意两份真机日志里 B 段解码音频的 300~3400Hz 能量占比只有 **~1.3%**（主峰 145Hz、A tone 才是 1000Hz），
+  与 A tone 的"99.9% 在语音频带"完全不同；若需要"语音频带占比"作为硬判据，先确认现场回放音量/麦克风路是否正常
+  （建议用 `tools/afe_uplink_test.py --volume 50` 或把系统音量调到 50% 再抓 B 段）。
+
+### --self-test（不需要硬件）
+
+PyAV 的 libopus 编码器现场造 1kHz 正弦 Opus 帧（16k/单声道/20ms/16kbps，每帧 320 样本），把
+「合成 `ENC TEST start`/`ENCDUMP`/`ENC TEST done` → 解析 → 独立解码 → 频谱/时长/帧数」整条断言逻辑跑在**真实帧**上，
+另加 500Hz 负例（不得被判成 1kHz）证明断言不是写死的；S11 覆盖 dump 缓冲截断对账；**S12 交叉校验解码量纲**
+（分析 PCM s16 RMS ≈ libopus 原生 s16 RMS，±10%）。S5 断言的是**解码帧率 ∈ {16000, 48000}**
+（本机 libopus 解码器输出 48k，与真机一致），不是写死 16k。本机已验证 `av` 19.x 含 `libopus` 编码器与 `opus` 解码器。
+
+### 参数 / 依赖 / 限制
+
+- 参数：`--port`（默认自动探测唯一的 `/dev/cu.usbmodem*`）、`--window-ms`（默认 2000）、`--no-reset`、
+  `--boot-timeout`、`--log`、`--self-test`。
+- PEP 723 内联 `pyserial>=3.5`、`av>=12`，`uv run` 自动安装（首次会下载 PyAV/libopus 轮子，约 18MB）。
+- **脚本独占串口**：运行前关掉 `idf.py monitor`（串口只有一个）；默认复位设备，`--no-reset` 用于设备已在跑。
+- 用例 B 会 `afplay` 外放交互语音；**不改系统音量、默认增益**（音量口径见上文「音量口径」）。
+- 本机 PyAV wheel 未带 numpy，脚本**不调 `to_ndarray()`**（避免 fltp float 值域 [-1,1] 被当 s16 截断成 0、误判全静音）：
+  解码后统一重采样成 16k/mono/s16 写临时 WAV，再用标准库 `wave` 读样本做 FFT/RMS（FFT 纯 Python，2s@16k 约 0.05s，
+  中间 WAV 落在系统临时目录、结束删除）。设备帧解码原生输出是 **48k**（单帧 960 样本），时长断言按原生 `sample_rate`
+  折算，不写死 16k。
+
+---
+
 ## ws_mock_server.py —— 本地「云端」WS 模拟服务（T1.5）
 
 **作用**：在真实后端就绪前，用一台电脑模拟云端 WebSocket 服务（握手、心跳、事件下发、TTS 音频流），让端侧 T1.4/T1.6 以及 P2–P4 全部能脱机联调（ROADMAP §2.0 P1 顺序 0：可最早启动，端侧不必等后端）。
@@ -259,4 +375,4 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 - 真实 MP3 素材 + 断言可解码（T2.3/T2.4）。
 - HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求），P4（T4.1/T4.2）前补。
 - `wss` + 自签证书（T1.4 决定证书策略后）。
-- 上行 Opus 帧解码校验（需 Opus 库），P2（T2.2）后可选。
+- 上行 Opus 帧解码校验 → **已交付 `opus_enc_test.py`**（PyAV 独立解码 + 频谱/码率/泄漏断言，见上）；真机联调在 T2.2 固件就绪后由 Lead 通知。

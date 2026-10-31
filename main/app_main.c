@@ -19,20 +19,28 @@
 
 static const char *TAG = "APP";
 
-static void on_play_done(void *arg)
+static void on_play_done(audio_player_src_t src, bool ok, void *arg)
 {
     (void)arg;
-    /* R2：播放结束（含尾部延时）后恢复收音 */
-    audio_fe_set_feed_enabled(true);
-    ESP_LOGI(TAG, "prompt done, feed resumed");
+    (void)ok;
 
-    /* 提示音播完、收音已恢复，才是"用户开始说话"的起点：发起一轮端云会话。
-     * 云端未 READY 时 vc_start_auto() 返回 INVALID_STATE 并只打 WARN —— 启动顺序
-     * 不能假设 WiFi/握手已经完成（唤醒是本地能力，早于联网）。 */
-    esp_err_t err = vc_start_auto();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "cloud round skipped: %s", esp_err_to_name(err));
+    if (src == AUDIO_PLAYER_SRC_PCM) {
+        /* R2：提示音播放结束（含尾部延时）后恢复收音 */
+        audio_fe_set_feed_enabled(true);
+        ESP_LOGI(TAG, "prompt done, feed resumed");
+
+        /* 提示音播完、收音已恢复，才是"用户开始说话"的起点：发起一轮端云会话。
+         * 云端未 READY 时 vc_start_auto() 返回 INVALID_STATE 并只打 WARN —— 启动顺序
+         * 不能假设 WiFi/握手已经完成（唤醒是本地能力，早于联网）。 */
+        esp_err_t err = vc_start_auto();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "cloud round skipped: %s", esp_err_to_name(err));
+        }
+    } else if (src == AUDIO_PLAYER_SRC_MP3_FILE) {
+        /* 整段 MP3 探针路径不涉及半双工状态 */
+        ESP_LOGI(TAG, "mp3 file done");
     }
+    /* AUDIO_PLAYER_SRC_TTS_STREAM：恢复 feed 由 voice_cloud 的附加订阅负责（T2.4-B） */
 }
 
 static void on_afe_event(audio_fe_event_t evt, void *arg)

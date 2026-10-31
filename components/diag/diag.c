@@ -1739,12 +1739,24 @@ static void print_player_stat(void)
            (unsigned)st.mp3.channels, (unsigned)st.mp3.duration_ms,
            (unsigned)st.mp3.skipped_bytes, (unsigned)st.mp3.bad_frames,
            (unsigned)st.mp3.decode_us_avg, (unsigned)st.mp3.decode_us_max);
+    /* T2.4 流式统计行：格式是 tools 与 voice_cloud 的解析契约（逐字对齐契约 §4） */
+    audio_player_stream_stats_t ss;
+    if (audio_player_stream_stats_read(&ss) == ESP_OK) {
+        printf("stream: active=%u fed=%u bytes=%u decoded=%u samples=%u rate=%u ch=%u "
+               "ring_ms=%u high_ms=%u underrun=%u dropped=%u bad=%u first_sound_us=%u dur_ms=%u\n",
+               ss.active ? 1U : 0U, (unsigned)ss.fed_frames, (unsigned)ss.fed_bytes,
+               (unsigned)ss.decoded_frames, (unsigned)ss.decoded_samples, (unsigned)ss.rate,
+               (unsigned)ss.channels, (unsigned)ss.ring_level_ms, (unsigned)ss.ring_high_ms,
+               (unsigned)ss.underruns, (unsigned)ss.dropped_bytes, (unsigned)ss.bad_frames,
+               (unsigned)ss.first_byte_to_sound_us, (unsigned)ss.duration_ms);
+    }
 }
 
 static int cmd_player(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("用法: player stat | reset | mp3 | pcm <off> <n> | load begin | load end | load <base64>\n");
+        printf("用法: player stat | reset | mp3 | pcm <off> <n> | stream [chunk] [gap_ms] | "
+               "stream abort | load begin | load end | load <base64>\n");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1798,6 +1810,67 @@ static int cmd_player(int argc, char **argv)
             return err;
         }
         printf("PLAYERPLAY bytes=%u\n", (unsigned)s_pload_len);
+        return ESP_OK;
+    }
+    if (strcmp(sub, "stream") == 0) {
+        /* 开发期探针（T2.4）：把 player load 上传的 MP3 按 chunk 喂进流式路径，
+         * gap_ms>0 时每块之间暂停，模拟网络抖动/欠载。默认 512 0。 */
+        if (argc > 2 && strcmp(argv[2], "abort") == 0) {
+            esp_err_t err = audio_player_stream_abort();
+            printf("PLAYERSTREAM abort err=%s\n", esp_err_to_name(err));
+            return err;
+        }
+        int chunk = (argc > 2) ? atoi(argv[2]) : 512;
+        int gap_ms = (argc > 3) ? atoi(argv[3]) : 0;
+        if (chunk <= 0 || chunk > 2048 || gap_ms < 0 || gap_ms > 5000) {
+            printf("用法: player stream [chunk_bytes(1~2048)] [gap_ms(0~5000)] | player stream abort\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (!audio_player_mp3_ready()) {
+            printf("MP3 能力不可用（audio_player_init 时 PSRAM 分配失败或 Kconfig 关闭）\n");
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        if (!s_pload_buf || s_pload_len == 0) {
+            printf("没有已加载的 MP3：先 player load begin → 分块 player load <base64> → player load end\n");
+            return ESP_ERR_INVALID_STATE;
+        }
+        esp_err_t err = audio_player_stream_open(1, 24000);
+        if (err != ESP_OK) {
+            printf("PLAYERSTREAM open err=%s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("PLAYERSTREAM open bytes=%u chunk=%d gap_ms=%d\n",
+               (unsigned)s_pload_len, chunk, gap_ms);
+
+        size_t off = 0;
+        uint32_t backpressure = 0;
+        while (off < s_pload_len) {
+            size_t n = s_pload_len - off;
+            if (n > (size_t)chunk) {
+                n = (size_t)chunk;
+            }
+            err = audio_player_stream_write(s_pload_buf + off, n);
+            if (err == ESP_ERR_NO_MEM) {
+                /* ring 满：探针侧等播放消费（真实下行由云端流控），避免整段丢数据 */
+                if (++backpressure > 5000) {
+                    printf("PLAYERSTREAM write backpressure timeout off=%u\n", (unsigned)off);
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            if (err != ESP_OK) {
+                printf("PLAYERSTREAM write off=%u err=%s\n", (unsigned)off, esp_err_to_name(err));
+                break;
+            }
+            off += n;
+            if (gap_ms > 0) {
+                vTaskDelay(pdMS_TO_TICKS(gap_ms));
+            }
+        }
+        err = audio_player_stream_end();
+        printf("PLAYERSTREAM end fed=%u backpressure=%u err=%s\n", (unsigned)off,
+               (unsigned)backpressure, esp_err_to_name(err));
         return ESP_OK;
     }
     if (strcmp(sub, "load") == 0) {
@@ -1932,8 +2005,9 @@ static esp_err_t register_commands(void)
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST
         {
             .command = "player",
-            .help = "MP3 播放探针（T2.3）：player stat | reset | mp3 | load begin|end|<base64>",
-            .hint = "stat|reset|mp3|pcm|load",
+            .help = "播放探针（T2.3/T2.4）：player stat | reset | mp3 | load begin|end|<base64> | "
+                    "stream [chunk] [gap_ms] | stream abort",
+            .hint = "stat|reset|mp3|pcm|load|stream",
             .func = cmd_player,
         },
 #endif

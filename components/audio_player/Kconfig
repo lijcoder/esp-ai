@@ -24,11 +24,38 @@ menu "Audio Player"
     config AUDIO_PLAYER_MP3_PCM_MAX_BYTES
         int "MP3 解码 PCM 缓冲上限（PSRAM，字节）"
         depends on AUDIO_PLAYER_ENABLE_MP3
-        default 1572864
+        default 524288
         range 65536 4194304
         help
-            播放任务解码 MP3 时把整段解成单声道 PCM 放在这块预分配缓冲里
-            （播放任务内禁止 malloc）。1.5MB ≈ 24k 单声道 32s / 44.1k 单声道 17s；
-            超长素材会被拒绝并打 WARN。
+            整段解码路径（audio_player_play_mp3）把整段解成单声道 PCM 放在这块
+            预分配缓冲里（播放任务内禁止 malloc）。T2.4 流式播放不走这里，
+            512KB ≈ 24k 单声道 10.9s；超长整段素材会被拒绝并打 WARN。
+
+    config AUDIO_PLAYER_STREAM_RING_BYTES
+        int "流式播放 PSRAM 压缩数据 ring（字节）"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 65536
+        range 8192 1048576
+        help
+            T2.4 流式播放：voice_cloud 把下行 MP3 字节写入这块 PSRAM ring，
+            player 任务边收边解。64KB ≈ 24k/64kbps 约 8s 缓冲。
+
+    config AUDIO_PLAYER_STREAM_PREROLL_FRAMES
+        int "流式起播最少已解码帧数"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 4
+        range 1 32
+        help
+            解出该帧数就起播（24kHz 单帧 24ms），与 PREROLL_MS 取先到者。
+            首帧到出声 <150ms 是 P2 验收项。
+
+    config AUDIO_PLAYER_STREAM_PREROLL_MS
+        int "流式起播超时（距首个 write，毫秒）"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 120
+        range 10 2000
+        help
+            即使还没解够 PREROLL_FRAMES 帧，距首字节超过该时长也起播，
+            避免弱网/小帧流迟迟不出声。
 
 endmenu

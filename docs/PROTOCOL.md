@@ -183,7 +183,8 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 
 ## 8. 联调工具与已知差异
 
-- `tools/ws_mock_server.py` 实现本文件全部契约；`--self-test` 9 项不需硬件；`--inject-late` 注入迟到帧验证端侧 `sid` 过滤；`--no-tts` / `--scenario error|music` / `--save-upload` 等见 `tools/README.md`。
-- mock 下发的 TTS 二进制是**合成 payload（不可解码的伪 MP3）**，仅用于帧级联调；真实 MP3 播放由 T2.3 用真实素材补。
+- `tools/ws_mock_server.py` 实现本文件全部契约；`--self-test` **13 项**不需硬件（含 TCP_NODELAY 与真实 MP3 帧切分）；`--inject-late` 注入迟到帧验证端侧 `sid` 过滤；`--tts-mp3 <file>` 下发真实 MP3（T2.4）并测流式播放；`--tts-stall-ms/--tts-stall-at` 制造欠载；`--tts-late-bin` 注入窗口外二进制帧；`--no-tts` / `--scenario error|music` / `--save-upload` 等见 `tools/README.md`。
+- 缺省 TTS 二进制仍是**合成 payload（不可解码的伪 MP3）**，仅用于帧级/协议联调；真实 MP3 播放用 `--tts-mp3`（`tools/tts_stream_test.py` 自动生成并下发 24k 单声道素材）。
+- **mock 默认对每条连接开 TCP_NODELAY**（T2.4 定稿）：Nagle + 端侧 delayed ACK 会把 20~30ms 均匀下发的 TTS 帧攒批 ~200ms，端侧流式 ring 被打空造成假欠载。**真实云端同样必须关闭 Nagle**。
 - 公网 `wss://echo.websocket.org/.ws` 之类回显端点**不符合本协议**（不回 `hello_ack`、会把 `hello` 原样回显），只用于 TLS 路径/内存水位验证；端侧对非契约下行文本会 WARN 后忽略，属预期。
 - 端侧上报的 `audio_end` 原因、`vc` 统计等调试信息**不上报文**，只走日志/console，见 `docs/ARCHITECTURE.md` §10.2。

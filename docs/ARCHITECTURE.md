@@ -89,6 +89,8 @@ TTS(MP3) ─┐
 | R4 | 按键打断：任意状态 → 播放通道 100ms 淡出 → 取消云端会话 → 恢复 feed → 回到 `IDLE` |
 | R5 | 恢复 feed 后丢弃最早 50ms 的音频，避免打断瞬间的噪声触发 VAD |
 
+> **T2.4 实现状态**：R1/R2 已用于 TTS 流式播放（`tts_start` → `audio_fe_set_feed_enabled(false)`；完成/打断回调 → 300ms 尾部延时后恢复）；R3–R5 随 T3.2/P4 落地。
+
 ### 3.4 提示音
 
 - 存放在 `assets` 分区（PCM16 / 16k 单声道），启动时加载索引；
@@ -124,7 +126,12 @@ TTS(MP3) ─┐
 - **实现（T2.3 定稿）**：vendored **minimp3**（CC0 单文件，`components/audio_player/third_party/minimp3`，3 处补丁）。解码状态 `mp3dec_t` 6,668 B + 临时区 `mp3dec_scratch_t` 16,256 B + 单帧输出 4,608 B **全部 PSRAM**（内部 RAM 增量 0）；解码在 `player` 任务内串行，不新建任务。输出单声道 PCM（双声道取 (L+R)/2）写入 PSRAM 预分配缓冲（`AUDIO_PLAYER_MP3_PCM_MAX_BYTES`，默认 1.5MB），再走既有「线性重采样 48k → 软件音量 → 淡入淡出 → 限幅 → I2S」。
 - **为什么不是 Helix**：Helix 的 8 个解码结构体实测 23,856 B，且托管组件 `chmorgan/esp-libhelix-mp3` 的 `AllocateBuffers()` 用裸 `malloc`、改不了分配器 → 必然占内部 RAM 并击穿 30KB 水位；minimp3 零 `malloc`，状态只有 6,668 B。与 FFmpeg 逐样本对拍 max|Δ| ≤ 1 LSB（STATUS §5）。
 - **T2.3 边界**：整段解码后播放，同一时刻只允许一段 MP3（解码输出复用同一块 PSRAM 缓冲）；帧参数中途变化（分段流）按截断处理；超长素材（超出 PCM 上限）拒绝并 WARN。
-- **流式播放（T2.4）**：收到首帧后启动解码、边收边解，预缓冲 200ms 数据再出声，防抖动；届时 `mp3_dec_decode_all()` 的帧循环拆成 feed/frame 接口，PCM 缓冲改为小 ring（PSRAM 预分配）。
+- **流式播放（T2.4 定稿；替代旧表述「预缓冲 200ms 再出声」）**：`tts_start` 时 `audio_player_stream_open(1, sr)`，下行 0x02 帧在 `audio_end → tts_end` 窗口内经 PSRAM ring（`AUDIO_PLAYER_STREAM_RING_BYTES`，默认 64KB）交给 `player` 任务边收边解；不新建任务、内部 RAM 增量 0。
+  - **起播门槛**：已解出 `AUDIO_PLAYER_STREAM_PREROLL_FRAMES` 帧（**默认 4 = 96ms**）**或**距首字节 `PREROLL_MS`（120ms），取先到者；此前 I2S TX 不出声。4 帧用于覆盖 I2S DMA 预填（~40ms）后仍留 ~56ms 抗 WiFi/调度抖动（实测 2/3 帧会偶发起播欠载，4 帧后全量 193/193 + heap-only 20 轮 0 欠载）；首声实测 14~29ms，远低于 150ms 目标。
+  - **边收边解**：只把「凑满整帧」的数据交给 minimp3（其在数据不足分支会重置解码器、丢比特池）；跨帧连续线性重采样（游标 + 上一块末样本 carry），帧边界不重复淡入淡出、无缝隙；欠载时补静音继续走 I2S 时钟，每次连续欠载计 1 次 `underruns` 并限频 WARN。
+  - **收尾**：`tts_end` 后先解完 ring 内数据，切 100ms 收尾环线性淡出 → 既有静音冲刷/关 TX → 300ms 尾部延时 → 完成回调（`src=TTS_STREAM`）；abort（cancel/error/断链/新轮次/响应超时）立即关 TX、丢弃 ring、回调 `ok=false`。
+  - **云端要求（T2.4 实测新增）**：服务端必须关闭 Nagle（`TCP_NODELAY`）。Nagle + 端侧 delayed ACK 会把均匀 TTS 帧攒批 ~200ms 再交付，任何预缓冲都会被打穿（mock 已默认开启，真实云端同样必须）。
+  - **整段路径**保留给本地/探针（`audio_player_play_mp3`）；PCM 预分配上限从 1.5MB 下调到 **512KB**（`mp3_test.py` 48/48 仍过）。
 
 ---
 
@@ -157,9 +164,9 @@ TTS(MP3) ─┐
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发；入站回调支持主回调 + 附加订阅（T2.5，业务与 console 观测并存） | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_subscribe()`, `ws_unsubscribe()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
 | `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 回调、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
-| `audio_player` | L2 音频引擎 | 播放引擎：PCM/MP3 播放 + 重采样到 48k + 软件音量 + 淡入淡出（MP3 用 vendored minimp3，解码状态/临时区/PCM 缓冲在 PSRAM，T2.3；多通道/HTTP 随 P3–P4 增加） | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_set_volume()`, `audio_player_stats_read()` |
+| `audio_player` | L2 音频引擎 | 播放引擎：PCM/整段 MP3/**流式 MP3（T2.4）** + 重采样到 48k + 软件音量 + 淡入淡出；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；多通道/HTTP 随 P3–P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_set_volume()`, `audio_player_stats_read()` |
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms，定点实现 + VBR，状态/伪栈在 PSRAM，不建任务） | `enc_open()`, `enc_encode(pcm, samples, out, cap, &out_len)`, `enc_flush()`, `enc_reset()`, `enc_close()`, `enc_stats_read()` |
-| `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发；**不含会话状态机**（归 T3.1 `voice_session`） | `vc_init()`, `vc_start()`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_is_busy()`, `vc_register_cb()`, `vc_stats_read()` |
+| `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发、**下行 0x02 接入 `audio_player` 流式播放 + R1/R2（T2.4）**；**不含会话状态机**（归 T3.1 `voice_session`） | `vc_init()`, `vc_start()`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_is_busy()`, `vc_register_cb()`, `vc_stats_read()` |
 | `music_cloud` | L3 能力 | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
 | `dev_ctrl` | L3 能力 | 按键事件（短按/长按）、LED 状态模式、静音切换 | `dev_init()`, `dev_register_cb()` |
 | `diag` | L3 能力 | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
@@ -279,6 +286,7 @@ esp-ai/
 - 重连退避：1s → 2s → 5s → 10s → 30s（上限），无限重试直到网络恢复；每次重连成功都重发 `hello` 并等 `hello_ack`
 - 鉴权失败（`device_id`/`token` 非法）：服务端以应用关闭码 **4001（device_id）/ 4002（token）** 关闭连接；端侧 ERROR 日志后**不再自动重试**，等 `NET_UP` 或 `ws reconnect` 再试（T1.4 定稿，见 PROTOCOL.md P-5）
 - 传输：线上只用 `wss://`；本地联调可用 `ws://`（由 `CONFIG_AI_WS_URL` 的 scheme 决定是否走 TLS，见 PRODUCT_IDEAS §8 X2 方案 A）；`wss` 建连前要求 SNTP 已对时（§10.1）
+- **服务端必须关闭 Nagle（`TCP_NODELAY`）**：TTS 帧按 20~30ms 均匀下行，Nagle + 端侧 delayed ACK 会把帧攒批 ~200ms 再交付，端侧流式 ring 会被打空（T2.4 实测：mock 未开 NODELAY 时稳态欠载；开启后 0 欠载）。
 
 ### 6.2 二进制帧（音频）
 
@@ -297,6 +305,7 @@ esp-ai/
 
 - `seq`：每端独立、按帧自增（uint16 回绕），由 `transport_ws` 维护，业务层不参与；
 - **帧头不带 `sid`**（T2.5 定稿 P-2）：同一连接内音频帧按 `audio_start → tts_end` 的顺序归属当前轮次。端侧实现只在"已发 `audio_end`、等待响应"的窗口内接收下行 0x02 帧，窗口外的迟到帧（上一轮残留）直接丢弃；`tts_end` 归零该窗口。这样既不扩帧头、也不让跨轮迟到帧混入。
+- **T2.4 端侧实现**：窗口内且未收 `tts_end` 的 0x02 → `audio_player_stream_write()`（单次 ≤2KB、非阻塞；ring 满丢弃整段）；窗口外/`tts_end` 后/播放器未开流/非 mp3/播放器忙 → 丢弃并计入 `vc stat` 的「音频丢弃 N 帧 字节 M」；`tts_end` → `stream_end()`，`vc_cancel`/error/断链/新轮次/响应超时 → `stream_abort()`。
 
 ### 6.3 文本帧（JSON）
 
@@ -333,6 +342,8 @@ esp-ai/
 | 按键打断停声 | < 100ms |
 | 音乐起播（首帧到出声） | < 1.5s |
 | 连续播放卡顿率 | < 0.1% |
+
+> **T2.4 实测（2026-10-31）**：TTS 首帧→出声 **14~29ms**（设备侧：首个 0x02 payload → 首个 I2S 写；prebuffer 96ms 后起播），远低于 150ms；`vc cancel` 打断停声实测 **51~52ms**（P3 的「按键打断 <100ms」在 T3.4/T3.2 的完整交互链路上再收紧）。
 
 ---
 
@@ -433,6 +444,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 > **T2.2 实测（2026-10-31，见 STATUS §5）**：加入 libopus 定点编码器后，静态 DIRAM **196,462 B**；`ws://` 内部堆峰值 208,012 B、最低水位 52,675 B；**wss 握手期峰值 220,784 B、最低水位 39,763 B** → 静态 + 堆峰值 = **417,246 B ≤ 440KB（余 33.3KB）**，最低水位高于 30KB 线 9.7KB。PSRAM 峰值 902,676 B（编码器状态 15,364 + 伪栈 120,000 + 上行 ring 64KB + dump 探针 25,600 等）。
 > **T2.5 实测（2026-10-31，见 STATUS §5）**：加入 `voice_cloud`（`vc` 任务 8KB）后，静态 DIRAM **196,670 B**（+208 B）；`ws://` 内部堆峰值 223,620 B / 最低水位 38,451 B；**wss 握手期（公网 `wss://`）峰值 227,988 B、最低水位 32,339 B、最大块 31,744 B** → 静态 + 堆峰值 = **424,658 B ≤ 440KB（余 25.9KB）**，wss 最低水位高于 30KB 线 2.3KB（预计 ~31KB，实测 32.3KB，符合预期但余量不大）。PSRAM 峰值 902,908 B；`vc` 任务栈 8KB，编码/上行轮次中的历史最低剩余 3,212 B（IDLE 时 7,436 B）。**T2.3/T2.4 加 MP3 解码任务栈与解码缓冲后需再按本口径复核。**
 > **T2.3 实测（2026-10-31，见 STATUS §5）**：加入 minimp3（解码状态/临时区/PCM 缓冲全 PSRAM）后，静态 DIRAM **196,782 B（+112 B）**、`player` 任务栈仍 6KB（MP3 解码后余 3,672 B，补丁把 16.3KB 临时区从栈移到 PSRAM）；`ws://` 内部堆最低水位 36,535 B；**wss 握手期（公网 `wss://echo.websocket.org/.ws`，2 次）峰值 227,552~227,724 B、最低水位 32,471~32,643 B** → 静态 + 堆峰值 = **424,506 B ≤ 440KB（余 26,054 B）**，wss 最低水位高于 30KB 线 2.5~2.6KB。**PSRAM 峰值抬到 2,895,336 B**：MP3 PCM 预分配 1.5MB + 解码状态 27,532 B + `player load` 上传探针 512KB（仅开发期）；常驻（不含上传探针）2,395,008 B。T2.4 改流式后可下调 PCM 预分配。
+> **T2.4 实测（2026-10-31，见 STATUS §5）**：加入流式播放（ring 64KB + stage 6.9KB + 收尾环 9.6KB + ring 读暂存 2KB 全 PSRAM）后，静态 DIRAM **196,998 B（+216 B，全为状态/计数，无新缓冲）**、`player` 栈仍 6KB（流式播放中余 3,544 B）；**wss 握手期（公网 echo，2 次）内部堆峰值 227,432~227,480 B、最低水位 32,671~32,719 B** → 静态 + 堆峰值 = **424,478 B ≤ 440KB（余 26,082 B）**，wss 最低水位高于 30KB 线 **1.95~2.05KB**；**PSRAM 峰值降到 1,446,724 B**（PCM 上限 1.5MB→512KB，常驻不含开发期上传探针）；无新增任务。**注意**：水位余量已不足 2KB，后续任务不得再增加内部 RAM 静态/堆占用。
 
 ### 9.3 任务与核心（确定）
 
@@ -440,10 +452,10 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 |---|---|---|---|---|
 | `afe_feed` | 1 | 8 | 4KB | I2S 读 + AFE feed（实时性最高） |
 | `afe_fetch` | 1 | 6 | 4KB | 唤醒/VAD/上行音频输出 |
-| `player` | 1 | 5 | 6KB | MP3 解码（minimp3，状态/临时区在 PSRAM）+ 重采样 + 混音 + I2S 写 |
+| `player` | 1 | 5 | 6KB | MP3 解码（minimp3，状态/临时区在 PSRAM）+ **流式解码/欠载补静音（T2.4）** + 重采样 + 混音 + I2S 写 |
 | `evt` | 0 | 5 | 4KB | 事件分发（`event_bus` 自建 esp_event 循环，T1.2a 起） |
 | `ws` | 0 | 5 | 6KB | WS 状态机/退避/心跳/发送队列（TLS 收发在库任务 `ws_client`） |
-| `vc` | 0 | 4 | 8KB | 上行 Opus 编码 + 发送、`audio_start/audio_end`、下行事件解析与 `sid` 过滤（T2.5；编码在本任务内串行，伪栈在 PSRAM，见 §3.6） |
+| `vc` | 0 | 4 | 8KB | 上行 Opus 编码 + 发送、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、**下行 0x02 → `audio_player` 流式播放 + R1/R2（T2.4）**（编码在本任务内串行，伪栈在 PSRAM，见 §3.6） |
 | `music_http` | 0 | 4 | 6KB | HTTP 拉流 |
 | `voice_session` | 0 | 4 | 4KB | 状态机事件循环 |
 | `dev` | 0 | 3 | 3KB | 按键扫描 + LED 驱动 |
@@ -483,8 +495,8 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `wifi status` / `wifi reconnect` | 查看/重连 WiFi |
 | `ws status` / `ws reconnect` | WebSocket 观测：状态/脱敏端点/握手与重连计数/心跳 RTT/收发送与丢弃计数/队列水位；主动重连（T1.4 提前交付） |
 | `ws send <json>` / `ws sendbin [len]` / `ws rxlog on\|off` | WebSocket 双向联调探针（T1.6）：原样发送文本/上行二进制帧、打印下行帧（T2.5 起 rxlog 走附加订阅，与 voice_cloud 并存） |
-| `vc status` / `vc start [sid]` / `vc stop` / `vc cancel` / `vc stat` / `vc reset` | 语音云观测与手动起轮（T2.5）：链路状态/sid、轮次与上行帧统计、首帧耗时、下行事件与 `sid` 丢弃计数；手动起一轮、优雅收尾（补尾帧 + audio_end）、立即放弃 |
-| `player stat` / `player reset` / `player mp3` / `player pcm <off> <n>` / `player load begin\|chunk\|<base64>\|end` | MP3 播放探针（T2.3，`CONFIG_DIAG_ENABLE_PLAYER_TEST` 仅开发期）：base64 分块上传素材到 PSRAM、交给播放任务整段解码播放、打印解码/播放统计、取回解码 PCM 供 PC 侧与 FFmpeg 逐样本对拍 |
+| `vc status` / `vc start [sid]` / `vc stop` / `vc cancel` / `vc stat` / `vc reset` | 语音云观测与手动起轮（T2.5/T2.4）：链路状态/sid、轮次与上行帧统计、首帧耗时、下行事件与 `sid` 丢弃计数、**下行音频丢弃帧/字节（窗口外/收尾后/播放器不可用）**；手动起一轮、优雅收尾（补尾帧 + audio_end）、立即放弃（同时打断在播 TTS） |
+| `player stat` / `player reset` / `player mp3` / `player pcm <off> <n>` / `player load begin\|chunk\|<base64>\|end` / `player stream [chunk] [gap_ms]` / `player stream abort` | 播放探针（T2.3/T2.4，`CONFIG_DIAG_ENABLE_PLAYER_TEST` 仅开发期）：base64 分块上传素材到 PSRAM；`player mp3` 整段解码播放；`player stream` 把上传素材按 chunk 喂流式路径（`gap_ms` 制造欠载）、`player stream abort` 打断；`player stat` 追加流式统计行（含 `first_sound_us`/`underrun`/`dur_ms`）；`player pcm` 取回整段解码 PCM 对拍 |
 | `net ping <host>` | 网络连通性 |
 | `mic stat` | 麦克风 RMS/峰值、VAD 状态 |
 | `enc test [ms] [tone\|uplink]` / `enc stat` / `enc dump on\|off` / `enc reset` | 上行 Opus 编码观测（T2.2）：tone=1kHz 正弦、uplink=真实链路（自动排空 ring 积压）；输出帧数/字节/码率/单帧耗时/内存增量；dump 最多 50 帧 hex 供 PC 侧独立解码 |

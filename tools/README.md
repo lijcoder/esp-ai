@@ -276,6 +276,44 @@ PyAV 的 libopus 编码器现场造 1kHz 正弦 Opus 帧（16k/单声道/20ms/16
 
 ---
 
+## mp3_test.py —— 下行 MP3 解码真机自测（T2.3）
+
+一条命令验证"设备能把 MP3 解对、真的从功放放出来"，不需要人工听（听感只作旁证）：
+
+```
+uv run tools/mp3_test.py                       # 默认自动探测串口；会抓一次真实电台流
+uv run tools/mp3_test.py --skip-radio          # 离线：只跑本地生成的两组素材
+uv run tools/mp3_test.py --dry-run             # 只生成素材 + 打印 PyAV 参考值（不碰设备）
+uv run tools/mp3_test.py --repeat 3 --min-peak 1500 --no-reset
+```
+
+**素材**（现生成，不入库）：
+- `24k/mono`：lameenc 编的 1kHz 正弦 4s @32kbps —— 模拟 TTS（服务端契约 24k 单声道）；
+- `44.1k/stereo`：440Hz/880Hz 双声道 4s @128kbps —— 模拟音乐，顺带验证 (L+R)/2 下混；
+- `电台流`：`curl` 抓 `http://lhttp.qingting.fm/live/20210755/64k.mp3` 前 ~4s（44.1k stereo
+  64kbps）；**从流中间接入**，首帧不完整 → 顺带考验同步字搜索与比特池重置。
+
+**流程**：PC 侧 PyAV 独立解码出参考（帧数/样本数/采样率/声道/单声道 PCM）→
+`player load begin` + base64 分块（240 字符/行，串口无流控，最后按总长度校验，不符整段重传）→
+`player load end` → `player mp3` → 等 `PLAYER: mp3 decoded` / `PLAYER: job done` →
+`player stat` 比对统计 → `player pcm <off> <n>` 取回设备解码 PCM 与参考**逐样本**对拍。
+
+**断言口径（48 项）**：
+- 上传字节数 == 素材长度；
+- 设备解码帧数/样本数 == PyAV 参考（电台流允许**少 8 帧**，因从流中间接入/截断）；
+- 采样率、声道数一致；时长误差 ≤1%（电台 ≤5%）；
+- 坏帧 0；干净素材跳过字节 0；单帧解码耗时 < 一帧音频时长（可实时）；
+- 设备 PCM 与 FFmpeg `max|Δ| ≤ 2 LSB`（实测 1）；电台流用 RMS 量级一致兜底；
+- 播放中 `mic stat` 峰值 ≥ `--min-peak`（默认 1000）→ 证明 PCM 真的从功放出来；
+- 重复播放 `--repeat` 次后：`player stat` 计数自洽、内部 RAM 差 ≤8KB、PSRAM 增量 0；
+- 全程无 ERROR/panic（`voice_test.error_lines` 的 TAG 过滤规则）。
+
+**依赖**：`pyserial` / `lameenc`（MP3 编码，本机没有 ffmpeg/lame）/ `av`（PyAV 参考解码）/ `numpy`。
+脚本独占串口（先关 `idf.py monitor`）。设备侧探针由 `CONFIG_DIAG_ENABLE_PLAYER_TEST=y` 提供
+（**仅开发期**：开启后 console 行缓冲 128→1024 B、`player load` 用 512KB PSRAM 上传缓冲；量产必须关闭）。
+
+**边界**：T2.3 是"整段解码后播放"；T2.4 流式播放的首帧延迟/抖动断言留给 `voice_cloud_test.py` 扩展。
+
 ## ws_mock_server.py —— 本地「云端」WS 模拟服务（T1.5）
 
 **作用**：在真实后端就绪前，用一台电脑模拟云端 WebSocket 服务（握手、心跳、事件下发、TTS 音频流），让端侧 T1.4/T1.6 以及 P2–P4 全部能脱机联调（ROADMAP §2.0 P1 顺序 0：可最早启动，端侧不必等后端）。
@@ -390,8 +428,8 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 
 ## 后续（未做）
 
-- `voice_cloud_test.py` 已承接 P2 端到端断言（唤醒 → 上行 Opus → ASR/LLM/TTS → 收尾/中止 + sid 过滤）；后续 T2.3/T2.4 加「下行音频可解码/可出声」断言，P3 起增加会话状态机、半双工、打断断言；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
-- 真实 MP3 素材 + 断言可解码（T2.3/T2.4）。
+- `voice_cloud_test.py` 已承接 P2 端到端断言（唤醒 → 上行 Opus → ASR/LLM/TTS → 收尾/中止 + sid 过滤）；`mp3_test.py` 承接下行解码断言（T2.3 已交付）；T2.4 再给 `voice_cloud_test.py` 加「下行 0x02 帧被解码播放 + 首帧延迟」断言；P3 起增加会话状态机、半双工、打断断言；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
+- 下行流式播放断言（T2.4）：WS 0x02 帧 → 解码 → 出声，含首帧延迟/预缓冲/抖动。
 - HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求），P4（T4.1/T4.2）前补。
 - `wss` + 自签证书（T1.4 决定证书策略后）。
 - 上行 Opus 帧解码校验 → **已交付 `opus_enc_test.py`**（PyAV 独立解码 + 频谱/码率/泄漏断言，见上）；真机联调在 T2.2 固件就绪后由 Lead 通知。

@@ -35,6 +35,7 @@
 - **不要 `source export.sh`**：本机是 EIM 安装方式，PATH 已就绪，source 反而报错。
 - 提交前必须：build 通过 + size 无明显增长。
 - **唤醒别喊话**：测"嗨，乐鑫"用 `afplay tools/lexin.wav`（Mac 扬声器回放、设备麦克风拾音），不需要人工喊；`idf.py -p <PORT> monitor` 侧预期 `APP: wake detected` → `AFE: feed paused` → `PLAYER: play ...` → `APP: prompt done, feed resumed`。**音量按用户定稿：系统音量正常 31%、上限 50%（不得超过；70% 已否决）、`afplay` 默认增益**；`-v` 放大须满足 系统音量×增益 ≤50%（如 31% + `-v 1.5` ≈ 46.5% 可）。用法与注意事项见 `tools/README.md`。
+- **交互语音也回放**：唤醒提示音结束（`feed resumed`）之后用 `afplay tools/今天天气如何.wav` / `afplay tools/今天吃了什么.wav` 模拟用户说话；**自动回归一条命令**：`uv run tools/voice_test.py --volume 50`（覆盖 3 个素材 + 串口断言，音量临时调到上限后自动恢复）。实测与参数见 `tools/README.md`。
 
 ## 4. 铁律（违反会返工，完整版见 CONVENTIONS）
 

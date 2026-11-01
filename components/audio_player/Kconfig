@@ -66,7 +66,7 @@ menu "Audio Player"
         help
             audio_player_fade_out_and_stop() 的默认时长（voice_session 的 R4 打断用它）。
             P3 验收口径是"按键打断 <100ms 停声"：80ms 淡出 + 一块 10ms 输出块 + 事件投递
-            余量，实测 last_stop_ms 应在 80~95ms。改大就必然超线，不要为了听感调大。
+            余量，T3.2/T3.3 真机实测 last_stop_ms 64~84ms。改大就必然超线，不要为了听感调大。
 
     config AUDIO_PLAYER_DUCK_DB
         int "音乐 duck 深度（dB，规则 R3）"
@@ -77,10 +77,12 @@ menu "Audio Player"
             架构定稿 -12dB，约 0.25 倍振幅。
 
     config AUDIO_PLAYER_DUCK_RAMP_MS
-        int "duck 斜坡时长（毫秒）"
+        int "通道增益/duck 斜坡时长（毫秒）"
         range 10 500
         default 100
         help
-            R3 的"100ms 内 duck 到 -12dB"由它保证：q8 增益按该时长线性走到目标。
+            R3 的"100ms 内 duck 到 -12dB"由它保证：CH_MUSIC 的 q16 通道增益按该时长
+            线性走到目标（T3.3 起 duck 是通道增益，不再压整个输出）。仅当目标变化时
+            按本时长重算一次步进（块内逐样本推进），不要改成每块按剩余差重算。
 
 endmenu

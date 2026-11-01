@@ -83,9 +83,9 @@ esp_err_t audio_player_stream_abort(void);
  */
 esp_err_t audio_player_fade_out_and_stop(uint32_t fade_ms);
 
-/* duck（R3）：在用户音量之外叠一个 -CONFIG_AUDIO_PLAYER_DUCK_DB 的增益，
- * 100ms 线性斜坡（不改变 s_volume，会话结束置 false 即恢复原音量）。
- * 非阻塞、任意任务可调用；对随后开始的任务同样生效（直到关掉）。 */
+/* duck（R3，T3.3 语义）：作用于 CH_MUSIC 通道增益（-CONFIG_AUDIO_PLAYER_DUCK_DB，
+ * 默认 -12dB），100ms 线性斜坡；不改 s_volume。语音（TTS/提示音）活跃时也会自动 duck，
+ * 本开关用于探针/强制音乐 duck。非阻塞、任意任务可调用。 */
 void audio_player_set_duck(bool on);
 bool audio_player_get_duck(void);
 

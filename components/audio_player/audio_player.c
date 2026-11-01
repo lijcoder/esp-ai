@@ -52,7 +52,7 @@ static const char *TAG = "PLAYER";
 #define FADE_IN_FRAMES     (AUDIO_IO_SPK_SAMPLE_RATE / 100u) /* 10ms */
 #define FADE_OUT_FRAMES    (AUDIO_IO_SPK_SAMPLE_RATE / 10u)  /* 100ms */
 #define VOL_RAMP_FRAMES    (AUDIO_IO_SPK_SAMPLE_RATE / 50u)  /* 20ms（ARCH §3.5） */
-#define GAIN_RAMP_FRAMES   (AUDIO_IO_SPK_SAMPLE_RATE / 10u)  /* 通道 duck 100ms 斜坡 */
+#define GAIN_RAMP_FRAMES   (CONFIG_AUDIO_PLAYER_DUCK_RAMP_MS * AUDIO_IO_SPK_SAMPLE_RATE / 1000u) /* 通道 duck 斜坡 */
 #define LIMIT_CEIL         29196 /* -1dBFS = 32767 × 10^(-1/20) */
 #define LIMIT_KNEE         26276 /* 0.9×ceiling：以下完全透明，以上压向 ceiling */
 #define LIMIT_SPAN         (LIMIT_CEIL - LIMIT_KNEE)
@@ -148,7 +148,6 @@ static portMUX_TYPE s_mix_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_mix_pump_running; /* 泵循环在跑（含正在启动） */
 static volatile bool s_mix_pump_job;     /* player 任务正持有 PUMP 作业（含收尾冲刷） */
 static volatile bool s_mix_stop_req;
-static int16_t *s_sine_tab; /* PSRAM：256 点正弦表（探针按需分配） */
 
 /* 256 点正弦表 Q15（sin(2πi/256)×32767），用于探针音调；放 rodata 不占内部 RAM */
 static const int16_t s_sine_q15[256] = {
@@ -484,7 +483,10 @@ static void ch_update_end(void)
             if (level == 0) {
                 c->run_active = false;
                 portENTER_CRITICAL(&s_mix_mux);
-                c->req_active = false;
+                /* 新请求（req_gen 变化）不在本轮清掉，交给 ch_sync 下一块重启通道 */
+                if (c->req_gen == c->run_gen) {
+                    c->req_active = false;
+                }
                 portEXIT_CRITICAL(&s_mix_mux);
             } else if (!c->fade_started && level <= FADE_OUT_FRAMES) {
                 c->fade_started = true;
@@ -2010,14 +2012,6 @@ esp_err_t audio_player_mix_tone(audio_player_ch_t ch, uint32_t freq_hz, uint32_t
     if (s_busy && !s_mix_pump_running && !s_mix_pump_job) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!s_sine_tab) {
-        s_sine_tab = heap_caps_malloc(256 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_sine_tab) {
-            return ESP_ERR_NO_MEM;
-        }
-        memcpy(s_sine_tab, s_sine_q15, sizeof(s_sine_q15));
-    }
-
     bool need_enqueue = false;
     portENTER_CRITICAL(&s_mix_mux);
     mix_ch_t *c = &s_ch[ch];

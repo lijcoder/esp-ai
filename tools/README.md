@@ -633,6 +633,8 @@ C1  [ASR] 识别结果: '今天天气如何？'（81 帧 / 音频 1.62s / 推理
 模型查找顺序：`--asr-model-dir` → 环境变量 `MOCK_ASR_MODEL_DIR` → `~/.cache/esp-ai-mock-asr/sensevoice`
 → 复用 `~/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx`（纯数据复用，不 import DSH 代码）。
 
+**真机验收（2026-11-01）**：`uv run tools/voice_cloud_test.py --asr --asr-expect 天气` **55/55 PASS**（连续两次）：mock 识别 `今天天气如何？`，设备 `VC: ASR final` 文本与之一致、非固定文案；上行 201 帧、首帧 23.3ms、内部堆最低 33,875 B。
+
 **限制（测试用途，不追求产品级）**：离线整段识别，没有中间结果（`asr_partial` 取文本前半段）；
 识别失败/设备无声时只 WARN 并回退 `--tts-text`，不打断协议链路；单轮默认最多送 30s 音频
 （`--asr-max-seconds`）；SenseVoice 支持 auto/中/英/粤/日/韩（`--asr-language`）。

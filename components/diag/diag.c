@@ -1842,11 +1842,54 @@ static void print_player_stat(void)
            st.duck_on ? 1 : 0, st.duck_gain_q8, st.out_peak, st.last_stop_ms, st.stop_count);
 }
 
+/* T3.3 三通道混音探针：player mix stat 的输出格式是 tools/mixer_test.py 的解析契约 */
+static void print_mix_stat(void)
+{
+    audio_player_mix_stats_t st;
+    if (audio_player_mix_stats_read(&st) != ESP_OK) {
+        printf("读取混音统计失败\n");
+        return;
+    }
+    uint32_t cap_pos = 0;
+    uint32_t cap_len = 0;
+    if (audio_player_mix_capture_status(&cap_pos, &cap_len) != ESP_OK) {
+        cap_len = 0;
+    }
+    printf("MIXSTAT vol=%u vol_q8=%u vol_target=%u limiter=%u limiter_peak=%u clip=%u "
+           "mix_peak=%u block_max_us=%u cap_len=%u cap_pos=%u\n",
+           (unsigned)st.vol, (unsigned)st.vol_q8, (unsigned)st.vol_target_q8,
+           (unsigned)st.limiter, (unsigned)st.limiter_peak, (unsigned)st.clip,
+           (unsigned)st.mix_peak, (unsigned)st.block_max_us, (unsigned)cap_len,
+           (unsigned)cap_pos);
+    static const char *names[AUDIO_PLAYER_CH_NUM] = {"TTS", "PROMPT", "MUSIC"};
+    for (int i = 0; i < AUDIO_PLAYER_CH_NUM; i++) {
+        const audio_player_ch_stats_t *c = &st.ch[i];
+        printf("MIXCH ch=%s active=%u gain_q8=%u level_ms=%u peak=%u\n", names[i],
+               c->active ? 1U : 0U, (unsigned)c->gain_q8, (unsigned)c->level_ms,
+               (unsigned)c->peak);
+    }
+}
+
+static int mix_ch_from_name(const char *name)
+{
+    if (strcmp(name, "TTS") == 0) {
+        return AUDIO_PLAYER_CH_TTS;
+    }
+    if (strcmp(name, "PROMPT") == 0) {
+        return AUDIO_PLAYER_CH_PROMPT;
+    }
+    if (strcmp(name, "MUSIC") == 0) {
+        return AUDIO_PLAYER_CH_MUSIC;
+    }
+    return -1;
+}
+
 static int cmd_player(int argc, char **argv)
 {
     if (argc < 2) {
         printf("用法: player stat | reset | mp3 | pcm <off> <n> | stream [chunk] [gap_ms] | "
-               "stream abort | duck on|off | stop [ms] | load begin | load end | load <base64>\n");
+               "stream abort | duck on|off | stop [ms] | load begin | load end | load <base64> | "
+               "mix stat|reset|vol|tone|stop|cap|dump\n");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1984,6 +2027,103 @@ static int cmd_player(int argc, char **argv)
                (unsigned)backpressure, esp_err_to_name(err));
         return ESP_OK;
     }
+    if (strcmp(sub, "mix") == 0) {
+        /* T3.3 三通道混音探针：三通道 tone 源 + 抓取输出，供 PC 侧 FFT/幅度/包络对拍 */
+        if (argc < 3) {
+            printf("用法: player mix stat | reset | vol <0~100> | stop | "
+                   "tone <TTS|PROMPT|MUSIC> <freq 100~4000> <ms 50~10000> [amp 100~20000] | "
+                   "cap <1~16384> | dump <off> <n 1~512>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        const char *m = argv[2];
+        if (strcmp(m, "stat") == 0) {
+            print_mix_stat();
+            return ESP_OK;
+        }
+        if (strcmp(m, "reset") == 0) {
+            audio_player_mix_stats_reset();
+            printf("MIXRESET ok=1\n");
+            return ESP_OK;
+        }
+        if (strcmp(m, "vol") == 0) {
+            const int v = (argc > 3) ? atoi(argv[3]) : -1;
+            esp_err_t err = ESP_ERR_INVALID_ARG;
+            if (v >= 0 && v <= 100) {
+                err = audio_player_set_volume((uint8_t)v);
+            }
+            printf("MIXVOL vol=%d err=%s\n", v, esp_err_to_name(err));
+            return err;
+        }
+        if (strcmp(m, "tone") == 0) {
+            if (argc < 6) {
+                printf("用法: player mix tone <TTS|PROMPT|MUSIC> <freq 100~4000> <ms 50~10000> [amp 100~20000]\n");
+                return ESP_ERR_INVALID_ARG;
+            }
+            const int ch = mix_ch_from_name(argv[3]);
+            const int freq = atoi(argv[4]);
+            const int ms = atoi(argv[5]);
+            const int amp = (argc > 6) ? atoi(argv[6]) : 8000;
+            if (ch < 0) {
+                printf("MIXTONE err=通道名必须是 TTS|PROMPT|MUSIC\n");
+                return ESP_ERR_INVALID_ARG;
+            }
+            esp_err_t err = audio_player_mix_tone((audio_player_ch_t)ch, (uint32_t)freq,
+                                                  (uint32_t)ms, (uint32_t)amp);
+            printf("MIXTONE ch=%s freq=%d ms=%d amp=%d err=%s\n", argv[3], freq, ms, amp,
+                   esp_err_to_name(err));
+            return err;
+        }
+        if (strcmp(m, "stop") == 0) {
+            esp_err_t err = audio_player_mix_stop();
+            printf("MIXSTOP ok=%d err=%s\n", (err == ESP_OK) ? 1 : 0, esp_err_to_name(err));
+            return err;
+        }
+        if (strcmp(m, "cap") == 0) {
+            const int frames = (argc > 3) ? atoi(argv[3]) : 0;
+            esp_err_t err = audio_player_mix_capture((uint32_t)frames);
+            printf("MIXCAP armed=%d err=%s\n", frames, esp_err_to_name(err));
+            return err;
+        }
+        if (strcmp(m, "dump") == 0) {
+            const int off = (argc > 3) ? atoi(argv[3]) : 0;
+            const int count = (argc > 4) ? atoi(argv[4]) : 64;
+            if (off < 0 || count <= 0 || count > 512) {
+                printf("用法: player mix dump <off> <count 1~512>\n");
+                return ESP_ERR_INVALID_ARG;
+            }
+            static int16_t tmp[512];
+            esp_err_t err = audio_player_mix_capture_read(tmp, (size_t)off, (size_t)count);
+            if (err != ESP_OK) {
+                printf("MIXCAP err=%s\n", esp_err_to_name(err));
+                return err;
+            }
+            /* 关键：整段 dump 一次 write 输出。逐行 printf 会被并发日志行插进字符流，
+             * 造成 PC 侧解析丢行/拼行（T3.3 真机实测：512 样本偶发只解析到 480）。
+             * 缓冲放 PSRAM（内部 RAM 水位只剩 ~2.8KB，2.8KB 的 BSS 会直接击穿 30KB 线）。 */
+            static char *dump_buf;
+            if (dump_buf == NULL) {
+                dump_buf = heap_caps_malloc(256 + 512 * 4 + 512, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (dump_buf == NULL) {
+                    printf("MIXCAP err=no-mem\n");
+                    return ESP_ERR_NO_MEM;
+                }
+            }
+            const size_t dump_cap = 256 + 512 * 4 + 512;
+            int n = snprintf(dump_buf, dump_cap, "MIXCAP off=%d count=%d\n", off, count);
+            for (int i = 0; i < count; i++) {
+                n += snprintf(dump_buf + n, dump_cap - (size_t)n, "%04x", (uint16_t)tmp[i]);
+                if ((i % 16) == 15 || i == count - 1) {
+                    n += snprintf(dump_buf + n, dump_cap - (size_t)n, "\n");
+                }
+            }
+            n += snprintf(dump_buf + n, dump_cap - (size_t)n, "MIXCAPEND\n");
+            printf("%s", dump_buf);
+            return ESP_OK;
+        }
+        printf("未知 mix 子命令: %s\n", m);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (strcmp(sub, "load") == 0) {
         if (argc < 3) {
             printf("用法: player load begin | load end | load <base64>\n");
@@ -2122,9 +2262,10 @@ static esp_err_t register_commands(void)
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST
         {
             .command = "player",
-            .help = "播放探针（T2.3/T2.4/T3.2）：player stat | reset | mp3 | duck on|off | stop [ms] | load begin|end|<base64> | "
-                    "stream [chunk] [gap_ms] | stream abort",
-            .hint = "stat|reset|mp3|pcm|load|stream|duck|stop",
+            .help = "播放探针（T2.3/T2.4/T3.2/T3.3）：player stat | reset | mp3 | duck on|off | stop [ms] | "
+                    "load begin|end|<base64> | stream [chunk] [gap_ms] | stream abort | "
+                    "mix stat|reset|vol|stop|tone|cap|dump",
+            .hint = "stat|reset|mp3|pcm|load|stream|duck|stop|mix",
             .func = cmd_player,
         },
 #endif

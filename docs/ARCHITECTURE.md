@@ -93,7 +93,7 @@ TTS(MP3) ─┐
 
 > **T3.2 实现状态（2026-11-01）**：
 > - **R1/R2**：提示音与 TTS 统一经原因位仲裁（`hold_mask` 在 `mic stat` 可观测：提示音期 `0x1`、TTS 期 `0x2`、恢复后 `0x0`）；300ms 尾部延时仍在 `audio_player`（PCM 与流式一致），完成回调 → 各自 `release` 自己那一位。
-> - **R4**：`voice_session() → vs_interrupt()`：`audio_player_fade_out_and_stop(80ms)`（输出级线性淡出，`player stat` 的 `last_stop_ms` 实测 79~95ms）→ `vc_interrupt()` 发 `{"t":"interrupt","sid":N}` 并 `vc_cancel()` → `audio_fe_feed_discard_ms(50)` → 回 `IDLE`。播放完成回调以 `ok=false` 上报。淡出期间 `vc_cancel` 的立即 abort 不会截断淡出（`run_stream` 里"有淡出请求时忽略 abort_req"）。按键来源：`APP_EVT_BUTTON`（payload 见 §4.2），`EVT` 驱动在 T3.4 交付；console 用 `vs interrupt` / `evt post BUTTON` 验证。**停声口径**：从按键/命令到输出静音 ≤100ms（80ms 淡出 + 一个 10ms 输出块）。
+> - **R4**：`voice_session() → vs_interrupt()`：`audio_player_fade_out_and_stop(80ms)`（输出级线性淡出，`player stat` 的 `last_stop_ms` 真机实测 64~80ms；80ms 淡出被 10ms 输出块量化，故只设上界 <100ms）→ `vc_interrupt()` 发 `{"t":"interrupt","sid":N}` 并 `vc_cancel()` → `audio_fe_feed_discard_ms(50)` → 回 `IDLE`。播放完成回调以 `ok=false` 上报。淡出期间 `vc_cancel` 的立即 abort 不会截断淡出（`run_stream` 里"有淡出请求时忽略 abort_req"）。按键来源：`APP_EVT_BUTTON`（payload 见 §4.2），`EVT` 驱动在 T3.4 交付；console 用 `vs interrupt` / `evt post BUTTON` 验证。**停声口径**：从按键/命令到输出静音 ≤100ms（80ms 淡出 + 一个 10ms 输出块）。
 > - **R5**：`audio_fe_feed_discard_ms()` 在恢复后把最早 50ms 的麦克风数据喂零并计数（`mic stat` 的 `discard_samples=800`）；只在打断/断链恢复路径使用，正常 TTS 收尾由 R2 的 300ms 覆盖、**不叠加** R5。
 > - **R3**：`audio_player_set_duck(true/false)` 在用户音量之外叠一个 `-12dB`（q8=64）、**100ms 线性斜坡**的增益，port 在输出级（T3.3 混音/限幅接管同一位置）；`player duck on|off` 为探针。**边界与偏差**：音乐源在 P4，且当前播放器是单任务单通道，无法"音乐继续播 + 提示音/TTS 叠加"，因此 T3.2 的唤醒路径是"音乐播放中唤醒**不丢弃** → 麦克风保持开启 → 把音乐淡出（80ms）让出通道 → 提示音 → 会话"；R3 的"duck 后音乐继续播"需要 T3.3 的三通道混音，完整音乐流程（含会话后恢复音乐）归 T4.4。duck 机制本身已用探针在真机验证（`out_peak` 基线 15563 → duck 后 3890 = 0.250 → 恢复 15563）。
 

@@ -639,6 +639,29 @@ C1  [ASR] 识别结果: '今天天气如何？'（81 帧 / 音频 1.62s / 推理
 识别失败/设备无声时只 WARN 并回退 `--tts-text`，不打断协议链路；单轮默认最多送 30s 音频
 （`--asr-max-seconds`）；SenseVoice 支持 auto/中/英/粤/日/韩（`--asr-language`）。
 
+## mock_tts.py —— 本地 TTS 生成 mock 回复音频（Piper，T3.1 测试用）
+
+**作用**：把文字在 PC 侧合成为 **24kHz 单声道 MP3**，交给 `ws_mock_server.py --tts-mp3` 下发，让设备在联调里播放「与文本对应」的真实语音（TTS 链路/音质/时延验收不再只有合成帧或固定 MP3）。
+
+选型 **Piper（rhasspy/piper-voices，VITS，MIT）**：单音色 20~60MB、CPU 实时、许可干净；本工具预置 `zh_CN-huayan-medium`。Kokoro-82M / MeloTTS 试听体积/依赖更大，本项目暂不接入（2026-11-01 决定，先用 Piper，以后再加）。
+
+依赖用 PEP 723 内联声明（`piper-tts`/`lameenc`/`numpy`），`uv run` 即用；模型缓存在 `~/.cache/esp-ai-mock-tts/piper/`（家目录不可写时自动退到 `~/.cache/uv/...` 或临时目录；可用 `--model-dir`/`MOCK_TTS_CACHE` 覆盖）。
+
+```bash
+uv run tools/mock_tts.py --download                                   # 首次准备模型（约 60MB，失败自动换 hf-mirror）
+uv run tools/mock_tts.py --text "今天天气不错，适合出门散步。" --out /tmp/reply.mp3
+printf '好的，我在呢。' | uv run tools/mock_tts.py --speed 1.1 --out /tmp/reply.mp3
+
+# 交给 mock 让设备播
+uv run tools/ws_mock_server.py --tts-mp3 /tmp/reply.mp3 --tts-pace-pct 80
+```
+
+**参数**：`--text`/`--text-file`/stdin、`--out`（默认 `/tmp/mock_tts.mp3`）、`--voice`（默认 `zh_CN-huayan-medium`）、`--speed`（Piper length_scale，>1 更慢，<1 更快）、`--model/--config`（任意 Piper 音色）、`--download`。
+
+**实测（2026-11-01，Mac + 真机）**：`今天天气不错，适合出门散步。` → 2.87s / 24kHz 单声道 / 23,424B / 生成 1.89s；mock `--tts-mp3` 下发 **122 帧**，设备 `tts_start sr=24000` → 播完 → `round done` 正常（Mac 外放与设备扬声器均试听）。首次调用含模型加载约 1.5~2s，之后约 0.9~1.9s/句。
+
+**限制**：预置中文音色只有 `huayan-medium`（换音色用 `--model/--config` 指定 Piper voices 里其它音色）；线性重采样到 24k（测试够用）；情感/口语感一般（比 `macOS say` 清晰，仍偏播报）；长文本单次合成、不流式。
+
 ## 一轮语音的下发时序（`--scenario normal`）
 
 ```
@@ -706,3 +729,4 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 - HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求），P4（T4.1/T4.2）前补。
 - `wss` + 自签证书（T1.4 决定证书策略后）。
 - 上行 Opus 帧解码校验 → **已交付 `opus_enc_test.py`**（PyAV 独立解码 + 频谱/码率/泄漏断言，见上）；真机联调在 T2.2 固件就绪后由 Lead 通知。
+- 本地 TTS 扩展（Kokoro-82M / MeloTTS / CosyVoice 等更高自然度方案）→ **2026-11-01 暂缓**，先用 `mock_tts.py`（Piper）；以后需要再加。

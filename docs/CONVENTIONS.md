@@ -98,6 +98,7 @@ components/<module>/
 - **解析 coredump 必须用崩溃那一刻的 ELF**（`build/esp-ai.elf`，含符号与地址布局）：崩溃后先备份该文件再改代码/重建；要交付或现场测试的固件需把 elf 与 commit 一起归档，否则 coredump 无法还原调用栈。
 - **会话状态机调试（T3.1 起）**：`vs status` 看当前状态/sid/轮次与异常计数；`vs start`/`vs interrupt` 手动起轮/打断；迁移日志 `VS: state A -> B（sid=N，停留 M ms，原因=…）`。唤醒链路日志自 T3.1 起由 `VS` 输出（`VS: wake detected` / `VS: prompt done, feed resumed`），测试脚本正则用 `(?:APP|VS)` 兼容新旧固件。错误路径用 mock 验证：`--scenario error`（云端 error → ERROR）、`--think-ms 12000`（THINKING 10s 超时 → ERROR）。
 - **mock 真 ASR（T3.1 起，测试用）**：`uv run --with av --with numpy --with sherpa-onnx tools/ws_mock_server.py --asr sensevoice` 让 mock 把上行 Opus 帧解码后用本地 SenseVoice 识别（`tools/mock_asr.py`，独立于 DSH；默认假 ASR 路径不装这些依赖）；`uv run tools/mock_asr.py --test <wav>` 可离线验证识别；真机回归用 `uv run tools/voice_cloud_test.py --asr --asr-expect <子串>`。限制：离线整段识别、无中间结果，失败回退 `--tts-text`，只用于测试链路。
+- **mock 本地 TTS（T3.1 起，测试用）**：`uv run tools/mock_tts.py --text "…" --out /tmp/reply.mp3` 用 Piper（MIT，中文音色 60MB，CPU 实时）生成 **24kHz 单声道 MP3**，再 `uv run tools/ws_mock_server.py --tts-mp3 /tmp/reply.mp3` 让设备播真实语音；模型缓存 `~/.cache/esp-ai-mock-tts/piper/`，`--download` 首次准备。更高自然度方案（Kokoro/MeloTTS/CosyVoice）暂缓，先用 Piper。
 
 ## 9. 禁止事项
 

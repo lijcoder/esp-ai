@@ -25,6 +25,15 @@ P2–P4 都能脱机联调，不占端侧排期（ROADMAP §2.0 P1 顺序 0）�
   uv run tools/ws_mock_server.py --tts-mp3 tts.mp3 --tts-stall-ms 600 --tts-stall-at 30
   uv run tools/ws_mock_server.py --tts-mp3 tts.mp3 --tts-late-bin  # 窗口外帧（端侧应丢弃）
 
+T3.1 测试用的「真 ASR」（可选，独立实现见 tools/mock_asr.py，不依赖 DSH）：
+  # 依赖通过 --with 临时装进 uv 环境（脚本自身的 PEP 723 依赖仍只有 websockets）
+  uv run --with av --with numpy --with sherpa-onnx tools/ws_mock_server.py --asr sensevoice
+  # 模型缺失时自动下载（约 239MB；也可先 `uv run tools/mock_asr.py --download`）
+  uv run --with av --with numpy --with sherpa-onnx tools/ws_mock_server.py --asr sensevoice --asr-download
+  开启后：audio_start~audio_end 的上行 Opus 帧会被解码 + 本地 SenseVoice 识别，asr_final.text
+  用真实识别结果；识别失败/无声时回退 `--tts-text`（只 WARN，不打断协议链路）。
+  离线验证识别效果：uv run tools/mock_asr.py --test tools/今天天气如何.wav
+
 传输说明：本地 mock 是 ws://（不加密）；线上契约是 wss://（ARCH §6.1）。
 TLS/证书策略在 T1.4 决定，见 docs/PRODUCT_IDEAS.md §8 X2。
 每条 accept 的连接都开 TCP_NODELAY（关 Nagle）：Nagle + 端侧 delayed ACK 会把均匀发送的
@@ -240,6 +249,13 @@ class Config:
     tts_stall_at: int = 30       # stall 帧序号（0 基）
     tts_late_bin: bool = False   # 每轮 tts_start 前 / tts_end 后各发 1 帧 0x02
     tts_pace_pct: int = 100      # 真实 MP3 发送节奏：帧时长的百分比（100=实时）
+    # ---- T3.1 测试：本地真 ASR（默认关闭，假 ASR 路径保持零额外依赖） ----
+    asr: str = "none"            # none / sensevoice（见 tools/mock_asr.py）
+    asr_model_dir: str = ""      # SenseVoice 模型目录；空则自动找缓存/DSH 缓存
+    asr_download: bool = False   # 模型缺失时下载（约 239MB）
+    asr_threads: int = 2         # ONNX 推理线程数
+    asr_language: str = "auto"   # SenseVoice 语言提示
+    asr_max_seconds: float = 30.0  # 单轮最多送 ASR 的音频时长（超出截断）
     quiet: bool = False          # 自测用：只打 WARN 及以上
     verbose: bool = False        # 打印上行 payload 前 16 字节
 
@@ -265,6 +281,11 @@ class Stats:
     tts_bytes: int = 0
     tts_stalls: int = 0
     late_bins: int = 0
+    # ---- T3.1：真 ASR 统计（--asr 时才有值） ----
+    asr_rounds: int = 0
+    asr_errors: int = 0
+    asr_audio_ms: int = 0
+    asr_infer_ms: int = 0
 
     def summary(self) -> str:
         duration = time.monotonic() - self.started_at
@@ -273,6 +294,11 @@ class Stats:
             extra += f" 窗口外注入 {self.late_bins} 帧"
         if self.tts_stalls:
             extra += f" stall {self.tts_stalls} 次"
+        if self.asr_rounds or self.asr_errors:
+            extra += (
+                f" | ASR {self.asr_rounds} 轮成功/{self.asr_errors} 失败"
+                f"（音频 {self.asr_audio_ms}ms / 推理 {self.asr_infer_ms}ms）"
+            )
         return (
             f"时长 {duration:.1f}s | 上行 {self.frames_up} 帧/{self.bytes_up}B | "
             f"下行 {self.frames_down} 帧/{self.bytes_down}B{extra} | "
@@ -302,6 +328,10 @@ class Session:
         self.close_task: asyncio.Task | None = None
         self.hello_info: dict[str, Any] = {}
         self._upload_dir_ready = False
+        # --asr：本轮上行 Opus payload（audio_start 清空、audio_end 取走送识别）
+        self.up_packets: list[bytes] = []
+        self.up_packet_bytes = 0
+        self.asr_overflow = False
 
     # ---- 日志统一带连接号：多设备联调时能分清是谁说的话 ----
 
@@ -355,6 +385,23 @@ class Session:
             self._log(logging.DEBUG, f"    hex={payload[:16].hex(' ')}")
         if self.cfg.save_upload:
             self._save_uplink(seq, payload)
+        if self.server.asr is not None:
+            self._collect_asr_payload(payload)
+
+    def _collect_asr_payload(self, payload: bytes) -> None:
+        """缓存本轮上行 Opus payload，供 audio_end 后送 ASR（有上限，避免内存失控）。"""
+        max_frames = max(1, int(self.cfg.asr_max_seconds * 1000 / 20))
+        if len(self.up_packets) >= max_frames:
+            if not self.asr_overflow:
+                self.asr_overflow = True
+                self._log(
+                    logging.WARNING,
+                    f"本轮上行超过 ASR 上限（{self.cfg.asr_max_seconds:.0f}s / {max_frames} 帧），"
+                    "超出部分不参与识别",
+                )
+            return
+        self.up_packets.append(payload)
+        self.up_packet_bytes += len(payload)
 
     def _save_uplink(self, seq: int, payload: bytes) -> None:
         try:
@@ -406,6 +453,9 @@ class Session:
             self.sid = sid if _valid_sid(sid) else None
             self.up_seq_expected = None          # 新的一轮重新累计上行 seq
             self.up_round_frames = 0
+            self.up_packets = []
+            self.up_packet_bytes = 0
+            self.asr_overflow = False
             self.stats.voice_sessions += 1
             self._log(logging.INFO, f"<-- audio_start sid={self.sid}")
 
@@ -417,7 +467,10 @@ class Session:
             else:
                 self.sid = sid
             await self._stop_tts("重复的 audio_end")
-            self.tts_task = asyncio.create_task(self._tts_flow())
+            # 取走本轮上行帧（识别在 tts_flow 任务里做，不阻塞 WS 收包/心跳）
+            asr_packets, self.up_packets = self.up_packets, []
+            self.up_packet_bytes = 0
+            self.tts_task = asyncio.create_task(self._tts_flow(asr_packets))
 
         elif event == "interrupt":
             self.stats.interrupts += 1
@@ -530,7 +583,41 @@ class Session:
         if gap_ms > 0:
             await asyncio.sleep(gap_ms / 1000)
 
-    async def _tts_flow(self) -> None:
+    async def _asr_text(self, asr_packets: list[bytes] | None) -> str:
+        """本轮 asr 文本：--asr 时用本地 SenseVoice 真识别，否则用 --tts-text 固定文案。
+
+        识别失败只 WARN 并回退固定文案，保证 mock 的协议链路测试不被 ASR 问题拖垮。
+        推理放在线程里跑（ONNX 是同步阻塞的），不卡 WS 收包与心跳。
+        """
+        if self.server.asr is None:
+            return self.cfg.tts_text
+        packets = asr_packets or []
+        if not packets:
+            self.stats.asr_errors += 1
+            self._log(logging.WARNING, "[ASR] 本轮没有上行音频帧（设备没出声？），回退 --tts-text")
+            return self.cfg.tts_text
+        try:
+            started = time.monotonic()
+            result = await asyncio.to_thread(self.server.asr.transcribe_opus, packets)
+            self.stats.asr_rounds += 1
+            self.stats.asr_audio_ms += int(result["audio_seconds"] * 1000)
+            self.stats.asr_infer_ms += int(result["inference_seconds"] * 1000)
+            self._log(
+                logging.INFO,
+                f"[ASR] 识别结果: {result['text']!r}"
+                f"（{len(packets)} 帧 / 音频 {result['audio_seconds']:.2f}s / "
+                f"推理 {result['inference_seconds']:.2f}s / 总耗时 {time.monotonic() - started:.2f}s）",
+            )
+            if not result["text"]:
+                self._log(logging.WARNING, "[ASR] 未识别到文字，回退 --tts-text")
+                return self.cfg.tts_text
+            return result["text"]
+        except Exception as exc:  # noqa: BLE001 - 单轮识别失败不能拖垮 mock
+            self.stats.asr_errors += 1
+            self._log(logging.WARNING, f"[ASR] 识别失败（回退 --tts-text）：{exc}")
+            return self.cfg.tts_text
+
+    async def _tts_flow(self, asr_packets: list[bytes] | None = None) -> None:
         sid = self.sid
         try:
             if self.cfg.think_ms > 0:
@@ -558,7 +645,7 @@ class Session:
                 )
                 return
 
-            text = self.cfg.tts_text
+            text = await self._asr_text(asr_packets)
             await self._send_json({"t": "asr_partial", "sid": sid, "text": text[: max(1, len(text) // 2)]})
             await self._send_json({"t": "asr_final", "sid": sid, "text": text})
             for offset in range(0, len(text), 5):
@@ -677,9 +764,10 @@ def _process_request(connection: Any, request: Any) -> None:
 
 
 class MockServer:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, asr: Any = None) -> None:
         self.cfg = cfg
         self.port = cfg.port
+        self.asr = asr  # mock_asr.MockAsr 实例（--asr）；None = 固定文案假 ASR
         self._server: Any = None
         self._next_conn = 1
         self.active: dict[int, Session] = {}
@@ -848,6 +936,11 @@ def _print_banner(server: MockServer) -> None:
         f"max_tts_frames={cfg.max_tts_frames} no_tts={cfg.no_tts} drop_pong={cfg.drop_pong}"
         + (f" close_after={cfg.close_after}s" if cfg.close_after else ""),
         _tts_mode_line(server),
+        (
+            f"ASR 模式: {cfg.asr}（本地 SenseVoice，模型 {server.asr.model_dir}；失败回退 --tts-text）"
+            if server.asr is not None
+            else "ASR 模式: 关闭（asr_final 固定用 --tts-text 文案）"
+        ),
         "传输: 每条 accept 连接 TCP_NODELAY=1（关 Nagle；避免 delayed ACK 攒批造成端侧假欠载）",
         "直连 URL（设备端填 CONFIG_AI_WS_URL）：",
     ]
@@ -1436,6 +1529,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drop-pong", action="store_true", help="收到 ping 不回 pong（测端侧超时）")
     parser.add_argument("--close-after", type=float, default=0.0, help=">0 时到点主动断开（测重连）")
     parser.add_argument("--save-upload", default="", help="把上行 payload 落盘到该目录")
+    # ---- T3.1 测试：本地真 ASR（tools/mock_asr.py，独立于 DSH） ----
+    parser.add_argument(
+        "--asr",
+        choices=("none", "sensevoice"),
+        default="none",
+        help="用本地 SenseVoice 识别上行音频（需额外依赖，见模块文档；默认固定文案）",
+    )
+    parser.add_argument("--asr-model-dir", default="", help="SenseVoice 模型目录（含 model.int8.onnx + tokens.txt）")
+    parser.add_argument("--asr-download", action="store_true", help="模型缺失时自动下载（约 239MB）")
+    parser.add_argument("--asr-threads", type=int, default=2, help="ONNX 推理线程数")
+    parser.add_argument(
+        "--asr-language",
+        default="auto",
+        choices=("auto", "zh", "en", "yue", "ja", "ko"),
+        help="SenseVoice 语言提示",
+    )
+    parser.add_argument("--asr-max-seconds", type=float, default=30.0, help="单轮最多送 ASR 的音频秒数")
     # ---- T2.4：真实 MP3 下发（契约 §6） ----
     parser.add_argument(
         "--tts-mp3",
@@ -1499,15 +1609,48 @@ def main(argv: list[str] | None = None) -> int:
         tts_stall_at=args.tts_stall_at,
         tts_late_bin=args.tts_late_bin,
         tts_pace_pct=args.tts_pace_pct,
+        asr=args.asr,
+        asr_model_dir=args.asr_model_dir,
+        asr_download=args.asr_download,
+        asr_threads=args.asr_threads,
+        asr_language=args.asr_language,
+        asr_max_seconds=args.asr_max_seconds,
         quiet=args.self_test,
         verbose=args.verbose,
     )
+    if args.asr_max_seconds <= 0:
+        raise SystemExit(f"--asr-max-seconds 必须 > 0（当前 {args.asr_max_seconds}）")
+    if args.asr_threads < 1:
+        raise SystemExit(f"--asr-threads 必须 >= 1（当前 {args.asr_threads}）")
     _setup_logging(cfg)
 
     if args.self_test:
         return asyncio.run(run_self_test())
 
-    server = MockServer(cfg)
+    asr_backend = None
+    if args.asr != "none":
+        try:
+            import mock_asr  # 同目录模块：自带 PEP 723 依赖，mock 只在 --asr 时依赖它
+        except ImportError as exc:
+            raise SystemExit(
+                f"--asr={args.asr} 需要额外依赖（{exc}）。请改用：\n"
+                "  uv run --with av --with numpy --with sherpa-onnx tools/ws_mock_server.py --asr sensevoice ...\n"
+                "首次使用可先准备模型：uv run tools/mock_asr.py --download（约 239MB，"
+                "或复用 ~/.dsh 下的缓存）"
+            ) from exc
+        try:
+            asr_backend = mock_asr.MockAsr(
+                args.asr_model_dir or None,
+                download=args.asr_download,
+                threads=args.asr_threads,
+                language=args.asr_language,
+                log=lambda message: LOG.info("%s", message),
+            )
+        except RuntimeError as exc:
+            raise SystemExit(f"mock ASR 初始化失败：{exc}") from exc
+        LOG.info("ASR 已启用：asr_final 使用本地 SenseVoice 识别结果")
+
+    server = MockServer(cfg, asr_backend)
     try:
         return asyncio.run(_serve_forever(server))
     except KeyboardInterrupt:

@@ -77,6 +77,11 @@ RE_EVT_TTS_START = re.compile(r"evt trace: TTS_START")
 RE_EVT_TTS_END = re.compile(r"evt trace: TTS_END")
 RE_EVT_VS_STATE = re.compile(r"evt trace: VOICE_STATE_CHANGED")
 
+# 真 ASR（--asr，tools/mock_asr.py）：设备侧 asr_final 文本 + mock 侧识别日志
+RE_ASR_FINAL_TEXT = re.compile(r"VC: ASR final sid=(\d+): (.+)")
+RE_MOCK_ASR_TEXT = re.compile(r"\[ASR\] 识别结果: '([^']*)'")
+ASR_FALLBACK_TEXT = "今天天气不错，我们来试试端云联调。"
+
 # voice_session（T3.1）：状态迁移日志与命令输出
 RE_VS_STATE = re.compile(
     r"VS: state (\w+) -> (\w+)（sid=(\d+)，停留 (\d+) ms，原因=([a-z-]+)）")
@@ -112,9 +117,12 @@ def port_open(port: int) -> bool:
 
 
 class MockServer:
-    def __init__(self, port: int, inject_late: bool = False) -> None:
+    def __init__(self, port: int, inject_late: bool = False, asr: bool = False,
+                 asr_model_dir: str = "") -> None:
         self.port = port
         self.inject_late = inject_late
+        self.asr = asr
+        self.asr_model_dir = asr_model_dir
         self.proc: subprocess.Popen | None = None
         self.owned = False
         self.log_path = os.path.join(tempfile.gettempdir(), f"vc_mock_{port}.log")
@@ -124,10 +132,17 @@ class MockServer:
             print(f"  mock: 端口 {self.port} 已被占用，复用现有服务（跳过 mock 侧断言）")
             return
         log = open(self.log_path, "w", encoding="utf-8", buffering=1)
-        cmd = ["uv", "run", MOCK_SCRIPT,
-               "--host", "0.0.0.0", "--port", str(self.port)]
+        cmd = ["uv", "run"]
+        if self.asr:
+            # mock 的 ASR 依赖不在本脚本的 PEP 723 里：由 uv --with 临时装进 mock 子进程环境
+            cmd += ["--with", "av", "--with", "numpy", "--with", "sherpa-onnx"]
+        cmd += [MOCK_SCRIPT, "--host", "0.0.0.0", "--port", str(self.port)]
         if self.inject_late:
             cmd.append("--inject-late")
+        if self.asr:
+            cmd += ["--asr", "sensevoice"]
+            if self.asr_model_dir:
+                cmd += ["--asr-model-dir", self.asr_model_dir]
         self.proc = subprocess.Popen(
             cmd, stdout=log, stderr=subprocess.STDOUT, cwd=HERE,
         )
@@ -306,7 +321,8 @@ def run(args: argparse.Namespace) -> int:
 
     port = detect_port(args.port)
     print(f"  串口: {port}")
-    mock = MockServer(args.mock_port or DEFAULT_MOCK_PORT, inject_late=args.inject_late)
+    mock = MockServer(args.mock_port or DEFAULT_MOCK_PORT, inject_late=args.inject_late,
+                      asr=args.asr, asr_model_dir=args.asr_model_dir)
     dev: Device | None = None
     mark = 0
     try:
@@ -409,6 +425,28 @@ def run(args: argparse.Namespace) -> int:
                      f"VS 轮次统计：开始 {vst.get('rounds_started')} / 完成 {vst.get('rounds_completed')}")
         result.check(vst.get("rounds_errored") == 0 and vst.get("timeouts") == 0,
                      "VS 无异常/超时轮次")
+
+        # ---- 真 ASR（--asr）：设备 asr_final 的文本应来自本地 SenseVoice 识别 ----
+        if args.asr:
+            if not mock.owned:
+                result.warn("--asr 需要脚本自己拉起 mock（端口被复用），跳过真 ASR 文本断言")
+            else:
+                asr_text = None
+                for line in vs_lines:
+                    m = RE_ASR_FINAL_TEXT.search(line)
+                    if m and int(m.group(1)) == sid_dev:
+                        asr_text = m.group(2).strip()
+                result.check(asr_text is not None and len(asr_text) >= 2,
+                             f"设备收到真 ASR 文本（{asr_text!r}）")
+                mock_match = RE_MOCK_ASR_TEXT.search(mock.text())
+                mock_text = mock_match.group(1).strip() if mock_match else None
+                result.check(mock_text is not None, "mock 侧打印了 SenseVoice 识别结果")
+                result.check(asr_text == mock_text,
+                             f"设备 asr_final 与 mock 识别一致（设备 {asr_text!r} / mock {mock_text!r}）")
+                result.check(asr_text != ASR_FALLBACK_TEXT, "识别文本不是 --tts-text 固定文案")
+                if args.asr_expect:
+                    result.check(args.asr_expect in (asr_text or ""),
+                                 f"识别文本包含期望子串 {args.asr_expect!r}")
 
         # ---- 统计自洽 ----
         st = vc_status(dev)
@@ -537,6 +575,13 @@ def main() -> int:
                         help="本地 mock 端口（需与设备 CONFIG_AI_WS_URL 一致）")
     parser.add_argument("--inject-late", action="store_true",
                         help="让 mock 每轮注入一个 sid+1 的迟到事件，验证端侧 sid 过滤")
+    parser.add_argument("--asr", action="store_true",
+                        help="让 mock 用本地 SenseVoice 做真 ASR：asr_final 文本来自上行音频识别"
+                             "（mock 由脚本以 uv --with 启动，本脚本自身不需要额外依赖）")
+    parser.add_argument("--asr-model-dir", default="",
+                        help="SenseVoice 模型目录（缺省自动找本机缓存）")
+    parser.add_argument("--asr-expect", default="",
+                        help="期望识别文本包含的子串（如 天气；缺省只断言非空且非固定文案）")
     parser.add_argument("--no-mock", action="store_true",
                         help="不启动 mock（已有服务在跑时用；mock 侧断言会跳过）")
     parser.add_argument("--no-reset", action="store_true", help="不复位设备（设备已在跑时用）")
@@ -550,6 +595,8 @@ def main() -> int:
 
     if not 0 <= args.volume <= SYSTEM_VOLUME_MAX:
         raise SystemExit(f"--volume 必须在 0~{SYSTEM_VOLUME_MAX}（用户定稿上限 50%）")
+    if args.asr and args.no_mock:
+        raise SystemExit("--asr 需要脚本自己拉起 mock，不能与 --no-mock 同时使用")
 
     print("===== voice_cloud 端到端自测（T2.5） =====")
     try:

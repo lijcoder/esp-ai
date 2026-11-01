@@ -662,6 +662,23 @@ uv run tools/ws_mock_server.py --tts-mp3 /tmp/reply.mp3 --tts-pace-pct 80
 
 **限制**：预置中文音色只有 `huayan-medium`（换音色用 `--model/--config` 指定 Piper voices 里其它音色）；线性重采样到 24k（测试够用）；情感/口语感一般（比 `macOS say` 清晰，仍偏播报）；长文本单次合成、不流式。
 
+## 回声测试：ASR 识别文本 → Piper 复读（不要固定文案）
+
+`ws_mock_server.py --tts-piper` 把收到的设备语音先 ASR 识别，再把**识别出的文本**用本地 Piper 合成 24kHz MP3 下发；设备会把"它听到的话"复读出来 —— 既验证 ASR 正确性，又验证 TTS/下行播放链路（识别错时复读的也是错字，一听就知道）。
+
+```bash
+# 依赖一次性装进 uv 环境（ASR + TTS 两套）；首次音色缺失加 --tts-piper-download
+uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc \
+  tools/ws_mock_server.py --asr sensevoice --tts-piper
+```
+
+- `--tts-piper` 与 `--tts-mp3` **互斥**；必须同时开 `--asr`（没有识别文本可复读会直接报错）。
+- 设备侧日志：`VC: ASR final sid=1: 今天天气如何？` → 约 1~2s 后 `TTS start sid=1 codec=mp3 sr=24000` → 复读；`round done` 正常。
+- mock 侧日志：`[ASR] 识别结果: '…'` → `[TTS] 复读合成：'…' → N 帧` → `tts 下发完成 frames=N mode=mp3`。
+- 可调：`--tts-piper-voice`（默认 `zh_CN-huayan-medium`）、`--tts-piper-speed`（>1 更慢）、`--tts-piper-model-dir`、`--tts-pace-pct`（默认 100=实时）。
+- **实测（2026-11-01，真机）**：设备说「今天天气如何」→ ASR `今天天气如何？` → Piper 复读（77 帧 / 14,784B / 1.80s 音频）；`audio_end → tts_start` ≈ **1.9s**（ASR 0.31s + Piper 合成 1.38s），设备播完 `round done`；假客户端离线复测同链路端到端 3.38s（63 帧）。
+- **限制**：识别错则复读错（这是刻意的）；合成失败只 WARN 并回退合成帧；Piper 单次合成约 1~2s（首次含模型加载），太长的句子会增加等待（仍 < 设备 10s 响应超时）。
+
 ## 一轮语音的下发时序（`--scenario normal`）
 
 ```
@@ -708,6 +725,9 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 | `--asr-threads N` | 2 | ONNX 推理线程数 |
 | `--asr-language L` | `auto` | `auto/zh/en/yue/ja/ko` |
 | `--asr-max-seconds S` | 30 | 单轮最多送 ASR 的音频秒数（超出部分不参与识别） |
+| `--tts-piper` | 关 | **回声测试**：ASR 识别文本 → 本地 Piper 合成后下发（与 `--tts-mp3` 互斥，需 `--asr`） |
+| `--tts-piper-voice` / `--tts-piper-speed` | `zh_CN-huayan-medium` / 1.0 | Piper 音色与语速（length_scale，>1 更慢） |
+| `--tts-piper-model-dir` / `--tts-piper-download` | 空 / 关 | Piper 音色目录 / 缺失时下载（约 60MB） |
 | `--verbose` | 关 | 打印上行 payload 前 16 字节（库自身的握手 DEBUG 已压到 WARNING） |
 | `--self-test` | — | 进程内自测，不需要硬件 |
 

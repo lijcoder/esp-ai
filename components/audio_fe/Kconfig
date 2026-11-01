@@ -23,4 +23,15 @@ menu "Audio Front-End"
             默认 2000ms → 32768 样本（2.048s，64KB PSRAM）：足够吸收编码/发送
             任务调度抖动，又能把上行时延限制在可接受范围（架构 §6.4 首帧 <200ms）。
 
+
+    config AUDIO_FE_RESUME_DISCARD_MS
+        int "恢复收音后丢弃的最早音频（毫秒，规则 R5）"
+        range 0 200
+        default 50
+        help
+            半双工规则 R5（ARCH §3.3）：打断恢复 feed 后，前 N 毫秒的麦克风数据喂零，
+            避免打断瞬间的功放余响/开关噪声触发 VAD。voice_session 的 R4 打断路径用
+            该值调用 audio_fe_feed_discard_ms()；正常 TTS 收尾走 R2 的 300ms 尾部延时，
+            不使用 R5。
+
 endmenu

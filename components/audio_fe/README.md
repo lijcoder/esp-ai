@@ -19,8 +19,12 @@
 |---|---|
 | `audio_fe_init(cb, arg)` | 加载模型、初始化 AFE，注册事件回调 |
 | `audio_fe_start()` | 创建 feed/fetch 任务并运行 |
-| `audio_fe_set_feed_enabled(bool)` | 暂停/恢复收音（暂停时喂静音，保持时间节奏） |
-| `audio_fe_feed_enabled()` | 查询当前收音状态 |
+| `audio_fe_feed_hold(reason)` | **半双工门控唯一入口（T3.2）**：置原因位（`AUDIO_FE_HOLD_PROMPT/TTS/PROBE`），暂停时喂静音但保持时间节奏 |
+| `audio_fe_feed_release(reason)` | 清原因位；**位图归零才真正恢复收音**（幂等，多路不互相覆盖） |
+| `audio_fe_feed_discard_ms(ms)` | R5：恢复后丢弃最早 N ms 麦克风数据（喂零并计数）；release 前调用，默认 50ms |
+| `audio_fe_feed_stats_read(out)` | 门控统计（holds/releases/hold_mask/discards/discard_samples/last_discard_ms） |
+| `audio_fe_feed_enabled()` | 查询当前是否在收音（位图为 0） |
+| `audio_fe_set_feed_enabled(bool)` | **旧接口/探针兼容**：映射为 `PROBE` 原因位；产品路径禁止使用（见 CONVENTIONS §3） |
 | `audio_fe_wakenet_name()` | 返回已加载的唤醒词模型名 |
 | `audio_fe_stats_read(out)` | 读取统计快照（不清零，任意任务可调用） |
 | `audio_fe_stats_reset()` | 清零统计窗口（帧数/失败数/唤醒数/电平一起清零） |
@@ -55,6 +59,7 @@
 | `AUDIO_FE_MODEL_PARTITION` | `model` | 模型分区标签 |
 | `AUDIO_FE_INPUT_FORMAT` | `M` | 单麦；后续 AEC 实验可改 `MR`/`MMR` |
 | `AUDIO_FE_UPLINK_RING_MS` | `2000` | 上行 PSRAM 环形缓冲深度（ms，0=关闭）；取 2 的幂，默认 32768 样本 / 64KB |
+| `AUDIO_FE_RESUME_DISCARD_MS` | `50` | R5：打断恢复后丢弃最早音频的窗口（ms）；16k 下 50ms = 800 样本 |
 
 ## 关键约束
 
@@ -63,7 +68,9 @@
 - `fetch_with_delay` 的超时参数是 **tick**（与 `audio_io` 的毫秒不同），用于让 fetch 任务能响应退出。
 - 统计口径是**送 AFE 之前的麦克风真实数据**（补零帧不计），暂停收音时仍继续累计 —— 便于区分"麦克风没声"和"AFE 吃静音"；RMS/log 等浮点计算一律在 console 侧，音频任务内只做整数累加。
 - 上行接口是**拉取式**（ring + read），不是回调：编码/发送若放进 `afe_fetch` 会违反 CONVENTIONS §3（音频任务禁止 malloc/网络/阻塞）。
-- `feed` 暂停（R1）时 AFE 吃静音、上行输出也是静音；**不能**用 `audio_fe_set_feed_enabled(false)` 代替 `audio_fe_uplink_stop()`。
+- `feed` 暂停（R1）时 AFE 吃静音、上行输出也是静音；**不能**用门控代替 `audio_fe_uplink_stop()`（门控只停"送 AFE"，不停上行写入接口）。
+- **R1/R2 由原因位仲裁（T3.2）**：提示音（`voice_session` 的 `PROMPT`）与 TTS（`voice_cloud` 的 `TTS`）各持一位，谁都不能靠"后写覆盖"提前开麦；`mic stat` 的 `hold_mask` 是唯一事实来源（提示音期 `0x1`、TTS 期 `0x2`）。
+- R5 丢弃窗口在音频任务里按帧扣减（16k 帧 512 样本），只影响"喂给 AFE 的数据"，麦克风读取与电平统计照常（`mic stat` 仍能看到真实电平）。
 - 上行缓冲分配失败时只降级（WARN + `uplink_start` 返回 `ESP_ERR_NOT_SUPPORTED`），唤醒/提示音不受影响。
 
 ## 依赖
@@ -73,6 +80,7 @@
 ## 后续
 
 - ✅ 唤醒/VAD 改走 `event_bus`（T1.2b，T3.1 完成；业务方 `voice_session`）；
+- ✅ 半双工门控仲裁 + R5 丢弃窗口（T3.2，`ACOUSTIC` 无关；AEC 仍属后续）；
 - 双麦/参考通道支持（`"MMR"`）随硬件升级（见 PRODUCT_IDEAS H1）。
 
 对应架构：[docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) §2、§3.1、§3.3、§4。

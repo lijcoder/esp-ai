@@ -12,8 +12,12 @@
  *      `vc_start(sid)` 交给 voice_cloud；voice_cloud 不再为产品路径自增 sid。
  *   4. **超时策略**：THINKING 的 10s 计时在 voice_cloud 的协议超时里（`VC_RESPONSE_TIMEOUT_MS`），
  *      超时后由 `VC_EVT_ROUND_END(TIMEOUT)` 通知本组件 → ERROR。避免两套计时器互相打架。
- *   5. **R1/R2**：唤醒应答提示音的 R1（暂停收音）在本组件；TTS 播放的 R1/R2 仍在 voice_cloud
- *      （T2.4 已验收，不动）；本组件只在 `STREAM_DONE` 时把 SPEAKING → IDLE。
+ *   5. **R1/R2**：T3.2 起暂停/恢复收音统一走 `audio_fe` 的原因位仲裁
+ *      （PROMPT / TTS 两个 owner，位图归零才真正开麦），提示音与 TTS 不再互相覆盖；
+ *      唤醒提示音 R1/R2 在本组件，TTS 的 R1/R2 在 voice_cloud。
+ *   6. **R4/R5**：`vs_interrupt()`（按键事件或 console）→ player 淡出 → `vc_interrupt()`
+ *      发 interrupt 报文 → 回 IDLE；恢复收音前设 50ms 丢弃窗口（R5）。
+ *   7. **R3**：音乐播放中唤醒不再丢弃，先把音乐淡出让出单输出通道（混音叠加归 T3.3/P4）。
  */
 #include "voice_session.h"
 
@@ -331,8 +335,9 @@ static void vs_on_play_done(audio_player_src_t src, bool ok, void *arg)
         return;
     }
 
-    /* R2：唤醒应答播完恢复收音；日志文案与 T1.2b 之前的 APP 版本保持一致（测试脚本依赖） */
-    audio_fe_set_feed_enabled(true);
+    /* R2：唤醒应答播完恢复收音（T3.2 起走原因位仲裁，release 幂等）；
+     * 日志文案与 T1.2b 之前的 APP 版本保持一致（测试脚本依赖） */
+    audio_fe_feed_release(AUDIO_FE_HOLD_PROMPT);
     ESP_LOGI(TAG, "prompt done, feed resumed");
 
     if (vs_get_state() != VS_STATE_LISTENING) {
@@ -366,13 +371,21 @@ static void vs_on_wake(void)
         ESP_LOGW(TAG, "会话进行中（%s），忽略本次唤醒", vs_state_name(vs_get_state()));
         return;
     }
+    /* R3：音乐/本地长播中唤醒**不丢弃**（麦克风本来就没关）。单输出通道（P4 才有混音）
+     * 下先把音乐淡出、把通道让给提示音/TTS；duck 叠加播放归 T3.3 混音 + T4.4。 */
+    bool music_playing = false;
     if (audio_player_is_busy()) {
-        /* 例：`player mp3` 探针在放本地音频；会话不抢占本地播放 */
-        portENTER_CRITICAL(&s_mux);
-        s_stats.wakes_dropped++;
-        portEXIT_CRITICAL(&s_mux);
-        ESP_LOGW(TAG, "播放器忙（本地播放/上一路未收尾），忽略本次唤醒");
-        return;
+        audio_player_src_t cur = AUDIO_PLAYER_SRC_PCM;
+        if (audio_player_current_src(&cur) && cur == AUDIO_PLAYER_SRC_MP3_FILE) {
+            music_playing = true;
+        } else {
+            /* 提示音/TTS 收尾中：本地会话不插队（避免两路提示音叠在一起） */
+            portENTER_CRITICAL(&s_mux);
+            s_stats.wakes_dropped++;
+            portEXIT_CRITICAL(&s_mux);
+            ESP_LOGW(TAG, "播放器忙（提示音/TTS 收尾），忽略本次唤醒");
+            return;
+        }
     }
 
     uint16_t sid;
@@ -380,11 +393,21 @@ static void vs_on_wake(void)
         return;
     }
 
-    /* R1：应答提示音播放期间暂停收音（与 T2.4 的 TTS R1 语义一致） */
+    if (music_playing) {
+        ESP_LOGW(TAG, "音乐播放中唤醒（R3）：淡出音乐让出输出通道 %d ms（混音叠加归 T3.3/P4）",
+                 CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS);
+        esp_err_t ferr = audio_player_fade_out_and_stop(CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS);
+        if (ferr != ESP_OK) {
+            ESP_LOGW(TAG, "音乐淡出请求失败（%s），提示音将排队等它播完",
+                     esp_err_to_name(ferr));
+        }
+    }
+
+    /* R1：应答提示音播放期间暂停收音（原因位 PROMPT，与 TTS 的 R1 互不覆盖） */
     portENTER_CRITICAL(&s_mux);
     s_prompt_playing = true;
     portEXIT_CRITICAL(&s_mux);
-    audio_fe_set_feed_enabled(false);
+    audio_fe_feed_hold(AUDIO_FE_HOLD_PROMPT);
 
     esp_err_t err = audio_player_play_pcm(prompt_wo_zai_ne_pcm, prompt_wo_zai_ne_samples,
                                           AUDIO_IO_MIC_SAMPLE_RATE);
@@ -393,7 +416,7 @@ static void vs_on_wake(void)
         portENTER_CRITICAL(&s_mux);
         s_prompt_playing = false;
         portEXIT_CRITICAL(&s_mux);
-        audio_fe_set_feed_enabled(true);
+        audio_fe_feed_release(AUDIO_FE_HOLD_PROMPT);
         (void)vs_transition(VS_STATE_LISTENING, VS_STATE_IDLE, VS_REASON_PROMPT_FAILED);
     }
 }
@@ -425,8 +448,24 @@ static void vs_on_app_evt(void *arg, app_evt_t evt, const app_evt_data_t *data)
     case APP_EVT_NET_DOWN:
         vs_on_net_down(data);
         break;
+    case APP_EVT_BUTTON: {
+        /* T3.2 定稿 payload；T3.4 只负责 GPIO 扫描/去抖与投递。
+         * 短按：会话中 = 打断（R4）；IDLE = 开始一轮（ARCH §8.2）。长按归 T3.4 静音。 */
+        const uint8_t action = (data != NULL) ? data->button.action : APP_EVT_BUTTON_SHORT;
+        if (action == APP_EVT_BUTTON_LONG) {
+            ESP_LOGI(TAG, "长按事件（静音功能归 T3.4），忽略");
+            break;
+        }
+        if (vs_get_state() == VS_STATE_IDLE) {
+            ESP_LOGI(TAG, "按键开始对话（IDLE 短按 → LISTENING）");
+            (void)vs_start();
+        } else {
+            (void)vs_interrupt();
+        }
+        break;
+    }
     default:
-        /* VOICE_STATE_CHANGED 是本组件自己投递的；BUTTON 待 T3.4 接线 */
+        /* VOICE_STATE_CHANGED 是本组件自己投递的 */
         break;
     }
 }
@@ -519,8 +558,20 @@ esp_err_t vs_interrupt(void)
     portEXIT_CRITICAL(&s_mux);
     ESP_LOGW(TAG, "打断当前会话（state=%s）", vs_state_name(vs_get_state()));
 
-    /* 打断骨架：立即取消云端轮次（T3.2/T3.4 会补 100ms 淡出与按键来源） */
-    (void)vc_cancel();
+    /* R4：① 播放通道淡出（请求在这里、执行在 player 任务，80ms 见 Kconfig）；
+     *     ② 给云端发 interrupt 报文并作废本轮（vc_interrupt）；
+     *     ③ R5：恢复收音前先置 50ms 丢弃窗口（若提示音/TTS 还压着 PROMPT/TTS 位，
+     *        则由各自完成回调释放后自动开窗）；
+     *     ④ 回 IDLE。提示音/TTS 的 hold 位由播放完成回调释放，这里不抢着释放，
+     *        否则淡出的尾音会被麦克风拾进 AFE。 */
+    if (audio_player_is_busy()) {
+        esp_err_t ferr = audio_player_fade_out_and_stop(CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS);
+        if (ferr != ESP_OK) {
+            ESP_LOGW(TAG, "淡出请求失败（%s），按立即打断处理", esp_err_to_name(ferr));
+        }
+    }
+    audio_fe_feed_discard_ms(CONFIG_AUDIO_FE_RESUME_DISCARD_MS);
+    (void)vc_interrupt();
     vs_abort_to_idle(VS_REASON_INTERRUPT);
     return ESP_OK;
 }

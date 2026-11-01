@@ -25,6 +25,7 @@
 | `vc_start(sid)` / `vc_start_auto()` | 发起一轮（异步）。**产品路径由 `voice_session` 传入它分配的 sid**；`*_auto` 只留给 console 探针与测试脚本（每轮自增，0 保留）。云端未 READY 返回 `ESP_ERR_INVALID_STATE`，调用方按"网络未就绪"降级，**不要重试等待** |
 | `vc_stop()` | 优雅收尾：补 `enc_flush` 尾帧 + 发 `audio_end`（用于调试/按键路径） |
 | `vc_cancel()` | 立即放弃：不补尾帧、不发 `audio_end` |
+| `vc_interrupt()` | **T3.2 R4**：先发 `{"t":"interrupt","sid":N}` 报文，再 `vc_cancel()`；无进行中的轮次时只打日志不发报文。报文发送失败只 WARN（本地照样打断），不等待服务端应答 |
 | `vc_is_busy()` / `vc_get_state()` / `vc_state_name()` / `vc_current_sid()` | 三态观测（`IDLE` / `UPLINK` / `WAIT_RESPONSE`） |
 | `vc_register_cb(cb, arg)` | 业务回调（覆盖语义），与 `event_bus` 事件同时分发；回调在 `ws_client` 任务上下文，**禁止阻塞**，`text` 只在回调内有效。T3.1 起事件枚举增加 `VC_EVT_UPLINK_END`（`code`=收尾原因）与 `VC_EVT_ROUND_END`（`round_end`=`vc_round_end_t`），供 `voice_session` 驱动状态机 |
 | `vc_stats_read()` / `vc_stats_reset()` | 轮次/上行帧/字节/首帧耗时/下行事件/`sid` 丢弃/解析失败/下行音频播放与丢弃等统计（`diag` 的 `vc status` 使用） |
@@ -96,8 +97,9 @@ voice_session（IDLE→LISTENING，提示音播完、sid 已分配）
 6. **文本截断**：event_bus payload 定长 32B，ASR 文本最多 28B（约 9 个汉字）；完整文本在 VC 日志/回调里。
 7. `vc_start*` 是异步的：返回 `ESP_OK` 只表示已受理，真正开轮要看 `vc status` / 日志。
 8. **流式播放的写帧在 `ws_client` 任务上下文**（下行回调里）：`audio_player_stream_write()` 只做 PSRAM ring 拷贝（单次 ≤2KB，非阻塞）；ring 满返回 `ESP_ERR_NO_MEM`，本组件计入「音频丢弃」并限频 WARN，不重试。
-9. **R2 恢复收音靠完成回调，不在 `vc` 任务里做**：`vc_init()` 里 `audio_player_subscribe_done()` 注册一次（附加槽，≤3 个，不要重复注册）；回调在 `player` 任务上下文，只做一次 `audio_fe_set_feed_enabled(true)`，禁止阻塞/耗时。成功、失败、打断都会回调。
-10. **打断是立即关 TX（无淡出）**：`vc_cancel`/云端 error/断链/新轮次/响应超时都调 `audio_player_stream_abort()`；未开流时返回 `ESP_ERR_INVALID_STATE` 按无操作处理，不刷屏。
+9. **R2 恢复收音靠完成回调，不在 `vc` 任务里做**：`vc_init()` 里 `audio_player_subscribe_done()` 注册一次（附加槽，≤3 个，不要重复注册）；回调在 `player` 任务上下文，只做 `audio_fe_feed_release(AUDIO_FE_HOLD_TTS)`（T3.2 起走原因位仲裁；`AUDIO_FE_HOLD_TTS=1<<1`），禁止阻塞/耗时。成功、失败、打断都会回调。
+10. **打断分层（T3.2）**：`vc_cancel`/云端 error/断链/新轮次/响应超时仍走 `audio_player_stream_abort()`（立即关 TX，无淡出）；**按键打断（R4）走 `vc_interrupt()`**：先由 `voice_session` 请求 `audio_player_fade_out_and_stop(80ms)`，再发 `interrupt` 报文 + `vc_cancel`；此时 `run_stream` 会忽略 `abort_req`，等淡出走完再按 `ABORT` 收尾（否则 80ms 淡出会变成硬切）。
+11. **R1 走原因位**：`tts_start` 开流成功后 `audio_fe_feed_hold(AUDIO_FE_HOLD_TTS)`，恢复由第 9 条的回调负责；与提示音的 `PROMPT` 位互不覆盖（ARCH §3.3 门控仲裁）。
 11. **VAD 静音仍用 `audio_fe_stats_read().vad_active` 轮询**（50Hz）：T1.2b 已把 VAD 事件接到 event_bus，但本组件在 `vc` 任务里需要一个同步快照判"连续静音"，轮询成本可忽略；改为事件驱动留待后续按需优化。
 
 ## 真机验收（T2.5，2026-10-31）
@@ -146,5 +148,5 @@ voice_session（IDLE→LISTENING，提示音播完、sid 已分配）
 ## 后续
 
 - 错误提示音（T3.6）接入后，ERROR 状态的停留时长改为提示音时长（`CONFIG_VS_ERROR_HOLD_MS`）；
-- 按键打断（T3.2/T3.4）改为 R4 完整路径（100ms 淡出 + interrupt 报文 + 50ms 丢弃）；
+- ✅ 按键打断 R4（T3.2：80ms 淡出 + `interrupt` 报文 + 恢复后丢弃 50ms；按键来源与完整语义仍归 T3.4）；
 - 如需进一步降 CPU，可把 VAD 静音判定改为事件驱动（T1.2b 已具备事件源）。

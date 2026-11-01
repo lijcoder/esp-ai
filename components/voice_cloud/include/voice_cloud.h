@@ -131,6 +131,14 @@ esp_err_t vc_stop(void);
 /* 立即放弃当前轮次（不补尾帧、不发 audio_end）；打断/断网路径用 */
 esp_err_t vc_cancel(void);
 
+/**
+ * @brief 按键打断（T3.2 R4）：先发 `interrupt{sid}` 报文，再 vc_cancel() 作废本轮
+ *
+ * 报文发送失败只记 WARN（本地仍然立即打断）；不等待服务端应答。
+ * 在任意任务/回调上下文调用，非阻塞（发送走 transport_ws 的非阻塞队列）。
+ */
+esp_err_t vc_interrupt(void);
+
 /* 是否有一轮在进行（UPLINK 或 WAIT_RESPONSE） */
 bool vc_is_busy(void);
 

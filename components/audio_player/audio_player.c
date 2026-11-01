@@ -18,6 +18,7 @@
 
 #include "audio_player.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "audio_io.h"
@@ -89,6 +90,32 @@ static audio_player_stats_t s_stats;
 /* 最近一次 MP3 解码结果（PCM 指向 decoder_mp3 的静态 PSRAM 缓冲，仅探针对拍用） */
 static const int16_t *s_last_mp3_pcm;
 static size_t s_last_mp3_samples;
+
+/* ---------------- T3.2：打断淡出（R4）+ duck（R3）+ 输出观测 ----------------
+ *
+ * 为什么放在输出级而不是各播放循环里：PCM/MP3/流式三条路径最终都写 I2S，
+ * 在这一层统一做"增益斜坡"最不容易漏，T3.3 的混音/限幅也接在这里。
+ * 线程模型：请求方（evt/console 任务）只写 total/left + 记录时间戳；
+ * 递减与停播判断全部在 player 任务里，临界区只在每 10ms 块首尾各一次。
+ */
+#define PEAK_RING_LEN 32 /* 32 × 10ms = 320ms 输出峰值窗口 */
+
+static portMUX_TYPE s_stop_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_stop_total_frames; /* 淡出总帧数；0 = 无请求 */
+static volatile uint32_t s_stop_left_frames;  /* 剩余淡出帧数（player 任务递减） */
+static int64_t s_stop_req_us;                 /* 淡出请求时刻（player 任务读） */
+static uint32_t s_last_stop_ms;               /* 请求 → 输出静音（ms） */
+static uint32_t s_stop_count;                 /* 淡出停止次数 */
+
+static volatile bool s_duck_on;
+static volatile uint32_t s_duck_gain_q8 = 256; /* 当前 duck 增益（player 任务写） */
+static uint32_t s_duck_target_q8 = 64;         /* -12dB ≈ 64/256，init 里按 Kconfig 算 */
+static uint32_t s_duck_step_frames = 1;        /* 每多少帧走 1 个 q8 步进 */
+static uint32_t s_duck_step_cnt;
+
+static volatile uint32_t s_cur_src; /* 正在播的 audio_player_src_t（忙时有效） */
+static uint32_t s_peak_ring[PEAK_RING_LEN];
+static uint32_t s_peak_idx;
 
 /* ---------------- 流式状态（T2.4） ---------------- */
 static uint8_t *s_ring;        /* PSRAM：下行压缩数据 ring */
@@ -165,8 +192,87 @@ static void tx_flush_and_disable(int16_t *out)
     audio_io_spk_enable(false);
 }
 
-/* 把一段源采样率单声道 PCM 播完：线性重采样到 48k + 音量 + 淡入淡出 + 限幅 */
-static void play_block(const int16_t *pcm, size_t samples, uint32_t rate, int16_t *out)
+/*
+ * 输出级统一增益：duck 斜坡 + 打断淡出 + 输出峰值统计。
+ * 返回 true 表示淡出已到 0（本块已完全静音），调用方应立刻停播。
+ * 只允许在 player 任务上下文调用。
+ */
+static bool out_process(int16_t *out, uint32_t frames)
+{
+    uint32_t total;
+    uint32_t left;
+
+    portENTER_CRITICAL(&s_stop_mux);
+    total = s_stop_total_frames;
+    left = s_stop_left_frames;
+    portEXIT_CRITICAL(&s_stop_mux);
+
+    if (total > 0 && left == 0) {
+        memset(out, 0, (size_t)frames * 2 * sizeof(int16_t)); /* 兜底：淡完后不再放出任何声音 */
+        return true;
+    }
+
+    const uint32_t target = s_duck_on ? s_duck_target_q8 : 256u;
+    uint32_t peak = 0;
+    bool fade_done = false;
+
+    for (uint32_t i = 0; i < frames; i++) {
+        /* duck 斜坡：每 s_duck_step_frames 帧走 1 个 q8 步进（≈DUCK_RAMP_MS 到目标） */
+        if (s_duck_gain_q8 != target) {
+            if (++s_duck_step_cnt >= s_duck_step_frames) {
+                s_duck_step_cnt = 0;
+                if (s_duck_gain_q8 < target) {
+                    s_duck_gain_q8++;
+                } else {
+                    s_duck_gain_q8--;
+                }
+            }
+        }
+        int32_t gain = (int32_t)s_duck_gain_q8;
+        if (left > 0) {
+            gain = gain * (int32_t)left / (int32_t)total;
+            left--;
+            if (left == 0) {
+                fade_done = true;
+            }
+        }
+
+        int32_t l = (int32_t)out[i * 2] * gain / 256;
+        if (l > 32767) {
+            l = 32767;
+        } else if (l < -32768) {
+            l = -32768;
+        }
+        out[i * 2] = (int16_t)l;
+        out[i * 2 + 1] = (int16_t)l;
+
+        uint32_t a = (l < 0) ? (uint32_t)(-l) : (uint32_t)l;
+        if (a > peak) {
+            peak = a;
+        }
+    }
+
+    portENTER_CRITICAL(&s_stop_mux);
+    if (total > 0) {
+        s_stop_left_frames = left;
+    }
+    s_peak_ring[s_peak_idx] = peak;
+    s_peak_idx = (s_peak_idx + 1) % PEAK_RING_LEN;
+    if (fade_done && total > 0) {
+        s_last_stop_ms = (uint32_t)((esp_timer_get_time() - s_stop_req_us) / 1000);
+        s_stop_count++;
+        s_stop_total_frames = 0;
+        s_stop_left_frames = 0;
+    }
+    portEXIT_CRITICAL(&s_stop_mux);
+
+    return fade_done;
+}
+
+/* 把一段源采样率单声道 PCM 播完：线性重采样到 48k + 音量 + 淡入淡出 + 限幅。
+ * aborted=true 表示被 audio_player_fade_out_and_stop() 打断（R4）。 */
+static void play_block(const int16_t *pcm, size_t samples, uint32_t rate, int16_t *out,
+                       bool *aborted)
 {
     const uint32_t total_out = (uint32_t)((uint64_t)samples * AUDIO_IO_SPK_SAMPLE_RATE / rate);
     const uint32_t fade_in = total_out < FADE_IN_FRAMES ? total_out : FADE_IN_FRAMES;
@@ -214,18 +320,25 @@ static void play_block(const int16_t *pcm, size_t samples, uint32_t rate, int16_
             out[i * 2 + 1] = (int16_t)v;
         }
 
+        /* 输出级增益（duck/打断淡出/峰值统计）必须在写 I2S 之前 */
+        const bool fade_done = out_process(out, n);
+
         if (audio_io_write_spk(out, n, 100) < 0) {
             ESP_LOGW(TAG, "spk write failed");
             break;
         }
         produced += n;
+        if (fade_done) {
+            *aborted = true;
+            break;
+        }
     }
 
     tx_flush_and_disable(out);
 }
 
 /* 执行一个播放任务；PCM 直接播，MP3 先解码再播（都在播放任务上下文） */
-static void run_job(const play_job_t *job, int16_t *out, bool *ok)
+static void run_job(const play_job_t *job, int16_t *out, bool *ok, bool *aborted)
 {
     const int16_t *pcm = job->pcm;
     size_t samples = job->samples;
@@ -257,7 +370,7 @@ static void run_job(const play_job_t *job, int16_t *out, bool *ok)
     }
 
     if (decoded) {
-        play_block(pcm, samples, rate, out);
+        play_block(pcm, samples, rate, out, aborted);
         portENTER_CRITICAL(&s_stats_mux);
         s_stats.jobs_done++;
         if (job->kind == PLAY_JOB_MP3) {
@@ -486,7 +599,7 @@ static esp_err_t stream_render_chunk(stream_ctx_t *c)
 
 /* 收尾阶段：把剩余源音频解码进 100ms 环，最后一环线性淡出到 0。
  * 返回 true 表示收尾完成（环已排空且解码器无更多数据）。 */
-static bool stream_end_step(stream_ctx_t *c)
+static bool stream_end_step(stream_ctx_t *c, bool *aborted)
 {
     while (c->end_len < STREAM_END_RING_SAMPLES) {
         int16_t v;
@@ -534,8 +647,14 @@ static bool stream_end_step(stream_ctx_t *c)
     c->end_rd = (c->end_rd + n) % STREAM_END_RING_SAMPLES;
     c->end_len -= n;
 
+    /* T3.2：收尾阶段也可能被按键打断（R4），同样走输出级淡出 */
+    const bool fade_done = out_process(c->out, OUT_FRAMES_CHUNK);
     if (audio_io_write_spk(c->out, OUT_FRAMES_CHUNK, 100) < 0) {
         ESP_LOGW(TAG, "spk write failed (stream end)");
+    }
+    if (fade_done) {
+        *aborted = true;
+        return true;
     }
     return c->decoder_done && c->end_len == 0;
 }
@@ -570,12 +689,18 @@ static stream_result_t run_stream(int16_t *out)
 
     stream_result_t result = STREAM_RESULT_OK;
     bool started = false;
+    bool fade_aborted = false;
 
     /* ---- 1. 预缓冲：已解出 ≥PREROLL_FRAMES 帧 或 距首字节 ≥PREROLL_MS（取先到者） ---- */
     esp_err_t pre_err = ESP_OK;
     bool preroll_done = false;
     for (;;) {
         if (s_stream_abort_req) {
+            result = STREAM_RESULT_ABORT;
+            goto finish;
+        }
+        /* T3.2：起播前就收到 R4 淡出请求（还没出声）→ 直接按打断收尾，无需淡出 */
+        if (s_stop_total_frames != 0) {
             result = STREAM_RESULT_ABORT;
             goto finish;
         }
@@ -646,7 +771,9 @@ static stream_result_t run_stream(int16_t *out)
 
     /* ---- 3. 边收边解：欠载补静音；end 后剩余 ≤100ms 切收尾环 ---- */
     for (;;) {
-        if (s_stream_abort_req) {
+        /* R4：已有淡出请求时，vc_cancel 的立即 abort 不得截断淡出（否则"100ms 淡出"变成硬切）；
+         * 淡出自身走完就是 ABORT 收尾。 */
+        if (s_stream_abort_req && s_stop_total_frames == 0) {
             result = STREAM_RESULT_ABORT;
             goto finish;
         }
@@ -670,7 +797,10 @@ static stream_result_t run_stream(int16_t *out)
         }
 
         if (ctx.end_phase) {
-            if (stream_end_step(&ctx)) {
+            if (stream_end_step(&ctx, &fade_aborted)) {
+                if (fade_aborted) {
+                    result = STREAM_RESULT_ABORT;
+                }
                 break;
             }
             continue;
@@ -699,9 +829,15 @@ static stream_result_t run_stream(int16_t *out)
             ctx.in_underrun = false;
         }
 
+        /* 输出级增益（duck/打断淡出/峰值）在写 I2S 之前；淡完立刻按打断收尾 */
+        const bool fade_done = out_process(out, OUT_FRAMES_CHUNK);
         if (audio_io_write_spk(out, OUT_FRAMES_CHUNK, 100) < 0) {
             ESP_LOGW(TAG, "spk write failed (stream)");
             result = STREAM_RESULT_FAIL;
+            break;
+        }
+        if (fade_done) {
+            result = STREAM_RESULT_ABORT;
             break;
         }
     }
@@ -789,16 +925,31 @@ static void player_task(void *arg)
         const int64_t t0 = esp_timer_get_time();
         audio_player_src_t src = AUDIO_PLAYER_SRC_PCM;
         bool ok = true;
-        bool tail_delay = true;
+        bool aborted = false;
+
+        /* 新任务开始：清上一次的淡出请求（R4 请求只对当次播放生效） */
+        portENTER_CRITICAL(&s_stop_mux);
+        s_stop_total_frames = 0;
+        s_stop_left_frames = 0;
+        portEXIT_CRITICAL(&s_stop_mux);
 
         if (job.kind == PLAY_JOB_STREAM) {
             src = AUDIO_PLAYER_SRC_TTS_STREAM;
-            const stream_result_t r = run_stream(out);
-            ok = (r == STREAM_RESULT_OK);
-            tail_delay = ok;
         } else {
             src = (job.kind == PLAY_JOB_MP3) ? AUDIO_PLAYER_SRC_MP3_FILE : AUDIO_PLAYER_SRC_PCM;
-            run_job(&job, out, &ok);
+        }
+        s_cur_src = (uint32_t)src;
+
+        if (job.kind == PLAY_JOB_STREAM) {
+            const stream_result_t r = run_stream(out);
+            ok = (r == STREAM_RESULT_OK);
+            aborted = (r == STREAM_RESULT_ABORT);
+        } else {
+            run_job(&job, out, &ok, &aborted);
+        }
+
+        if (aborted) {
+            ok = false; /* 被打断的播放不算成功（R4：回调 ok=false） */
         }
 
         const uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
@@ -807,8 +958,9 @@ static void player_task(void *arg)
         portEXIT_CRITICAL(&s_stats_mux);
         ESP_LOGI(TAG, "job done (%u ms)", (unsigned)elapsed_ms);
 
-        /* 尾部延时后再通知完成（半双工恢复 feed 用，见架构 R2）；打断/失败不延时 */
-        if (tail_delay) {
+        /* 尾部延时后再通知完成（半双工恢复 feed 用，见架构 R2）；
+         * 打断（R4 淡出/abort）与失败不延时，让 feed 恢复/状态机尽快收尾 */
+        if (ok && !aborted) {
             vTaskDelay(pdMS_TO_TICKS(CONFIG_AUDIO_PLAYER_TAIL_DELAY_MS));
         }
         s_busy = false;
@@ -870,6 +1022,23 @@ esp_err_t audio_player_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /* T3.2：duck 目标增益与斜坡步长（powf 只在初始化跑一次） */
+    {
+        const double lin = pow(10.0, -(double)CONFIG_AUDIO_PLAYER_DUCK_DB / 20.0);
+        uint32_t target = (uint32_t)(256.0 * lin + 0.5);
+        if (target > 256) {
+            target = 256;
+        }
+        s_duck_target_q8 = target;
+        const uint32_t diff = 256u - target;
+        const uint32_t ramp_frames = (uint32_t)CONFIG_AUDIO_PLAYER_DUCK_RAMP_MS *
+                                     AUDIO_IO_SPK_SAMPLE_RATE / 1000u;
+        s_duck_step_frames = diff ? (ramp_frames / diff) : 1u;
+        if (s_duck_step_frames == 0) {
+            s_duck_step_frames = 1;
+        }
+    }
+
     BaseType_t ok = xTaskCreatePinnedToCore(player_task, "player", PLAYER_TASK_STACK, NULL,
                                             PLAYER_TASK_PRIO, &s_task, PLAYER_CORE);
     if (ok != pdPASS) {
@@ -878,8 +1047,9 @@ esp_err_t audio_player_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "ready: out=%d Hz, vol=%u, mp3=%s", AUDIO_IO_SPK_SAMPLE_RATE,
-             (unsigned)s_volume, audio_player_mp3_ready() ? "on" : "off");
+    ESP_LOGI(TAG, "ready: out=%d Hz, vol=%u, mp3=%s, duck=%u q8/%u ms", AUDIO_IO_SPK_SAMPLE_RATE,
+             (unsigned)s_volume, audio_player_mp3_ready() ? "on" : "off",
+             (unsigned)s_duck_target_q8, (unsigned)CONFIG_AUDIO_PLAYER_DUCK_RAMP_MS);
     return ESP_OK;
 }
 
@@ -1123,6 +1293,58 @@ esp_err_t audio_player_stream_abort(void)
     return ESP_OK;
 }
 
+/* ---------------- 半双工打断与 duck（T3.2，R4/R3） ---------------- */
+
+esp_err_t audio_player_fade_out_and_stop(uint32_t fade_ms)
+{
+    if (!s_busy) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (fade_ms == 0) {
+        fade_ms = 1;
+    }
+    const uint32_t frames = fade_ms * AUDIO_IO_SPK_SAMPLE_RATE / 1000u;
+
+    portENTER_CRITICAL(&s_stop_mux);
+    if (s_stop_total_frames != 0) {
+        portEXIT_CRITICAL(&s_stop_mux);
+        return ESP_OK; /* 已有淡出请求：不延长/不重复 */
+    }
+    s_stop_total_frames = frames;
+    s_stop_left_frames = frames;
+    s_stop_req_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_stop_mux);
+
+    ESP_LOGW(TAG, "fade out %u ms → stop", (unsigned)fade_ms);
+    return ESP_OK;
+}
+
+void audio_player_set_duck(bool on)
+{
+    if (s_duck_on == on) {
+        return;
+    }
+    s_duck_on = on;
+    ESP_LOGI(TAG, "duck %s (target %u q8)", on ? "on" : "off",
+             (unsigned)(on ? s_duck_target_q8 : 256u));
+}
+
+bool audio_player_get_duck(void)
+{
+    return s_duck_on;
+}
+
+bool audio_player_current_src(audio_player_src_t *out)
+{
+    if (!s_busy) {
+        return false;
+    }
+    if (out != NULL) {
+        *out = (audio_player_src_t)s_cur_src;
+    }
+    return true;
+}
+
 bool audio_player_stream_active(void)
 {
     return s_stream_active;
@@ -1173,6 +1395,21 @@ esp_err_t audio_player_stats_read(audio_player_stats_t *out)
     portENTER_CRITICAL(&s_stats_mux);
     *out = s_stats;
     portEXIT_CRITICAL(&s_stats_mux);
+
+    portENTER_CRITICAL(&s_stop_mux);
+    out->stop_count = s_stop_count;
+    out->last_stop_ms = s_last_stop_ms;
+    uint32_t peak = 0;
+    for (uint32_t i = 0; i < PEAK_RING_LEN; i++) {
+        if (s_peak_ring[i] > peak) {
+            peak = s_peak_ring[i];
+        }
+    }
+    out->out_peak = peak;
+    portEXIT_CRITICAL(&s_stop_mux);
+
+    out->duck_on = s_duck_on;
+    out->duck_gain_q8 = s_duck_gain_q8;
     return ESP_OK;
 }
 
@@ -1188,6 +1425,14 @@ void audio_player_stats_reset(void)
     s_stream_ring_high_bytes = s_stream_wr - s_stream_rd;
     s_stream_stats.active = s_stream_active;
     portEXIT_CRITICAL(&s_stream_mux);
+
+    /* T3.2：输出峰值窗口与打断统计一起清零（不影响 duck 开关/淡出请求） */
+    portENTER_CRITICAL(&s_stop_mux);
+    memset(s_peak_ring, 0, sizeof(s_peak_ring));
+    s_peak_idx = 0;
+    s_stop_count = 0;
+    s_last_stop_ms = 0;
+    portEXIT_CRITICAL(&s_stop_mux);
 }
 
 esp_err_t audio_player_set_volume(uint8_t volume)

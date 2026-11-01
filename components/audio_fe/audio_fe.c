@@ -28,9 +28,22 @@ static esp_afe_sr_data_t *s_afe_data = NULL;
 static audio_fe_cb_t s_cb = NULL;
 static void *s_cb_arg = NULL;
 static volatile bool s_running = false;
-static volatile bool s_feed_enabled = true;
 static char s_wn_name[32] = {0};
 static bool s_fetch_chunk_logged; /* 只在 fetch 任务里读写，单线程无需保护 */
+
+/* ---- 半双工门控仲裁（T3.2，R1/R2/R5） ----
+ * 位图 = "谁要求暂停收音"；归零才真正恢复。所有字段由 s_feed_mux 保护：
+ * 写入方是业务任务（evt/ws_client/player 回调/console），读取方是 feed 任务（每 32ms）。
+ */
+static portMUX_TYPE s_feed_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_feed_hold_mask;      /* 当前原因位图（0 = 收音中） */
+static volatile uint32_t s_feed_discard_left;   /* 恢复后还要喂零的样本数（R5） */
+static uint32_t s_feed_discard_pending_ms;      /* 下次恢复时生效的丢弃窗口（ms） */
+static uint32_t s_feed_holds;                   /* hold() 次数（累计） */
+static uint32_t s_feed_releases;                /* release() 次数（累计） */
+static uint32_t s_feed_discards;                /* 触发过的丢弃窗口次数 */
+static uint32_t s_feed_discard_samples;         /* 累计喂零样本数 */
+static uint32_t s_feed_last_discard_ms;         /* 最近一次丢弃窗口长度（ms） */
 
 /* ---- 观测统计（mic stat）：只在 feed/fetch 任务里单写，命令侧只读 ---- */
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -364,7 +377,23 @@ static void feed_task(void *arg)
         if (got > 0) {
             stats_accumulate(buf, got);
         }
-        if (!s_feed_enabled) {
+        /* 半双工门控（T3.2）：持有任一路原因位 → 喂静音；刚恢复时先丢弃 R5 窗口。
+         * 只在音频任务里读，写入方拿 s_feed_mux，临界区只有几条比较/加法。 */
+        bool mute = false;
+        portENTER_CRITICAL(&s_feed_mux);
+        if (s_feed_hold_mask != 0) {
+            mute = true;
+        } else if (s_feed_discard_left > 0) {
+            /* R5：恢复后最早 N ms 的麦克风数据喂零，避免打断瞬间的噪声触发 VAD */
+            const uint32_t n = (s_feed_discard_left > (uint32_t)chunksize)
+                                   ? (uint32_t)chunksize
+                                   : s_feed_discard_left;
+            s_feed_discard_left -= n;
+            s_feed_discard_samples += n;
+            mute = true;
+        }
+        portEXIT_CRITICAL(&s_feed_mux);
+        if (mute) {
             memset(buf, 0, (size_t)chunksize * nch * sizeof(int16_t));
         }
         portENTER_CRITICAL(&s_stats_mux);
@@ -521,17 +550,111 @@ esp_err_t audio_fe_start(void)
     return ESP_OK;
 }
 
+/* ---------------- 半双工门控（T3.2，R1/R2/R5） ---------------- */
+
+void audio_fe_feed_hold(uint32_t reason)
+{
+    uint32_t mask;
+    bool entered;
+
+    if (reason == 0) {
+        return;
+    }
+    portENTER_CRITICAL(&s_feed_mux);
+    entered = (s_feed_hold_mask == 0);
+    s_feed_hold_mask |= reason;
+    s_feed_holds++;
+    mask = s_feed_hold_mask;
+    portEXIT_CRITICAL(&s_feed_mux);
+
+    if (entered) {
+        ESP_LOGI(TAG, "feed paused (holds=0x%02x)", (unsigned)mask);
+    }
+}
+
+void audio_fe_feed_release(uint32_t reason)
+{
+    uint32_t mask;
+    bool resumed = false;
+    uint32_t discard_ms = 0;
+
+    if (reason == 0) {
+        return;
+    }
+    portENTER_CRITICAL(&s_feed_mux);
+    const uint32_t before = s_feed_hold_mask;
+    s_feed_hold_mask = before & ~reason;
+    s_feed_releases++;
+    mask = s_feed_hold_mask;
+    if (before != 0 && mask == 0) {
+        resumed = true;
+        discard_ms = s_feed_discard_pending_ms;
+        s_feed_discard_pending_ms = 0;
+        if (discard_ms > 0) {
+            s_feed_discard_left = discard_ms * AUDIO_IO_MIC_SAMPLE_RATE / 1000u;
+            s_feed_discards++;
+            s_feed_last_discard_ms = discard_ms;
+        }
+    }
+    portEXIT_CRITICAL(&s_feed_mux);
+
+    if (resumed) {
+        ESP_LOGI(TAG, "feed resumed (discard %u ms, hold_mask=0x%02x)", (unsigned)discard_ms,
+                 (unsigned)mask);
+    }
+}
+
+void audio_fe_feed_discard_ms(uint32_t ms)
+{
+    portENTER_CRITICAL(&s_feed_mux);
+    if (s_feed_hold_mask == 0) {
+        /* 已经恢复：立即开窗（等价于"现在起丢弃 N ms"） */
+        if (ms > 0) {
+            s_feed_discard_left = ms * AUDIO_IO_MIC_SAMPLE_RATE / 1000u;
+            s_feed_discards++;
+            s_feed_last_discard_ms = ms;
+        }
+    } else {
+        s_feed_discard_pending_ms = ms;
+    }
+    portEXIT_CRITICAL(&s_feed_mux);
+}
+
 void audio_fe_set_feed_enabled(bool enabled)
 {
-    if (s_feed_enabled != enabled) {
-        ESP_LOGI(TAG, "feed %s", enabled ? "resumed" : "paused (half-duplex)");
+    /* 兼容旧接口：映射到 PROBE 原因位（产品路径请用 hold/release） */
+    if (enabled) {
+        audio_fe_feed_release(AUDIO_FE_HOLD_PROBE);
+    } else {
+        audio_fe_feed_hold(AUDIO_FE_HOLD_PROBE);
     }
-    s_feed_enabled = enabled;
 }
 
 bool audio_fe_feed_enabled(void)
 {
-    return s_feed_enabled;
+    return s_feed_hold_mask == 0;
+}
+
+uint32_t audio_fe_feed_hold_mask(void)
+{
+    return s_feed_hold_mask;
+}
+
+esp_err_t audio_fe_feed_stats_read(audio_fe_feed_stats_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&s_feed_mux);
+    out->holds = s_feed_holds;
+    out->releases = s_feed_releases;
+    out->hold_mask = s_feed_hold_mask;
+    out->discards = s_feed_discards;
+    out->discard_samples = s_feed_discard_samples;
+    out->last_discard_ms = s_feed_last_discard_ms;
+    out->feed_enabled = (s_feed_hold_mask == 0);
+    portEXIT_CRITICAL(&s_feed_mux);
+    return ESP_OK;
 }
 
 const char *audio_fe_wakenet_name(void)
@@ -556,8 +679,18 @@ esp_err_t audio_fe_stats_read(audio_fe_stats_t *out)
 
     out->chunksize = s_stat_chunksize;
     out->sample_rate = AUDIO_IO_MIC_SAMPLE_RATE;
-    out->feed_enabled = s_feed_enabled;
+    out->feed_enabled = audio_fe_feed_enabled();
     out->vad_active = s_stat_vad_active;
+
+    audio_fe_feed_stats_t feed;
+    if (audio_fe_feed_stats_read(&feed) == ESP_OK) {
+        out->feed_holds = feed.holds;
+        out->feed_releases = feed.releases;
+        out->feed_hold_mask = feed.hold_mask;
+        out->feed_discards = feed.discards;
+        out->feed_discard_samples = feed.discard_samples;
+        out->feed_last_discard_ms = feed.last_discard_ms;
+    }
     return ESP_OK;
 }
 
@@ -571,5 +704,14 @@ esp_err_t audio_fe_stats_reset(void)
     s_stat_read_errors = 0;
     s_stat_wake_count = 0;
     portEXIT_CRITICAL(&s_stats_mux);
+
+    /* 门控累计统计一起清零（hold_mask 是状态、不清），方便测试脚本"清零后断言一次 R5" */
+    portENTER_CRITICAL(&s_feed_mux);
+    s_feed_holds = 0;
+    s_feed_releases = 0;
+    s_feed_discards = 0;
+    s_feed_discard_samples = 0;
+    s_feed_last_discard_ms = 0;
+    portEXIT_CRITICAL(&s_feed_mux);
     return ESP_OK;
 }

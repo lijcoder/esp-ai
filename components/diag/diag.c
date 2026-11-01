@@ -447,6 +447,10 @@ static void print_mic_stats(void)
         printf("  状态: 收音 暂停（R1 半双工，AFE 输入为静音），VAD %s，累计唤醒 %u 次\n",
                st.vad_active ? "人声" : "静音", (unsigned)st.wake_count);
     }
+    printf("  门控: holds=%" PRIu32 " releases=%" PRIu32 " hold_mask=0x%02x discards=%" PRIu32
+           " discard_samples=%" PRIu32 " last_discard_ms=%" PRIu32 "\n",
+           st.feed_holds, st.feed_releases, (unsigned)st.feed_hold_mask, st.feed_discards,
+           st.feed_discard_samples, st.feed_last_discard_ms);
     printf("  参考: 安静室内底噪 RMS≈40~270；正常说话峰值数百~4k\n");
 }
 
@@ -1504,8 +1508,9 @@ static int cmd_vs(int argc, char **argv)
 
     if (strcmp(sub, "interrupt") == 0) {
         esp_err_t err = vs_interrupt();
-        printf("%s\n", err == ESP_OK ? "已打断当前会话（vc cancel + 回 IDLE）" :
-                                      esp_err_to_name(err));
+        printf("%s\n", err == ESP_OK ?
+                           "已打断当前会话（淡出 + interrupt 报文 + R5 丢弃 50ms + 回 IDLE）" :
+                           esp_err_to_name(err));
         return err;
     }
 
@@ -1531,7 +1536,7 @@ static bool evt_has_payload(app_evt_t evt)
     /* 带 payload 的事件：P1 的网络事件 + T2.5 的语音事件 + T3.1 的会话状态事件（见 event_bus.h） */
     return evt == APP_EVT_NET_UP || evt == APP_EVT_NET_DOWN || evt == APP_EVT_ASR_PARTIAL ||
            evt == APP_EVT_ASR_FINAL || evt == APP_EVT_TTS_START || evt == APP_EVT_TTS_END ||
-           evt == APP_EVT_VOICE_STATE_CHANGED;
+           evt == APP_EVT_VOICE_STATE_CHANGED || evt == APP_EVT_BUTTON;
 }
 
 static bool evt_parse(const char *text, app_evt_t *out)
@@ -1574,6 +1579,8 @@ static void evt_fill_sample_payload(app_evt_t evt, app_evt_data_t *data)
     } else if (evt == APP_EVT_TTS_END) {
         data->tts_end.sid = 1;
         data->tts_end.frames = 100;
+    } else if (evt == APP_EVT_BUTTON) {
+        data->button.action = APP_EVT_BUTTON_SHORT; /* 示例：短按 */
     } else if (evt == APP_EVT_VOICE_STATE_CHANGED) {
         data->voice_state.sid = 1;
         data->voice_state.from = VS_STATE_LISTENING;
@@ -1604,6 +1611,8 @@ static void evt_trace_cb(void *arg, app_evt_t evt, const app_evt_data_t *data)
     } else if (evt == APP_EVT_TTS_END && data != NULL) {
         ESP_LOGI(TAG, "evt trace: %s sid=%u frames=%u", app_evt_name(evt),
                  (unsigned)data->tts_end.sid, (unsigned)data->tts_end.frames);
+    } else if (evt == APP_EVT_BUTTON && data != NULL) {
+        ESP_LOGI(TAG, "evt trace: %s action=%u", app_evt_name(evt), (unsigned)data->button.action);
     } else if (evt == APP_EVT_VOICE_STATE_CHANGED && data != NULL) {
         ESP_LOGI(TAG, "evt trace: %s sid=%u %s -> %s（原因=%s，停留 %" PRIu32 " ms）",
                  app_evt_name(evt), (unsigned)data->voice_state.sid,
@@ -1827,13 +1836,17 @@ static void print_player_stat(void)
                (unsigned)ss.underruns, (unsigned)ss.dropped_bytes, (unsigned)ss.bad_frames,
                (unsigned)ss.first_byte_to_sound_us, (unsigned)ss.duration_ms);
     }
+    /* T3.2 半双工观测行（R3 duck / R4 淡出停声）：工具脚本按子串匹配，字段只追加不删 */
+    printf("duck: on=%d gain_q8=%" PRIu32 " out_peak=%" PRIu32
+           " stop: last_stop_ms=%" PRIu32 " stops=%" PRIu32 "\n",
+           st.duck_on ? 1 : 0, st.duck_gain_q8, st.out_peak, st.last_stop_ms, st.stop_count);
 }
 
 static int cmd_player(int argc, char **argv)
 {
     if (argc < 2) {
         printf("用法: player stat | reset | mp3 | pcm <off> <n> | stream [chunk] [gap_ms] | "
-               "stream abort | load begin | load end | load <base64>\n");
+               "stream abort | duck on|off | stop [ms] | load begin | load end | load <base64>\n");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1888,6 +1901,27 @@ static int cmd_player(int argc, char **argv)
         }
         printf("PLAYERPLAY bytes=%u\n", (unsigned)s_pload_len);
         return ESP_OK;
+    }
+    if (strcmp(sub, "duck") == 0) {
+        /* T3.2 R3 探针：不依赖音乐源即可验证 duck 增益（播放中调用看 out_peak 变化） */
+        if (argc < 3 || (strcmp(argv[2], "on") != 0 && strcmp(argv[2], "off") != 0)) {
+            printf("用法: player duck on|off\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        audio_player_set_duck(strcmp(argv[2], "on") == 0);
+        printf("PLAYERDUCK on=%d\n", audio_player_get_duck() ? 1 : 0);
+        return ESP_OK;
+    }
+    if (strcmp(sub, "stop") == 0) {
+        /* T3.2 R4 探针：对当前播放做淡出停止（不依赖会话/按键） */
+        const int ms = (argc > 2) ? atoi(argv[2]) : CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS;
+        if (ms < 10 || ms > 1000) {
+            printf("用法: player stop [ms(10~1000)]\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        esp_err_t err = audio_player_fade_out_and_stop((uint32_t)ms);
+        printf("PLAYERSTOP fade=%d err=%s\n", ms, esp_err_to_name(err));
+        return err;
     }
     if (strcmp(sub, "stream") == 0) {
         /* 开发期探针（T2.4）：把 player load 上传的 MP3 按 chunk 喂进流式路径，
@@ -1987,7 +2021,7 @@ static int cmd_player(int argc, char **argv)
         return ESP_OK;
     }
 
-    printf("未知子命令: %s（可用: stat | reset | mp3 | load）\n", sub);
+    printf("未知子命令: %s（可用: stat | reset | mp3 | load | duck | stop）\n", sub);
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -2088,9 +2122,9 @@ static esp_err_t register_commands(void)
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST
         {
             .command = "player",
-            .help = "播放探针（T2.3/T2.4）：player stat | reset | mp3 | load begin|end|<base64> | "
+            .help = "播放探针（T2.3/T2.4/T3.2）：player stat | reset | mp3 | duck on|off | stop [ms] | load begin|end|<base64> | "
                     "stream [chunk] [gap_ms] | stream abort",
-            .hint = "stat|reset|mp3|pcm|load|stream",
+            .hint = "stat|reset|mp3|pcm|load|stream|duck|stop",
             .func = cmd_player,
         },
 #endif

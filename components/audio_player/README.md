@@ -39,6 +39,9 @@
 | `audio_player_stream_active()` | 是否流式播放中（含收尾） |
 | `audio_player_stream_stats_read(out)` | 流式统计（见下） |
 | `audio_player_is_busy()` | 是否正在播放（含解码阶段与排队；流式期间为 true） |
+| `audio_player_fade_out_and_stop(ms)` | **R4 打断（T3.2）**：对当前任务（PCM/整段 MP3/流式）线性淡出到静音后停播，回调 `ok=false`；实测 `last_stop_ms` 79~95ms（80ms 淡出） |
+| `audio_player_set_duck(on)` / `get_duck()` | **R3 duck（T3.2）**：在用户音量之外叠 `-AUDIO_PLAYER_DUCK_DB`（默认 12dB，q8=64）、`DUCK_RAMP_MS` 线性斜坡；不改 `s_volume`，关掉即恢复原音量 |
+| `audio_player_current_src(&src)` | 当前正在播的任务类型（忙时有效）；R3 判断"音乐/本地长播 vs 提示音/TTS"用 |
 | `audio_player_set_volume(v)` / `get_volume()` | 软件音量 0~100 |
 | `audio_player_stats_read(out)` / `stats_reset()` | 播放统计 + 最近一次整段 MP3 解码统计；`stats_reset()` 同时清空流式统计 |
 | `audio_player_mp3_pcm_read(dst, off, n)` | 开发期探针：读取最近一次整段解码 PCM，供 PC 侧与 FFmpeg 逐样本对拍 |
@@ -56,6 +59,9 @@
 | `AUDIO_PLAYER_STREAM_RING_BYTES` | 65536 | 流式压缩数据 ring（PSRAM）；64KB ≈ 24k/64kbps 约 8s |
 | `AUDIO_PLAYER_STREAM_PREROLL_FRAMES` | 4 | 起播最少已解码帧数（96ms；2/3 帧实测偶发起播欠载） |
 | `AUDIO_PLAYER_STREAM_PREROLL_MS` | 120 | 起播超时（距首个 write） |
+| `AUDIO_PLAYER_INTERRUPT_FADE_MS` | 80 | R4 打断淡出时长；P3 验收"按键打断 <100ms 停声"，改大必然超线（实测 last_stop_ms 79~95） |
+| `AUDIO_PLAYER_DUCK_DB` | 12 | R3 音乐 duck 深度（q8 目标 ≈ 0.25 倍振幅） |
+| `AUDIO_PLAYER_DUCK_RAMP_MS` | 100 | duck 斜坡时长（R3：100ms 内到位） |
 
 ## 依赖
 
@@ -102,9 +108,19 @@ W PLAYER: stream bad data, resync at byte 399
 stream: active=0 fed=57 bytes=29088 decoded=202 samples=116352 rate=24000 ch=1 ring_ms=0 high_ms=4762 underrun=0 dropped=0 bad=0 first_sound_us=15144 dur_ms=4850
 ```
 
+`player stat` 半双工行（T3.2）：
+
+```
+duck: on=0 gain_q8=256 out_peak=15563 stop: last_stop_ms=79 stops=1
+```
+
+- `out_peak`：最近 ~320ms（32 × 10ms 块）输出峰值，含 duck/淡出；R3 用它对比 duck 前后（实测 15563 → 3890 = 0.250 → 恢复 15563）；
+- `last_stop_ms`：最近一次淡出请求 → 输出静音（不是关 TX 时钟；淡出后还有静音冲刷）；`stops` 为累计次数；
+- `player duck on|off` / `player stop [ms]` 是仅开发期探针（`CONFIG_DIAG_ENABLE_PLAYER_TEST`）。
+
 ## 后续（P3/P4）
 
-- 多通道：`CH_TTS` / `CH_PROMPT` / `CH_MUSIC` + 混音 + ducking（P3/P4）；
+- 多通道：`CH_TTS` / `CH_PROMPT` / `CH_MUSIC` + 混音 + ducking（T3.3 做混音/限幅，T4.4 做音乐 duck 叠加与恢复；T3.2 已把打断淡出与 duck 增益统一放在输出级 `out_process()`，混音接同一位置）；
 - 音源抽象：`source_http`（HTTP 流）/`source_file`（FATFS），P4；
 - 流式音乐（T4.x）可复用本组件的 stream API（codec=1），只需扩 codec/声道策略。
 

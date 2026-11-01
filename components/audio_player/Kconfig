@@ -58,4 +58,29 @@ menu "Audio Player"
             即使还没解够 PREROLL_FRAMES 帧，距首字节超过该时长也起播，
             避免弱网/小帧流迟迟不出声。
 
+
+    config AUDIO_PLAYER_INTERRUPT_FADE_MS
+        int "按键打断淡出时长（毫秒，规则 R4）"
+        range 20 100
+        default 80
+        help
+            audio_player_fade_out_and_stop() 的默认时长（voice_session 的 R4 打断用它）。
+            P3 验收口径是"按键打断 <100ms 停声"：80ms 淡出 + 一块 10ms 输出块 + 事件投递
+            余量，实测 last_stop_ms 应在 80~95ms。改大就必然超线，不要为了听感调大。
+
+    config AUDIO_PLAYER_DUCK_DB
+        int "音乐 duck 深度（dB，规则 R3）"
+        range 3 30
+        default 12
+        help
+            R3：音乐播放中唤醒，音乐在 100ms 内 duck 到该深度（相对当前音量的增益）。
+            架构定稿 -12dB，约 0.25 倍振幅。
+
+    config AUDIO_PLAYER_DUCK_RAMP_MS
+        int "duck 斜坡时长（毫秒）"
+        range 10 500
+        default 100
+        help
+            R3 的"100ms 内 duck 到 -12dB"由它保证：q8 增益按该时长线性走到目标。
+
 endmenu

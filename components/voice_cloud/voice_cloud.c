@@ -549,7 +549,7 @@ static void vc_stream_done_cb(audio_player_src_t src, bool ok, void *arg)
         ESP_LOGD(TAG, "stream done 但新流已开始，跳过 R2");
         return;
     }
-    audio_fe_set_feed_enabled(true);
+    audio_fe_feed_release(AUDIO_FE_HOLD_TTS);
     ESP_LOGI(TAG, "stream done → feed resumed（ok=%d）", (int)ok);
 }
 
@@ -587,9 +587,10 @@ static void vc_audio_start(uint8_t codec_id, uint32_t sample_rate)
         return;
     }
 
-    /* R1：流式播放期间暂停收音，避免扬声器回采自激（R2 由完成回调恢复） */
+    /* R1：流式播放期间暂停收音，避免扬声器回采自激（R2 由完成回调恢复）。
+     * T3.2 起走 audio_fe 的原因位仲裁（与提示音的 PROMPT 位互不覆盖）。 */
     if (s_done_subscribed) {
-        audio_fe_set_feed_enabled(false);
+        audio_fe_feed_hold(AUDIO_FE_HOLD_TTS);
     } else {
         ESP_LOGE(TAG, "未订阅播放完成回调，跳过 R1（否则流结束后无法恢复收音）");
     }
@@ -1265,6 +1266,32 @@ esp_err_t vc_cancel(void)
         xTaskNotifyGive(s_task);
     }
     return ESP_OK;
+}
+
+/* T3.2 R4：按键打断 = 先给云端发 interrupt 报文，再本地作废本轮。
+ * 报文失败（WS 未 READY/队列满）只 WARN，不阻塞打断流程（本地必须立即停）。
+ * 端侧不等待服务端应答（PROTOCOL §8：服务端收到 interrupt 后停发并作废 sid）。 */
+esp_err_t vc_interrupt(void)
+{
+    char json[VC_JSON_MAX];
+    const uint16_t sid = s_sid;
+
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 没有进行中的轮次（例：唤醒提示音阶段还没 audio_start）：不发 interrupt 报文，
+     * 否则会把上一轮的 sid 当作"作废目标"发给服务端，属噪声。 */
+    if (s_state == VC_STATE_IDLE) {
+        ESP_LOGI(TAG, "interrupt: 无进行中的轮次，跳过报文（sid=%u）", (unsigned)sid);
+        return ESP_OK;
+    }
+    snprintf(json, sizeof(json), "{\"t\":\"interrupt\",\"sid\":%u}", (unsigned)sid);
+    if (vc_send_json(json)) {
+        ESP_LOGW(TAG, "interrupt sent sid=%u", (unsigned)sid);
+    } else {
+        ESP_LOGW(TAG, "interrupt 未发出（sid=%u），仅本地作废本轮", (unsigned)sid);
+    }
+    return vc_cancel();
 }
 
 bool vc_is_busy(void)

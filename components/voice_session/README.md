@@ -22,7 +22,7 @@
 |---|---|
 | `vs_init()` | 订阅 `event_bus`（`APP_EVT_ANY`）+ 注册 `vc_register_cb` + 订阅播放完成回调；**不建任务**。必须在 `app_evt_init`/`vc_init`/`audio_player_init` 之后 |
 | `vs_start()` | 手动开始一轮（不播应答提示音，直接进入上行）；已有会话返回 `ESP_ERR_INVALID_STATE` |
-| `vs_interrupt()` | 打断当前会话：`vc_cancel()` + 回 `IDLE`（完整 R4 淡出与按键来源归 T3.2/T3.4） |
+| `vs_interrupt()` | **T3.2 R4 完整打断**：`audio_player_fade_out_and_stop(80ms)` → `vc_interrupt()`（interrupt 报文 + cancel）→ R5 丢弃 50ms → 回 `IDLE`；播放完成回调 `ok=false`，门控位由回调释放 |
 | `vs_is_busy()` / `vs_get_state()` / `vs_state_name()` / `vs_reason_name()` | 状态观测（原因码用于日志/事件 payload） |
 | `vs_current_sid()` | 当前（或最近一轮）sid |
 | `vs_stats_read()` / `vs_stats_reset()` | 轮次（开始/完成/异常/中止）、打断、唤醒丢弃、超时、云端 error、迁移次数、上次状态停留（`diag` 的 `vs status` 使用） |
@@ -31,12 +31,12 @@
 
 | 迁移 | 触发（来源） | 备注 |
 |---|---|---|
-| `IDLE → LISTENING` | `APP_EVT_WAKE_DETECTED`（`evt` 任务）/ `vs_start()`（console） | 唤醒时若已有会话或播放器忙 → 丢弃唤醒并计数（`wakes_dropped`） |
+| `IDLE → LISTENING` | `APP_EVT_WAKE_DETECTED`（`evt` 任务）/ `vs_start()`（console）/ `APP_EVT_BUTTON` 短按（T3.2） | 唤醒时若已有会话或播放器忙（提示音/TTS 收尾）→ 丢弃唤醒并计数（`wakes_dropped`）；**音乐/本地长播中不丢弃**（R3：先淡出音乐让出单输出通道） |
 | `LISTENING → THINKING` | `VC_EVT_UPLINK_END`（`vc` 任务）：`audio_end` 已发出 | 收尾原因（vad/max/stop）在 `code` 字段 |
 | `THINKING → SPEAKING` | `VC_EVT_TTS_START`（`ws_client` 任务） | TTS 侧 R1 由 `voice_cloud` 打开流时执行 |
 | `SPEAKING → IDLE` | 播放完成回调（`player` 任务，`STREAM_DONE`）或 `VC_EVT_ROUND_END(DONE)`（无可播音频） | 等 TTS 排空后才收状态 |
 | `THINKING/SPEAKING → ERROR` | `VC_EVT_ROUND_END(TIMEOUT)` / `VC_EVT_CLOUD_ERROR` | `voice_cloud` 报告事实，本组件决定进 `ERROR` |
-| `任何活跃 → IDLE` | `APP_EVT_NET_DOWN`、`VC_EVT_ROUND_END(LINK/CANCEL/NEW/SETUP)`、`vs_interrupt()` | 断链/取消/新轮次覆盖 |
+| `任何活跃 → IDLE` | `APP_EVT_NET_DOWN`、`VC_EVT_ROUND_END(LINK/CANCEL/NEW/SETUP)`、`vs_interrupt()`（含按键短按） | 断链/取消/新轮次覆盖；R4 打断会先淡出并作废 sid（T3.2） |
 
 - **所有迁移**都打 INFO：`VS: state A -> B（sid=N，停留 M ms，原因=...）`，并存进迁移统计；
 - 每次迁移后投 `APP_EVT_VOICE_STATE_CHANGED`（`app_evt_voice_state_t`，见 ARCH §4.2），供 T3.4 LED/UI 消费；
@@ -57,8 +57,12 @@
    都是非阻塞调用；`ESP_LOGI` 只打关键迁移。
 3. **不绕过本组件改会话状态**（CONVENTIONS §9）：其它模块要驱动会话只能投事件或调本组件 API。
 4. **本组件不直接碰协议**：只调用 `voice_cloud` 的对外 API 并消费其回调；不 `ws_send_*`、不解析 JSON。
-5. **提示音的 R1/R2 与 TTS 的 R1/R2 相互独立**：本组件在 `vs_on_wake` 暂停收音、在提示音完成回调恢复；
-   若提示音期间被打断，回调仍会恢复收音。
+5. **R1/R2 统一门控（T3.2）**：本组件只 `audio_fe_feed_hold(AUDIO_FE_HOLD_PROMPT)` / `release` 自己那一位，
+   TTS 的 R1/R2 在 `voice_cloud` 持 `AUDIO_FE_HOLD_TTS`；位图归零才真正开麦，互不覆盖。提示音完成回调里先 `release` 再起轮。
+6. **R4/R5（T3.2）**：`vs_interrupt()` 的调用上下文可能是 `evt` 任务（按键）或 console；只做非阻塞调用
+   （淡出请求、`vc_interrupt`、`audio_fe_feed_discard_ms`），实际淡出在 `player` 任务执行。
+7. **R3 边界**：音乐播放中唤醒不再丢弃，但当前播放器是单任务单通道，做法是"淡出音乐让出通道"；
+   duck 叠加播放（音乐继续播 + TTS 混音）归 T3.3/P4。
 
 ## 真机验收（T3.1，2026-11-01）
 
@@ -72,7 +76,7 @@
 ## 后续
 
 - T3.6：错误提示音 + `VS_ERROR_HOLD_MS` 正式值；`ERROR` 提示音播放期间屏蔽唤醒。
-- T3.2/T3.4：R4 完整打断（100ms 淡出 + `interrupt` 报文 + 恢复后丢弃 50ms）与按键来源；
-  LED 消费 `APP_EVT_VOICE_STATE_CHANGED`。
+- ✅ T3.2：R4 完整打断（80ms 淡出 + `interrupt` 报文 + R5 丢弃 50ms）、R3 音乐中唤醒放行、`APP_EVT_BUTTON` 消费；
+- T3.4：按键 GPIO 扫描/去抖 + 长按静音 + LED 消费 `APP_EVT_VOICE_STATE_CHANGED`。
 - P4：音乐播放中唤醒的 ducking 与 `IDLE` 态允许音乐播放（`IDLE` 已预留）。
-- 本地音乐/提示音与 TTS 抢占：`audio_player_is_busy()` 目前直接忽略唤醒，P4 改为 duck/挂起策略。
+- 本地音乐/提示音与 TTS 抢占：T3.2 已对"音乐播放中"放行唤醒并淡出抢占；混音叠加（音乐继续播 + duck）归 T3.3，音乐恢复归 T4.4。

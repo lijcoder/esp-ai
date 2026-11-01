@@ -73,6 +73,25 @@ esp_err_t audio_player_stream_end(void);
 /* 打断/error/断链/新轮次：立刻停声，丢弃未播数据，回调 ok=false。 */
 esp_err_t audio_player_stream_abort(void);
 
+/* ---------------- 半双工打断与 duck（T3.2，规则 R4/R3） ----------------
+ *
+ * audio_player_fade_out_and_stop()：对"当前正在播的任务"（PCM 提示音 / 整段 MP3 / TTS 流）
+ * 在 fade_ms 内线性淡出到静音然后停播，完成回调 ok=false。用于按键打断（R4）：
+ * 从请求到输出静音应在 fade_ms+10ms 内（`player stat` 的 last_stop_ms 可断言）。
+ * 非阻塞、任意任务可调用；播放器空闲时返回 ESP_ERR_INVALID_STATE。
+ * 注意：淡出后仍会做静音冲刷/关 TX（尾部约 100ms 静音，不再有可闻声音）。
+ */
+esp_err_t audio_player_fade_out_and_stop(uint32_t fade_ms);
+
+/* duck（R3）：在用户音量之外叠一个 -CONFIG_AUDIO_PLAYER_DUCK_DB 的增益，
+ * 100ms 线性斜坡（不改变 s_volume，会话结束置 false 即恢复原音量）。
+ * 非阻塞、任意任务可调用；对随后开始的任务同样生效（直到关掉）。 */
+void audio_player_set_duck(bool on);
+bool audio_player_get_duck(void);
+
+/* 当前正在播放的任务类型；播放器空闲返回 false（R3 判断"音乐/本地长播 vs 提示音/TTS"用） */
+bool audio_player_current_src(audio_player_src_t *out);
+
 bool audio_player_stream_active(void);
 
 /* 流式统计（diag 的 player stat 用；任意任务上下文可读） */
@@ -114,6 +133,12 @@ typedef struct {
     uint32_t mp3_jobs;    /* 其中整段 MP3（成功解码） */
     uint32_t mp3_errors;  /* MP3 解码失败次数 */
     uint32_t last_play_ms;/* 最近一次播放实际耗时（含尾部静音冲刷，不含 300ms R2 延时） */
+    /* T3.2：半双工观测（R3/R4 真机断言用） */
+    uint32_t out_peak;    /* 最近 ~320ms 输出峰值（含 duck/淡出；R3 用它对比 duck 前后） */
+    uint32_t stop_count;  /* 淡出停止次数（R4） */
+    uint32_t last_stop_ms;/* 最近一次淡出停止：请求 → 输出静音（ms） */
+    bool duck_on;         /* 当前 duck 开关 */
+    uint32_t duck_gain_q8;/* 当前 duck 增益（q8，256=0dB，64≈-12dB） */
     audio_player_mp3_stats_t mp3;
 } audio_player_stats_t;
 

@@ -36,7 +36,7 @@ typedef enum {
     APP_EVT_TTS_START,              /* 云端 TTS 起播，payload: app_evt_tts_start_t（T2.5 定稿） */
     APP_EVT_TTS_END,                /* 云端 TTS 结束，payload: app_evt_tts_end_t（T2.5 定稿） */
     APP_EVT_VOICE_STATE_CHANGED,    /* 会话状态迁移，payload 待 T3.1 定稿 */
-    APP_EVT_BUTTON,                 /* 按键动作，payload 待 T3.4 定稿 */
+    APP_EVT_BUTTON,                 /* 按键动作，payload: app_evt_button_t（T3.2 定稿） */
     APP_EVT_MUSIC_STATE_CHANGED,    /* 音乐状态变化，payload 待 T4.3 定稿 */
     APP_EVT_MUSIC_ERROR,            /* 音乐播放出错，payload 待 T4.3 定稿 */
     APP_EVT_COUNT,                  /* 哨兵：事件数量，不是合法事件 */
@@ -90,6 +90,18 @@ typedef struct {
 
 /* ---------------- 会话状态事件 payload（T3.1 定稿，见 ARCHITECTURE §4.2/§7） ---------------- */
 
+/* APP_EVT_BUTTON（T3.2 定稿）：按键动作。T3.4 的 dev_ctrl 只负责 GPIO 扫描/去抖并投递，
+ * voice_session 消费：短按 = 打断当前会话（IDLE 下 = 开始对话，ARCH §8.2），长按 = 静音（T3.4）。 */
+typedef enum {
+    APP_EVT_BUTTON_SHORT = 1, /* 短按（<1s） */
+    APP_EVT_BUTTON_LONG = 2,  /* 长按（≥1s，T3.4 接线） */
+} app_evt_button_action_t;
+
+typedef struct {
+    uint8_t action; /* app_evt_button_action_t；非法值按短按处理 */
+    uint8_t reserved[3];
+} app_evt_button_t;
+
 /* APP_EVT_VOICE_STATE_CHANGED：会话状态迁移。from/to 是 voice_session 的 vs_state_t 数值
  * （0=IDLE / 1=LISTENING / 2=THINKING / 3=SPEAKING / 4=ERROR），reason 是 vs_reason_t 数值。
  * event_bus 是 L1，不能 include L4 的 voice_session.h，所以这里用显式数值 + 注释契约。 */
@@ -114,6 +126,7 @@ typedef union {
     app_evt_tts_start_t tts_start;
     app_evt_tts_end_t tts_end;
     app_evt_voice_state_t voice_state;
+    app_evt_button_t button;
     uint8_t raw[APP_EVT_DATA_MAX];
 } app_evt_data_t;
 

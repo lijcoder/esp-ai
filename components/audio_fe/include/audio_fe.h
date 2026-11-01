@@ -25,9 +25,48 @@ esp_err_t audio_fe_init(audio_fe_cb_t cb, void *arg);
 /* 创建 feed / fetch 两个任务并开始运行（feed 绑核 1） */
 esp_err_t audio_fe_start(void);
 
-/* 半双工控制：false 时麦克风数据丢弃，喂静音给 AFE（规则 R1/R2） */
+/* ---------------- 半双工门控（T3.2，规则 R1/R2/R5，ARCH §3.3） ----------------
+ *
+ * 只有一个仲裁点：多个业务方各自 hold/release 自己的原因位，**位图归零才真正恢复收音**。
+ * 这解决了 T3.1 之前"提示音 R1/R2"与"TTS R1/R2"两套独立开关互相覆盖的问题
+ * （谁后执行谁生效 → 可能提前开麦自激，或永久关麦卡死会话）。
+ *
+ * 约定：
+ *   1. hold/release 幂等（按原因位置位/清位），同一原因位只有一个 owner；
+ *   2. 任意任务/回调上下文可调用，非阻塞，内部只有一次临界区；
+ *   3. 恢复收音（位图归零）后，若 `audio_fe_feed_discard_ms()` 设了窗口，
+ *      前 N 毫秒的麦克风数据喂零（R5：打断瞬间的功放余响/开关噪声不触发 VAD）。
+ */
+#define AUDIO_FE_HOLD_PROMPT (1u << 0) /* 唤醒应答提示音在播（R1，voice_session） */
+#define AUDIO_FE_HOLD_TTS    (1u << 1) /* 云端 TTS 在播（R1，voice_cloud） */
+#define AUDIO_FE_HOLD_PROBE  (1u << 2) /* console/探针直控（兼容旧 set_feed_enabled） */
+
+void audio_fe_feed_hold(uint32_t reason);   /* 置位 → 门控关闭，AFE 吃静音 */
+void audio_fe_feed_release(uint32_t reason); /* 清位 → 位图归零才真正恢复 */
+
+/* 设置"恢复后丢弃窗口"（毫秒）。当前已恢复时立即生效；若仍 hold，则记在下次恢复时生效。
+ * 调用方（R4 打断路径）应在 release 之前调用。0 = 关闭该功能。 */
+void audio_fe_feed_discard_ms(uint32_t ms);
+
+/* 旧接口（T2.4/T3.1 遗留）：等价 hold/release(AUDIO_FE_HOLD_PROBE)，新代码请用原因位。
+ * 保留是为了测试脚本/探针兼容；产品路径不得用它绕开原因位仲裁。 */
 void audio_fe_set_feed_enabled(bool enabled);
-bool audio_fe_feed_enabled(void);
+
+bool audio_fe_feed_enabled(void);          /* 门控是否打开（位图 == 0） */
+uint32_t audio_fe_feed_hold_mask(void);    /* 当前置位的原因位图（观测用） */
+
+/* 门控统计（累计值；diag 的 mic stat 与 R1/R5 断言用） */
+typedef struct {
+    uint32_t holds;           /* hold() 调用次数 */
+    uint32_t releases;        /* release() 调用次数 */
+    uint32_t hold_mask;       /* 当前原因位图 */
+    uint32_t discards;        /* 触发过的恢复丢弃窗口次数（R5） */
+    uint32_t discard_samples; /* 累计被喂零的样本数（50ms@16k = 800） */
+    uint32_t last_discard_ms; /* 最近一次丢弃窗口长度（ms） */
+    bool feed_enabled;        /* 门控是否打开 */
+} audio_fe_feed_stats_t;
+
+esp_err_t audio_fe_feed_stats_read(audio_fe_feed_stats_t *out);
 
 /* 已加载的唤醒词模型名，如 "wn9_hilexin"；未初始化时返回 NULL */
 const char *audio_fe_wakenet_name(void);
@@ -49,6 +88,13 @@ typedef struct {
     uint32_t sample_rate;     /* 麦克风采样率（Hz） */
     bool feed_enabled;        /* 当前是否收音（R1 暂停时为 false） */
     bool vad_active;          /* 当前 VAD 是否判定为人声 */
+    /* T3.2：半双工门控统计（与 audio_fe_feed_stats_t 同口径，方便 mic stat 一行打印） */
+    uint32_t feed_holds;
+    uint32_t feed_releases;
+    uint32_t feed_hold_mask;
+    uint32_t feed_discards;
+    uint32_t feed_discard_samples;
+    uint32_t feed_last_discard_ms;
 } audio_fe_stats_t;
 
 /* 读取统计快照（不清零；任意任务上下文可调用） */

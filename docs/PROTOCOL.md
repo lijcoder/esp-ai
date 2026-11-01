@@ -92,7 +92,7 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 | `hello` | 建连后 | `device_id`(str)、`ver`(int) | `{"t":"hello","device_id":"esp32-dev1","ver":1}` |
 | `audio_start` | 每轮开始 | `sid`(uint16) | `{"t":"audio_start","sid":1}` |
 | `audio_end` | VAD 静音 800ms 或累计 8s（或调试 `vc stop`） | `sid`(uint16) | `{"t":"audio_end","sid":1}` |
-| `interrupt` | 用户打断（T3.1 接线） | `sid`(uint16) | `{"t":"interrupt","sid":1}` |
+| `interrupt` | 用户打断（R4：T3.2 已实现，`voice_session`→`vc_interrupt()`；发后立即本地作废本轮，不等应答） | `sid`(uint16) | `{"t":"interrupt","sid":1}` |
 | `ping` | 每 20s | 无 | `{"t":"ping"}` |
 | `music_request` | 音乐控制（P4） | `action`(str)、`id`/`index`(int) | `{"t":"music_request","action":"play","id":"a1","index":0}` |
 | `music_status` | 播放状态上报（P4） | `state`(str)、`progress_ms`(int) | `{"t":"music_status","state":"playing","progress_ms":12000}` |

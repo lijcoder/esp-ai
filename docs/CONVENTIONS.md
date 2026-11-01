@@ -31,6 +31,8 @@
 - 采样率固定：麦克风 16kHz、功放 48kHz，运行中不切换。
 - **超时参数必核对单位**：IDF I2S 驱动 `i2s_channel_read/write` 的最后一个参数是**毫秒**，禁止传 `pdMS_TO_TICKS()`；只有 FreeRTOS API（`TickType_t` 参数，如 `fetch_with_delay`）才用 tick。单位错会让读写持续超时、功能静默失效（2026-10-30 唤醒失效即此原因，见 STATUS）。
 - 半双工规则 R1–R5（ARCHITECTURE §3.3）是硬约束，任何改动必须同步架构文档。
+- **半双工门控唯一入口（T3.2）**：暂停/恢复收音只能经 `audio_fe_feed_hold()/audio_fe_feed_release()`（原因位 `PROMPT`/`TTS`/`PROBE`，位图归零才恢复）；禁止直接改 `audio_fe` 内部标志或用 `audio_fe_set_feed_enabled()` 绕开仲裁（该接口仅为探针/旧脚本兼容）。R5 的恢复丢弃窗口用 `audio_fe_feed_discard_ms()` 在 release 之前设置。
+- 打断淡出与 duck 统一在 `audio_player` 的输出级（`audio_player_fade_out_and_stop()` / `audio_player_set_duck()`），播放循环不得自己再做一套淡出；T3.3 的混音/限幅接同一位置。
 - 播放必须淡入 10ms / 淡出 100ms；混音后软限幅 -1dBFS。
 - 唤醒词/VAD 回调里只投递事件，不做耗时操作。
 - 关键路径打点：唤醒、上行首帧、TTS 首帧、打断、起播。
@@ -41,7 +43,7 @@
 - I2S DMA 缓冲必须内部 RAM：`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`。
 - 内部 RAM 预算（**X3-E 定稿，2026-10-31**）：**静态 DIRAM + 运行期堆峰值 ≤ 440KB**，且**最坏场景（wss/TLS 握手期）`sys heap` 最低水位 ≥ 30KB**；超预算先改设计，不靠砍功能硬压。
   - 口径与实测：`idf.py size` 的 DIRAM 已用 + `sys heap` 的「峰值占用」（internal），两者相加对照 440KB；`sys heap` 的「最低水位」对照 30KB。
-  - 当前值（T3.1 后，2026-11-01）：静态 **197,094 B** + `ws://` 堆峰值 **227,736 B** = **424,830 B**（距 440KB 上限余量 25,888 B），`ws://` 最低水位 **31,891~32,971 B**（≥30KB）；PSRAM 峰值 **1,556,032 B**（ws:// 冷启动口径）。**wss 握手期 T3.1 未复测**（未新增任务/缓冲，T2.4 时为 32,671~32,719 B，按 ~100B 静态增量估算仍 >30KB，T5.3 复测入基线）。T2.4 时为 424,478 B / 32,671~32,719 B / PSRAM 1,446,724 B；T2.3 时为 424,506 B / 32,471~32,643 B / PSRAM 2,895,336 B；T2.5 时为 424,658 B / 32,339 B / PSRAM 902,908 B；T2.2 时为 409,918 B / 47,051~52,839 B。
+  - 当前值（T3.2 后，2026-11-01）：静态 **197,326 B** + 内部堆峰值 **226,888 B** = **424,214 B**（距 440KB 上限余量 25,594 B），`ws://` 最低水位 **32,859 B**（≥30KB，余 2,859 B）；PSRAM 峰值 **1,556,040 B**（`sys heap` 口径）。**wss 握手期自 T3.1 起未复测**（T3.2 未新增任务/缓冲，静态 +232B，T2.4 时为 32,671~32,719 B，估算仍 >30KB，T5.3 复测入基线）。T3.1 时为 424,830 B / 31,891~32,971 B / PSRAM 1,556,032 B；T2.4 时为 424,478 B / 32,671~32,719 B / PSRAM 1,446,724 B；T2.3 时为 424,506 B / 32,471~32,643 B / PSRAM 2,895,336 B；T2.5 时为 424,658 B / 32,339 B / PSRAM 902,908 B；T2.2 时为 409,918 B / 47,051~52,839 B。
   - 两条必须同时满足；**最坏场景下「最低水位 ≥30KB」是更强约束**（堆总量 ~259,843 B → 堆峰值上限约 229,843 B，折合静态+堆 ≤426.8KB）；440KB 上限用于吸收静态 DIRAM 后续增长。**T2.4 后水位余量只剩 ~2KB：后续任务不得再新增内部 RAM 任务栈/静态/堆占用，需要缓冲时放 PSRAM 或复用现有任务。T3.1 即据此把 `voice_session` 改为事件驱动、不新建任务（ARCH §9.3）。**
   - TLS 记录缓冲与握手堆自 X3-F 起在 PSRAM，不计入内部 RAM；旧口径「峰值 ≤310KB」写于 P0（未含 WiFi 栈且只统计堆），已作废。
 - 长时运行场景必须监控堆水位（`diag`），不允许无限增长。
@@ -99,6 +101,7 @@ components/<module>/
 - **会话状态机调试（T3.1 起）**：`vs status` 看当前状态/sid/轮次与异常计数；`vs start`/`vs interrupt` 手动起轮/打断；迁移日志 `VS: state A -> B（sid=N，停留 M ms，原因=…）`。唤醒链路日志自 T3.1 起由 `VS` 输出（`VS: wake detected` / `VS: prompt done, feed resumed`），测试脚本正则用 `(?:APP|VS)` 兼容新旧固件。错误路径用 mock 验证：`--scenario error`（云端 error → ERROR）、`--think-ms 12000`（THINKING 10s 超时 → ERROR）。
 - **mock 真 ASR（T3.1 起，测试用）**：`uv run --with av --with numpy --with sherpa-onnx tools/ws_mock_server.py --asr sensevoice` 让 mock 把上行 Opus 帧解码后用本地 SenseVoice 识别（`tools/mock_asr.py`，独立于 DSH；默认假 ASR 路径不装这些依赖）；`uv run tools/mock_asr.py --test <wav>` 可离线验证识别；真机回归用 `uv run tools/voice_cloud_test.py --asr --asr-expect <子串>`。限制：离线整段识别、无中间结果，失败回退 `--tts-text`，只用于测试链路。
 - **mock 本地 TTS（T3.1 起，测试用）**：`uv run tools/mock_tts.py --text "…" --out /tmp/reply.mp3` 用 Piper（MIT，中文音色 60MB，CPU 实时）生成 **24kHz 单声道 MP3**，再 `uv run tools/ws_mock_server.py --tts-mp3 /tmp/reply.mp3` 让设备播真实语音；模型缓存 `~/.cache/esp-ai-mock-tts/piper/`，`--download` 首次准备。更高自然度方案（Kokoro/MeloTTS/CosyVoice）暂缓，先用 Piper。
+- **半双工 R1–R5 调试（T3.2 起）**：设备侧观测 `mic stat` 的「门控: holds/releases/hold_mask/discards/discard_samples/last_discard_ms」行（提示音期 `hold_mask=0x1`、TTS 期 `0x2`、恢复后 `0x0`；R5 一次打断 `discard_samples≈800`）、`player stat` 的「duck: on/gain_q8/out_peak/stop: last_stop_ms/stops」行（`last_stop_ms` 应从淡出请求到输出静音，实测 79~95ms）、`player duck on|off`（R3 探针，`out_peak` 应降到 ≈0.25×）、`player stop [ms]`（R4 探针，不依赖会话）。自动回归：`uv run tools/tts_stream_test.py --interrupt --r5 --r3-duck`（R4 打断链路 + R5 丢弃计数 + R3 duck 比率，断言 mock 收到 `interrupt` 且不再下发 `tts_end`）；只跑全量基础回归仍是 `uv run tools/tts_stream_test.py`（193 项）。**打断停声口径**：按键/命令 → 输出静音 ≤100ms（80ms 淡出 + 一个 10ms 输出块，Kconfig `AUDIO_PLAYER_INTERRUPT_FADE_MS=80`）。
 - **mock 回声测试（T3.1 起，不要固定文案）**：`uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc tools/ws_mock_server.py --asr sensevoice --tts-piper` —— 设备说的话先 ASR 识别，再把**识别文本**用 Piper 合成 24kHz MP3 下发，设备复读；同时验证 ASR 正确性与 TTS/播放链路。`--tts-piper` 与 `--tts-mp3` 互斥、必须配 `--asr`；合成失败只 WARN 回退合成帧。
 
 ## 9. 禁止事项
@@ -107,5 +110,6 @@ components/<module>/
 - 禁止在音频任务里做 TLS/HTTP/Flash。
 - 禁止硬编码 WiFi、服务器地址、设备 token（走 Kconfig/NVS）。
 - 禁止绕过 `voice_session` 直接改会话状态。
+- 禁止绕过 `audio_fe_feed_hold/release` 直接改半双工门控（含新增第三路 R1/R2 时各自造开关）。
 - 禁止引入未评估的第三方组件（先评估内存/许可证并记入文档）。
 - 禁止在未更新架构文档的情况下改变分层、协议或分区布局。

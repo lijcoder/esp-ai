@@ -83,14 +83,19 @@ TTS(MP3) ─┐
 
 | 规则 | 内容 |
 |---|---|
-| R1 | 进入 `SPEAKING` 时立即 `audio_fe_set_feed_enabled(false)`，麦克风数据丢弃（不送 AFE） |
-| R2 | `TTS_END` 后延迟 **300ms** 恢复 feed，吸收喇叭尾音与功放余响 |
+| R1 | 进入 `SPEAKING`/提示音播放时暂停收音（`audio_fe_feed_hold()` 置原因位），麦克风数据喂静音（不送 AFE） |
+| R2 | `TTS_END` 后延迟 **300ms** 恢复 feed，吸收喇叭尾音与功放余响（延时在 `audio_player` 的完成回调前统一做） |
 | R3 | 音乐播放不关闭麦克风（保持唤醒检测）；唤醒命中后 100ms 内把音乐 duck 到 -12dB |
-| R4 | 按键打断：任意状态 → 播放通道 100ms 淡出 → 取消云端会话 → 恢复 feed → 回到 `IDLE` |
-| R5 | 恢复 feed 后丢弃最早 50ms 的音频，避免打断瞬间的噪声触发 VAD |
+| R4 | 按键打断：任意活跃状态 → 播放通道 **80ms** 淡出 → 发 `interrupt` 报文 + 作废 sid → 恢复 feed（丢弃 50ms）→ `IDLE` |
+| R5 | 恢复 feed 后丢弃最早 **50ms** 的音频（`CONFIG_AUDIO_FE_RESUME_DISCARD_MS`），避免打断瞬间的噪声触发 VAD |
 
-> **T2.4 实现状态**：R1/R2 已用于 TTS 流式播放（`tts_start` → `audio_fe_set_feed_enabled(false)`；完成/打断回调 → 300ms 尾部延时后恢复）；R3–R5 随 T3.2/P4 落地。
-> **T3.1**：唤醒应答提示音的 R1/R2 由 `voice_session` 负责（播提示音前暂停收音、`prompt done` 后恢复），与 TTS 侧的 R1/R2 相互独立、互不复用标志。
+**门控仲裁（T3.2 定稿，唯一入口）**：`audio_fe` 维护一个原因位图，业务方各自 `audio_fe_feed_hold(reason)` / `audio_fe_feed_release(reason)`，**位图归零才真正恢复收音**。原因位：`PROMPT`（唤醒应答提示音，`voice_session`）、`TTS`（云端 TTS 流式播放，`voice_cloud`）、`PROBE`（console/旧 `audio_fe_set_feed_enabled()` 兼容）。这解决了 T3.1 之前"提示音 R1/R2"与"TTS R1/R2"两套独立开关互相覆盖的问题（谁后执行谁生效 → 可能提前开麦自激，或永久关麦卡死会话）。
+
+> **T3.2 实现状态（2026-11-01）**：
+> - **R1/R2**：提示音与 TTS 统一经原因位仲裁（`hold_mask` 在 `mic stat` 可观测：提示音期 `0x1`、TTS 期 `0x2`、恢复后 `0x0`）；300ms 尾部延时仍在 `audio_player`（PCM 与流式一致），完成回调 → 各自 `release` 自己那一位。
+> - **R4**：`voice_session() → vs_interrupt()`：`audio_player_fade_out_and_stop(80ms)`（输出级线性淡出，`player stat` 的 `last_stop_ms` 实测 79~95ms）→ `vc_interrupt()` 发 `{"t":"interrupt","sid":N}` 并 `vc_cancel()` → `audio_fe_feed_discard_ms(50)` → 回 `IDLE`。播放完成回调以 `ok=false` 上报。淡出期间 `vc_cancel` 的立即 abort 不会截断淡出（`run_stream` 里"有淡出请求时忽略 abort_req"）。按键来源：`APP_EVT_BUTTON`（payload 见 §4.2），`EVT` 驱动在 T3.4 交付；console 用 `vs interrupt` / `evt post BUTTON` 验证。**停声口径**：从按键/命令到输出静音 ≤100ms（80ms 淡出 + 一个 10ms 输出块）。
+> - **R5**：`audio_fe_feed_discard_ms()` 在恢复后把最早 50ms 的麦克风数据喂零并计数（`mic stat` 的 `discard_samples=800`）；只在打断/断链恢复路径使用，正常 TTS 收尾由 R2 的 300ms 覆盖、**不叠加** R5。
+> - **R3**：`audio_player_set_duck(true/false)` 在用户音量之外叠一个 `-12dB`（q8=64）、**100ms 线性斜坡**的增益，port 在输出级（T3.3 混音/限幅接管同一位置）；`player duck on|off` 为探针。**边界与偏差**：音乐源在 P4，且当前播放器是单任务单通道，无法"音乐继续播 + 提示音/TTS 叠加"，因此 T3.2 的唤醒路径是"音乐播放中唤醒**不丢弃** → 麦克风保持开启 → 把音乐淡出（80ms）让出通道 → 提示音 → 会话"；R3 的"duck 后音乐继续播"需要 T3.3 的三通道混音，完整音乐流程（含会话后恢复音乐）归 T4.4。duck 机制本身已用探针在真机验证（`out_peak` 基线 15563 → duck 后 3890 = 0.250 → 恢复 15563）。
 
 ### 3.4 提示音
 
@@ -165,14 +170,14 @@ TTS(MP3) ─┐
 | `net_mgr` | L1 基础服务 | WiFi STA 连接、退避重连、SNTP 对时、网络事件（无独立任务：事件回调 + 一次性定时器） | `net_init()`, `net_is_up()`, `net_wait_ready(ms)`, `net_is_time_synced()`, `net_get_info()`, `net_reconnect()` |
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发；入站回调支持主回调 + 附加订阅（T2.5，业务与 console 观测并存） | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_subscribe()`, `ws_unsubscribe()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
-| `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 事件（T1.2b 起投 `APP_EVT_WAKE_DETECTED`/`APP_EVT_VAD_*` 到 event_bus，回调仅调试兼容）、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
-| `audio_player` | L2 音频引擎 | 播放引擎：PCM/整段 MP3/**流式 MP3（T2.4）** + 重采样到 48k + 软件音量 + 淡入淡出；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；多通道/HTTP 随 P3–P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_set_volume()`, `audio_player_stats_read()` |
+| `audio_fe` | L2 音频引擎 | AFE 封装：**半双工门控仲裁（T3.2：原因位图 `PROMPT/TTS/PROBE` + 恢复丢弃窗口 R5）**、唤醒/VAD 事件（T1.2b 起投 `APP_EVT_WAKE_DETECTED`/`APP_EVT_VAD_*` 到 event_bus，回调仅调试兼容）、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_feed_hold()`, `audio_fe_feed_release()`, `audio_fe_feed_discard_ms()`, `audio_fe_feed_stats_read()`, `audio_fe_feed_enabled()`, `audio_fe_set_feed_enabled()`（旧接口/探针兼容）, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
+| `audio_player` | L2 音频引擎 | 播放引擎：PCM/整段 MP3/**流式 MP3（T2.4）** + 重采样到 48k + 软件音量 + 淡入淡出；**T3.2：输出级打断淡出（R4）与 duck 增益（R3）、输出峰值/停声耗时观测**；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；多通道/HTTP 随 P3–P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_fade_out_and_stop()`, `audio_player_set_duck()`, `audio_player_get_duck()`, `audio_player_current_src()`, `audio_player_set_volume()`, `audio_player_stats_read()` |
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms，定点实现 + VBR，状态/伪栈在 PSRAM，不建任务） | `enc_open()`, `enc_encode(pcm, samples, out, cap, &out_len)`, `enc_flush()`, `enc_reset()`, `enc_close()`, `enc_stats_read()` |
-| `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发、**下行 0x02 接入 `audio_player` 流式播放 + R1/R2（T2.4）**；**不含会话状态机**（归 T3.1 `voice_session`）；T3.1 起回调增加 `VC_EVT_UPLINK_END`/`VC_EVT_ROUND_END` 供状态机驱动，`sid` 由会话机传入 | `vc_init()`, `vc_start(sid)`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_is_busy()`, `vc_register_cb()`, `vc_stats_read()` |
+| `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发、**下行 0x02 接入 `audio_player` 流式播放 + R1/R2（T2.4；T3.2 起经 `audio_fe` 原因位仲裁）**；**不含会话状态机**（归 T3.1 `voice_session`）；T3.1 起回调增加 `VC_EVT_UPLINK_END`/`VC_EVT_ROUND_END` 供状态机驱动，`sid` 由会话机传入；T3.2 起 `vc_interrupt()` 负责 R4 的 `interrupt` 报文 | `vc_init()`, `vc_start(sid)`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_interrupt()`（T3.2：先发 `interrupt` 报文再 cancel）, `vc_is_busy()`, `vc_register_cb()`, `vc_stats_read()` |
 | `music_cloud` | L3 能力 | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
 | `dev_ctrl` | L3 能力 | 按键事件（短按/长按）、LED 状态模式、静音切换 | `dev_init()`, `dev_register_cb()` |
 | `diag` | L3 能力 | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
-| `voice_session` | L4 业务编排 | 会话状态机（IDLE/LISTENING/THINKING/SPEAKING/ERROR）、每轮 `sid` 分配、超时/错误策略（THINKING 超时与云端 error → ERROR，同轮不重试）、唤醒编排（T1.2b：订阅 event_bus，播应答提示音并做 R1/R2）；**不建任务**（事件驱动，见 §9.3） | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_is_busy()`, `vs_get_state()`, `vs_state_name()`, `vs_reason_name()`, `vs_current_sid()`, `vs_stats_read()`, `vs_stats_reset()` |
+| `voice_session` | L4 业务编排 | 会话状态机（IDLE/LISTENING/THINKING/SPEAKING/ERROR）、每轮 `sid` 分配、超时/错误策略（THINKING 超时与云端 error → ERROR，同轮不重试）、唤醒编排（T1.2b：订阅 event_bus，播应答提示音并做 R1/R2）、**T3.2：R4 完整打断（淡出→interrupt 报文→R5 丢弃→IDLE）、R3 音乐中唤醒放行、按键事件消费（短按打断/IDLE 起轮）**；**不建任务**（事件驱动，见 §9.3） | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_is_busy()`, `vs_get_state()`, `vs_state_name()`, `vs_reason_name()`, `vs_current_sid()`, `vs_stats_read()`, `vs_stats_reset()` |
 | `music_session` | L4 业务编排 | 音乐播放控制：播放/暂停/继续/停止/切歌；与语音抢占 | `ms_init()`, `ms_play()`, `ms_pause()`, `ms_resume()`, `ms_stop()` |
 | `assets`（临时） | 资源（不分层） | 内置提示音 PCM 资源；P3（T3.5）迁到 `assets` 分区后删除该组件 | `prompt_wo_zai_ne_pcm[]` |
 
@@ -205,6 +210,7 @@ typedef enum {
 | `APP_EVT_TTS_START` | `app_evt_tts_start_t { uint16_t sid; uint8_t codec; uint8_t reserved; uint32_t sr; }`（`codec=1` 为 MP3） |
 | `APP_EVT_TTS_END` | `app_evt_tts_end_t { uint16_t sid; uint16_t frames; }`（`frames` = 本轮收到的下行音频帧数） |
 | `APP_EVT_VOICE_STATE_CHANGED` | `app_evt_voice_state_t { uint16_t sid; uint8_t from, to; uint8_t reason; uint8_t reserved[3]; uint32_t dur_ms; }`（T3.1 定稿；`from`/`to` 为 §7 状态枚举数值、`reason` 为迁移原因码、`dur_ms` 为迁移前状态停留时长；由 `voice_session` 在每次迁移后投递） |
+| `APP_EVT_BUTTON` | `app_evt_button_t { uint8_t action; uint8_t reserved[3]; }`（T3.2 定稿；`action`：1=`SHORT` 短按、2=`LONG` 长按，非法值按短按处理。T3.4 的 `dev_ctrl` 只负责 GPIO 扫描/去抖并投递；`voice_session` 消费：会话中短按 = R4 打断、IDLE 短按 = 起一轮，长按归 T3.4 静音） |
 
 **投递与线程约束**：
 
@@ -365,7 +371,8 @@ esp-ai/
 1. 每轮会话 `sid` 自增（uint16），异步帧必须匹配当前 `sid`；
 2. 状态迁移统一经 `voice_session`，其它模块不得直接改状态；
 3. 所有迁移打 INFO 日志（`voice` tag），包含 `sid` 与停留时长；
-4. `ERROR` 状态不自动重试，由用户再次唤醒触发新一轮。
+4. `ERROR` 状态不自动重试，由用户再次唤醒触发新一轮；
+5. **按键（T3.2）**：任意活跃状态短按 = R4 打断 → `IDLE`；`IDLE` 短按 = `vs_start()` 直接进 `LISTENING`（不播应答提示音）。
 
 > **T3.1 实现状态（2026-11-01）**：
 > - 状态机在 `components/voice_session`（L4）。迁移统一经 `vs_transition()`/`vs_begin_session()` 的 CAS（期望状态 → 目标状态），并发来源（`evt` 任务、`ws_client`、`player` 完成回调、console/timer）不会打乱状态；
@@ -388,13 +395,18 @@ IDLE ──唤醒──> LISTENING ──VAD静音──> THINKING ──tts_sta
  wake 事件      上行Opus→WS            ASR/LLM事件             TTS MP3帧→解码→48k→喇叭
 ```
 
-### 8.2 按键打断（半双工）
+### 8.2 按键打断（半双工，T3.2 实现）
 
 ```
-任意状态 ──按键──> player fade_out(100ms) → 发送 interrupt → 作废当前 sid
-                → audio_fe_set_feed_enabled(true) → 丢弃 50ms → IDLE
-                                                 （再按一次进入 LISTENING）
+任意活跃状态 ──短按──> player fade_out(80ms) → interrupt{sid} → vc_cancel（作废 sid）
+                     → audio_fe 恢复收音（R5：丢弃最早 50ms）→ IDLE
+                                                  （再按一次进入 LISTENING，见 §7）
 ```
+
+- 触发源：`APP_EVT_BUTTON`（短按，payload `app_evt_button_t`；T3.4 的 `dev_ctrl` 只负责 GPIO 扫描/去抖后投递）或 console `vs interrupt` / `evt post BUTTON`；
+- `IDLE` 下短按 = `vs_start()` 直接起一轮（不进提示音路径，提示音只在唤醒时播）；
+- 淡出结束后播放完成回调以 `ok=false` 上报，TTS 的 `TTS` 门控位由回调释放（≠ 打断时立刻放麦，避免淡出尾音被麦克风拾进 AFE）；
+- 云端侧：`interrupt` 报文发出即作废本轮，服务端不再下发 `tts_end`（PROTOCOL §8）。
 
 ### 8.3 音乐播放
 

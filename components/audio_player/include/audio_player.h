@@ -153,3 +153,55 @@ void audio_player_stats_reset(void);
 /* 音量 0~100（软件数字音量） */
 esp_err_t audio_player_set_volume(uint8_t volume);
 uint8_t audio_player_get_volume(void);
+
+/* ---------------- 三通道混音（T3.3） ----------------
+ * 输出链：CH_TTS / CH_PROMPT / CH_MUSIC（48k 单声道 ring）→ 饱和相加 →
+ * 音量（0~100，20ms 线性插值）→ 软限幅（上限 -1dBFS，渐近式无硬削波）→ I2S 48k 立体声。
+ * 通道增益：音乐（CH_MUSIC）在语音播放时 duck 到 -12dB；提示音（CH_PROMPT）在 TTS 播放时
+ * 让位到 -6dB；TTS 恒 0dB。通道起播 10ms 淡入、结束 100ms 淡出。
+ * 约束：不新增任务；ring/捕获缓冲全部 PSRAM；player 任务内不做 malloc。
+ */
+typedef enum {
+    AUDIO_PLAYER_CH_TTS = 0,   /* 云端 TTS / 整段探针 */
+    AUDIO_PLAYER_CH_PROMPT,    /* 本地提示音 */
+    AUDIO_PLAYER_CH_MUSIC,     /* 音乐（P4 接真实音源，本轮仅骨架 + 探针） */
+    AUDIO_PLAYER_CH_NUM,
+} audio_player_ch_t;
+
+/* 单通道混音状态（diag 的 player mix stat 用） */
+typedef struct {
+    bool active;          /* 参与混音 */
+    uint32_t gain_q8;     /* 通道增益，256=0dB、128≈-6dB、64≈-12dB */
+    uint32_t level_ms;    /* ring 内待播毫秒 */
+    uint32_t peak;        /* 重置以来该通道贡献的最大幅度（含包络/增益） */
+} audio_player_ch_stats_t;
+
+typedef struct {
+    uint8_t vol;                /* 音量设置值 0~100 */
+    uint32_t vol_q8;            /* 当前生效音量（q8，256=100%，含插值） */
+    uint32_t vol_target_q8;     /* 目标音量（q8） */
+    uint32_t limiter;           /* 重置以来触发软限幅的样本数 */
+    uint32_t limiter_peak;      /* 触发限幅前的最大幅度（可能 >32767） */
+    uint32_t clip;              /* 硬削波样本数（设计上恒 0，用于自证"无削波"） */
+    uint32_t mix_peak;          /* 最近 ~320ms 混音输出峰值 */
+    uint32_t block_max_us;      /* 重置以来单块（10ms）泵+混音+限幅最大耗时 */
+    audio_player_ch_stats_t ch[AUDIO_PLAYER_CH_NUM];
+} audio_player_mix_stats_t;
+
+esp_err_t audio_player_mix_stats_read(audio_player_mix_stats_t *out);
+void audio_player_mix_stats_reset(void);
+
+/* ---------------- 混音探针（T3.3，仅开发期 diag 使用，量产不调用） ----------------
+ * player mix tone：往指定通道塞一个正弦音调源（相位从峰值开始，用于验证 10ms 淡入），
+ *   freq 100~4000 Hz、ms 50~10000、amp 100~20000。播放器空闲时自动起混音泵；
+ *   泵已在跑时直接叠加；真实播放任务（提示音/TTS/MP3）在播时返回 ESP_ERR_INVALID_STATE。
+ * player mix stop：停掉所有探针音调源（真实播放任务不受影响，返回 ESP_ERR_INVALID_STATE）。
+ * player mix capture/read：从下一个混音输出块开始抓取 48k 单声道输出（≤16384 帧，PSRAM），
+ *   供 PC 侧 FFT/幅度/包络对拍。capture 缓冲在首次调用时从 PSRAM 分配。
+ */
+esp_err_t audio_player_mix_tone(audio_player_ch_t ch, uint32_t freq_hz, uint32_t ms, uint32_t amp);
+esp_err_t audio_player_mix_stop(void);
+esp_err_t audio_player_mix_capture(uint32_t frames);
+/* 已抓取样例数（播放提前结束时 < 请求帧数；PC 侧应只 dump 这一段） */
+esp_err_t audio_player_mix_capture_status(uint32_t *captured, uint32_t *requested);
+esp_err_t audio_player_mix_capture_read(int16_t *dst, size_t offset, size_t count);

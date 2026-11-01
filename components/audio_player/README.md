@@ -1,10 +1,19 @@
 # audio_player —— 播放引擎（L2 音频引擎层）
 
-**作用**：把单声道 PCM（提示音）、整段 MP3（本地/探针）或**流式 MP3**（TTS 下行）变成 48kHz 立体声输出，负责解码、重采样、音量、淡入淡出、欠载补静音、尾音处理，并在播放结束后通知业务层。
+**作用**：把提示音 PCM、整段 MP3（本地/探针）与**流式 MP3**（TTS 下行）分别送进 **`CH_PROMPT` / `CH_MUSIC` / `CH_TTS` 三个通道**，混音成 48kHz 立体声输出；负责解码、重采样、混音、音量、淡入淡出、duck、软限幅、欠载补静音、尾音处理，并在播放结束后通知业务层（T3.3 起三通道混音）。
 
 ## 当前能力
 
 - 独立播放任务（核 1、优先级 5、栈 6KB），任务队列深度 4；不新增任务；
+- **三通道混音（T3.3）**：`CH_TTS`（TTS 流）/`CH_PROMPT`（提示音）/`CH_MUSIC`（整段 MP3，
+  将来音乐源）各一个 **8192 帧（170ms）PSRAM ring**；混音级每 10ms 从三路取数相加（int32，
+  最大 ±98301，中间不截断）→ 音量（q16，20ms 线性插值）→ **-1dBFS 软限幅**（膝点 26276、
+  上限 29196，有理函数渐近、无硬削波）→ R4 淡出 → I2S；`clip` 计数恒 0 用于自证无削波；
+- **通道增益/优先级**：TTS 恒 0dB；`CH_PROMPT` 在 TTS 活跃时让位到 **-6dB**（q16=32768）；
+  `CH_MUSIC` 在语音（TTS 或提示音）活跃或 `set_duck(true)` 时 duck 到 **-12dB**（q16=16384）。
+  斜坡**目标变化时按 100ms 线性重算步进**、块内逐样本推进（若每块按剩余差重算会变成指数逼近，
+  真机实测 240ms 才到位，三通道幅度断言会偏高）；
+- 通道起播 10ms 淡入；源耗尽（`closed`）且残留 ≤100ms 时做 100ms 淡出，播空即退出；
 - **PCM 播放**：线性重采样到 48kHz（如提示音 16k → 48k），单声道复制到 L/R；
 - **整段 MP3（T2.3）**：[minimp3](third_party/minimp3/README.md)（CC0）解码 → 双声道取 (L+R)/2 → 单声道 PSRAM 缓冲 → 同一条重采样/音量/淡入淡出链路；
 - **流式 MP3（T2.4，TTS）**：下行 0x02 字节写入 PSRAM ring，player 任务边收边解；
@@ -12,11 +21,11 @@
   - 跨帧/跨块**连续重采样**：游标 `(整数位置, 分数)` + 上一块末样本 carry，帧边界不重复淡入淡出、无缝隙；
   - 欠载：ring 空但流未结束 → 输出静音继续走 I2S 时钟，每次连续欠载计 1 次 `underruns` 并限频 WARN；恢复后继续解码（不重置解码器）；
   - 流中帧参数（采样率/声道）变化 → abort + WARN、回调 `ok=false`；
-  - `stream_end`：排空 ring/解完最后一帧后切 100ms 收尾环 → 最后一环线性淡出 100ms → 既有静音冲刷/关 TX → 300ms 尾部延时 → 回调 `ok=true`；`decoded_frames==0` 时不使能 I2S、WARN、立即回调 `ok=false`；
+  - `stream_end`：排空已收数据、解码器无更多数据后标记通道 `closed`，通道包络对残留 ≤100ms 做线性淡出 → 静音冲刷/关 TX → 300ms 尾部延时 → 回调 `ok=true`（T3.3 起不再用独立"收尾环"，淡出由混音通道统一施加）；`decoded_frames==0` 时不使能 I2S、WARN、立即回调 `ok=false`；
   - `stream_abort`：≤20ms 内停止写音频并关 TX、丢弃 ring 剩余、回调 `ok=false`；
   - 流式 active 期间拒绝 `play_pcm`/`play_mp3`，`is_busy()` 返回 true；
-- 软件音量 0~100（MAX98357A 无数字音量，增益由 SD 电阻固定）；
-- 淡入 10ms / 淡出 100ms；按块限幅（16bit）；
+- 软件音量 0~100（MAX98357A 无数字音量，增益由 SD 电阻固定）：混音后、限幅前施加，20ms 插值；
+- 淡入 10ms / 淡出 100ms；软限幅 -1dBFS（见上）；
 - 播放结束：静音冲刷 DMA + 150ms 延时 + 关 TX；完成回调带 300ms 尾部延时（半双工规则 R2）；
 - 完成回调：主槽（`register_done_cb`，覆盖语义）+ 3 个附加订阅槽（`subscribe/unsubscribe_done`），按主槽→附加槽顺序分发，参数 `(src, ok, arg)`；流式/打断/失败都回调；
 - 播放/解码/流式统计（`audio_player_stats_read()` / `audio_player_stream_stats_read()`），供 `diag` 的 `player stat` 观测。
@@ -40,11 +49,15 @@
 | `audio_player_stream_stats_read(out)` | 流式统计（见下） |
 | `audio_player_is_busy()` | 是否正在播放（含解码阶段与排队；流式期间为 true） |
 | `audio_player_fade_out_and_stop(ms)` | **R4 打断（T3.2）**：对当前任务（PCM/整段 MP3/流式）线性淡出到静音后停播，回调 `ok=false`；实测 `last_stop_ms` 79~95ms（80ms 淡出） |
-| `audio_player_set_duck(on)` / `get_duck()` | **R3 duck（T3.2）**：在用户音量之外叠 `-AUDIO_PLAYER_DUCK_DB`（默认 12dB，q8=64）、`DUCK_RAMP_MS` 线性斜坡；不改 `s_volume`，关掉即恢复原音量 |
+| `audio_player_set_duck(on)` / `get_duck()` | **R3 duck**：**T3.3 起作用于 `CH_MUSIC` 通道增益**（`-AUDIO_PLAYER_DUCK_DB` 默认 12dB，q16=16384），100ms 线性斜坡；不改 `s_volume`，关掉即恢复；语音活跃时自动 duck |
 | `audio_player_current_src(&src)` | 当前正在播的任务类型（忙时有效）；R3 判断"音乐/本地长播 vs 提示音/TTS"用 |
 | `audio_player_set_volume(v)` / `get_volume()` | 软件音量 0~100 |
 | `audio_player_stats_read(out)` / `stats_reset()` | 播放统计 + 最近一次整段 MP3 解码统计；`stats_reset()` 同时清空流式统计 |
 | `audio_player_mp3_pcm_read(dst, off, n)` | 开发期探针：读取最近一次整段解码 PCM，供 PC 侧与 FFmpeg 逐样本对拍 |
+| `audio_player_mix_stats_read(out)` / `mix_stats_reset()` | 三通道混音统计（`player mix stat`）：音量/插值状态、限幅计数与限幅前峰值、`clip`、`mix_peak`、单块耗时、三通道 active/gain_q8/水位/峰值 |
+| `audio_player_mix_tone(ch, freq, ms, amp)` | 开发期探针：往指定通道塞正弦音调（相位从峰值开始，便于验证 10ms 淡入）；播放器空闲时自动起混音泵，泵在跑时直接叠加 |
+| `audio_player_mix_stop()` | 停掉所有探针音调源（真实播放任务不受影响） |
+| `audio_player_mix_capture(frames)` / `capture_status(&captured, &requested)` / `capture_read(dst, off, n)` | 开发期探针：从下一个混音输出块开始抓 48k 单声道输出（≤16384 帧，PSRAM，首次用时分配），供 PC 侧 FFT/包络/限幅对拍；`capture_read` 只允许读已抓到的部分（播放提前结束时 `captured < requested`） |
 
 流式统计字段（`audio_player_stream_stats_t`）：`active / fed_frames / fed_bytes / decoded_frames / decoded_samples / rate / channels / ring_level_ms / ring_high_ms / underruns / dropped_bytes / bad_frames / first_byte_to_sound_us / duration_ms`。
 
@@ -70,8 +83,8 @@
 ## 内存与实时约束（CONVENTIONS §3/§4）
 
 - I2S 输出块（480 帧 ×2ch ×2B）在**内部 RAM**（DMA 需要），播放任务内不做动态分配；
-- **PSRAM**：MP3 解码状态 38,020 B（minimp3 状态/临时区/单帧/单声道帧/pending 8KB）+ 整段 PCM 512KB + 流式 ring 64KB + 起播 stage 6,912 B + 收尾环 9,600 B + ring 读取暂存 2KB；
-- **内部 RAM 增量 0**（T2.4 只在静态区 +192 B：流式状态/计数器），`player` 任务栈保持 6KB；实测流式播放中 `sys tasks` 栈余约 3,544 B；
+- **PSRAM**：MP3 解码状态 38,020 B（minimp3 状态/临时区/单帧/单声道帧/pending 8KB）+ 整段 PCM 512KB + 流式 ring 64KB + 起播 stage 6,912 B + ring 读取暂存 2KB + TTS 泵中转 960 B + **三通道 ring 3×16KB** + 探针抓取 32KB（首次用时分配）；
+- **内部 RAM**：T3.3 新增静态约 +1.5KB（三通道状态/混音统计/流式上下文瘦身），`player` 任务栈保持 6KB、不新增任务；实测 `sys tasks` 播放中栈余约 3.5KB；内部 RAM 预算见 CONVENTIONS §4；
 - 音频任务内禁止 malloc/网络/Flash/阻塞；水位统计与 ring 拷贝用临界区（单次 memcpy ≤2KB）；
 - minimp3 上游把 16.3KB 临时区放任务栈（6KB 栈必爆），本项目用 3 处补丁改成调用方注册（见 `third_party/minimp3/README.md`）；
 - 流式解码用**自解析帧头求帧长**，凑满整帧才交给 minimp3：minimp3 在"数据不足"分支会 memset 解码器状态（丢比特池），每块都踩会让部分帧解出噪声；坏数据/丢块后重新找同步字并限频 WARN；

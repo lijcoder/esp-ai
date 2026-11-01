@@ -11,7 +11,7 @@
 | `今天吃了什么.wav` | 交互语音素材（模拟用户提问） | `afplay tools/今天吃了什么.wav`，见下文 |
 | `opus_enc_test.py` | 上行 Opus 编码真机自测（T2.2）：串口抓帧 + PyAV 独立解码断言 + 内存/泄漏 | `uv run tools/opus_enc_test.py --self-test`，见下文 |
 | `voice_cloud_test.py` | 语音云端到端真机自测（T2.5）：起 mock → 唤醒 → 上行 Opus → 下行事件 → sid/统计断言 | `uv run tools/voice_cloud_test.py`，见下文 |
-| `tts_stream_test.py` | 下行 TTS **流式播放**真机自测（T2.4）：真实 MP3 经 WS 0x02 下发 → 首帧延迟/欠载/解码对拍/abort/排空/10 轮堆稳定 | `uv run tools/tts_stream_test.py`，见下文 |
+| `tts_stream_test.py` | 下行 TTS **流式播放**真机自测（T2.4 / T3.2 R3–R5）：真实 MP3 经 WS 0x02 下发 → 首帧延迟/欠载/解码对拍/abort/排空/10 轮堆稳定；可选 R4 按键打断、R5 无丢弃、R3 ducking、提示音 R1 原因位 | `uv run tools/tts_stream_test.py`，见下文 |
 | `e2e_voice_test.py` | **端到端语音**真机自测（T2.6）：唤醒 → 上行 Opus → 真实 MP3 下行流式播放 → R2，10 轮稳定性 + P2 验收断言 | `uv run tools/e2e_voice_test.py`，见下文 |
 | `record_wav.py` | 串口采集 WAV，用于唤醒/AEC 实测（**T5.2 计划，尚未实现**） | — |
 
@@ -319,10 +319,13 @@ uv run tools/mp3_test.py --repeat 3 --min-peak 1500 --no-reset
 **边界**：T2.3 是"整段解码后播放"；T2.4 流式播放的首帧延迟/欠载/abort/排空断言由
 `tts_stream_test.py` 承接（见下一节），mock 真实 MP3 下发由 `ws_mock_server.py --tts-mp3` 提供。
 
-## tts_stream_test.py —— 下行 TTS 流式播放真机自测（T2.4）
+## tts_stream_test.py —— 下行 TTS 流式播放真机自测（T2.4 / T3.2 R3–R5）
 
 **作用**：验证「真实 MP3 经 WS 0x02 帧下发 → 端侧流式解码播放」这条链路，断言音频侧硬指标
 （不是"能不能收到帧"，而是"首帧多久出声、会不会欠载、解出来对不对、打断停不停、收尾排不排空"）。
+T3.2 起额外提供四个**可选**场景（默认不跑）：`--interrupt`（R4 播放中按键打断）、
+`--r5`（正常收尾不产生 discard）、`--r3-duck`（音乐 ducking 探针）、`--prompt-r1`（提示音 R1 原因位），
+见下文「T3.2 附加场景」。
 
 一条命令完成：PC 侧生成素材 → 起 mock（`--tts-mp3`）→ 复位设备 → `vc start` → 轮询
 `vc status` 到 `UPLINK` → `vc stop` 确定性触发一轮（**不依赖唤醒词/人声/VAD**）→ mock 下发
@@ -330,9 +333,14 @@ uv run tools/mp3_test.py --repeat 3 --min-peak 1500 --no-reset
 
 ```bash
 uv run tools/tts_stream_test.py                    # 全量（默认复位设备、独占串口，约 1.5~2 分钟）
-uv run tools/tts_stream_test.py --dry-run          # 只生成素材 + PyAV 参考，不连设备
+uv run tools/tts_stream_test.py --dry-run          # 只生成素材 + PyAV 参考 + 自检解析逻辑，不连设备
+uv run tools/tts_stream_test.py --self-test        # 只做 T3.2 新解析/断言逻辑离线自检（33 项）
 uv run tools/tts_stream_test.py --no-reset         # 设备已在跑
 uv run tools/tts_stream_test.py --skip-heap        # 跳过 10 轮堆稳定（快速冒烟）
+uv run tools/tts_stream_test.py --interrupt        # 附加 R4：真实 MP3 播放中按键打断 + 回归轮次
+uv run tools/tts_stream_test.py --r5               # 附加 R5：正常收尾轮不产生 discard
+uv run tools/tts_stream_test.py --r3-duck          # 附加 R3：player duck on/off 前后 out_peak 对比
+uv run tools/tts_stream_test.py --prompt-r1        # 附加：提示音 R1 原因位（hold_mask=0x1，需外放）
 uv run tools/tts_stream_test.py --log /tmp/tts_stream.log
 ```
 
@@ -352,7 +360,7 @@ PyAV 独立解码出参考：`frames=202 samples=116352 rate=24000 ch=1 dur=4848
 - `vc stat` 下行行追加：`；音频丢弃 <n> 帧 字节 <n>`
 - 轮次触发/收尾继续用 T2.5 已有日志：`VC: round start` / `TTS start` / `TTS end` / `round done` / `round aborted`
 
-### 六个场景与断言
+### 场景与断言（基础 6 个，另有可选 T3.2 场景 7~10）
 
 | # | 场景 | 关键断言 |
 |---|---|---|
@@ -362,6 +370,10 @@ PyAV 独立解码出参考：`frames=202 samples=116352 rate=24000 ch=1 dur=4848
 | 4 | stall 欠载 | mock 在 `--tts-stall-at` 帧后停发 `--tts-stall-ms`（默认 600ms）：`underrun>=1`、日志 `stream underrun`；停发不丢帧、恢复后 decoded 完整、`rounds_done=1`；mock 日志确认 stall；**`dur` 用物理口径 `[素材时长, 素材时长+stall_ms+300ms]`**（stall 按设计补静音，会顶破 ±10%，与实现无关） |
 | 5 | 窗口外帧丢弃 | mock `--tts-late-bin`：`tts_start` 前 / `tts_end` 后各 1 帧 0x02；`vc`「音频丢弃」≥2 帧且字节>0；窗口内计数/播放仍==素材帧数（不误播）；无 ERROR |
 | 6 | 合成帧降级 | mock 下发合成帧（不可解码）：本轮仍 `round done`、`active=0`、decoded≤2、收音恢复、**无 ERROR/panic**（bad data 只允许 WARN） |
+| 7（可选 `--interrupt`） | **R4 按键打断**（T3.2） | 播放中 `hold_mask=0x2`（仅 TTS 位）+ 收音暂停；`evt post BUTTON`（必须先处于 SPEAKING）→ 打断链路日志齐全、`last_stop_ms<100`、`discard_samples≈800`、打断后 `hold_mask=0x0`、mock `interrupt` 计数=1 且不再发 `tts_end`；随后再跑一轮正常播放（回归 + R5） |
+| 8（可选 `--r5`） | **R5 正常收尾无丢弃**（T3.2） | `mic reset` 后正常一轮：`discard_samples==0`、`hold_mask=0x0`、收音恢复「开启」、hold/release 计数各 ≥1 |
+| 9（可选 `--r3-duck`） | **R3 音乐 ducking**（T3.2） | 恒定幅度 1kHz MP3 播放中：`player duck on` 后 `out_peak` ≈0.25× 基线（0.15~0.45），`player duck off` 后恢复 ≥0.7× 基线，`duck on` 字段 0/1 正确切换 |
+| 10（可选 `--prompt-r1`） | **提示音 R1 原因位**（T3.2 统一门控） | `afplay lexin.wav` 唤醒 → 提示音期间 `hold_mask=0x1`（仅 PROMPT 位）+ 收音暂停 → `prompt done, feed resumed` 后 `hold_mask=0x0` + 收音开启 |
 
 另有全程健康检查：只按 `E (…)`/panic 判失败（`round aborted` 的 W 是预期）；`--no-mock`
 时跳过 mock 侧断言与依赖重启 mock 的场景 4~6，并打印 WARN。
@@ -372,14 +384,103 @@ PyAV 独立解码出参考：`frames=202 samples=116352 rate=24000 ch=1 dur=4848
 preroll=3 时 dur=5342ms，均落在物理范围内（通用 ±10% 上限 5332ms 会随机 FAIL，与实现无关）。
 判定逻辑见 `tts_stream_test.check_duration()`。
 
+### T3.2 附加场景：R4 按键打断 / R5 无丢弃 / R3 ducking / 提示音 R1（默认不跑）
+
+这四个场景**默认关闭**，需要 Lead 的 T3.2 固件契约就绪后手动加参数跑；固件缺契约时只影响这些
+可选场景（记 FAIL 并在输出里提示"契约未就绪"），基础 6 个场景不受影响。新增解析逻辑可先用
+`--self-test`（33 项、不连设备）或 `--dry-run`（素材/PyAV 参考 + 自检）离线验证。
+
+**T3.2「统一门控」直接证据（4 条 hold_mask 断言）**：T3.2 的核心是 R1/R2 从
+「两套独立开关」改成 `audio_fe` **原因位仲裁**（`AUDIO_FE_HOLD_PROMPT=1<<0` / `AUDIO_FE_HOLD_TTS=1<<1`，
+位图归零才真正开麦）。脚本用三条断言直接证明走的是仲裁器、两路 owner 互不覆盖：
+
+| 时机 | 期望 | 由谁断言 |
+|---|---|---|
+| TTS 播放中（`tts_start` 后 decoded≥8 帧、`stream active=1`） | `hold_mask == 0x2`（只有 TTS 位）+ `状态: 收音 暂停`；日志 `AFE: feed paused (holds=0x02)` | `--interrupt` 场景内、`evt post BUTTON` 之前 |
+| R4 打断完成、`AFE: feed resumed` 之后 | `hold_mask == 0x0` + 收音开启、`discard_samples≈800` | `--interrupt` 场景内（已有） |
+| 唤醒提示音播放中（`AFE: feed paused` 触发后**紧接着**读） | `hold_mask == 0x1`（只有 PROMPT 位）+ 收音暂停；日志 `AFE: feed paused (holds=0x01)` | `--prompt-r1` 场景 |
+| 提示音播完（`prompt done, feed resumed` 后） | `hold_mask == 0x0` + 收音开启 | `--prompt-r1` 场景 |
+
+> 注意：`hold_mask` 只在对应播放期间非 0，窗口很短（提示音 1.28s、TTS 数秒），脚本都是
+> **日志触发后立即读**，不用固定 sleep；旧实现的「两套独立开关」在一个 owner 释放时会把另一个
+> owner 的暂停顶掉，这四条 mask 断言就是为了抓这种回归。
+
+**设备侧新增可观测契约（脚本只消费、正则容错，不绑死完整行；已对照 Lead 的固件实现核对）**：
+
+| 来源 | 格式 / 子串 | 断言口径 |
+|---|---|---|
+| `mic stat` 追加行 | `门控: holds=<n> releases=<n> hold_mask=0x<hex> discards=<n> discard_samples=<n> last_discard_ms=<n>`（累计值；旧草稿前缀 `feed:` 也认） | `mic reset` 会把 holds/releases/discards/discard_samples/last_discard_ms 一起清零，**hold_mask 是状态不清**；R4/R5 都用"先 reset 再读绝对值"口径 |
+| `player stat` 追加行 | `duck: on=<0\|1> gain_q8=<n> out_peak=<n> stop: last_stop_ms=<n> stops=<n>`（早期草稿字段名 `last_req_to_tx_off_ms` 也认） | `last_stop_ms`=淡出请求→输出静音（Kconfig 淡出 **80ms**=3840 帧，实测 **79~95ms**——最后一块内就归零，**79 是正常值**），R4 只断言上界 `<100`、不设下界；`out_peak`=最近 **320ms** 输出峰值（32×10ms 环），R3 用 duck 前后对比；`stops` 同步递增，脚本用它防 `last_stop_ms=0` 假通过 |
+| 探针命令 | `player duck on\|off`（回显 `PLAYERDUCK on=0\|1`）、`player stop [ms]`（默认 80，手动验 R4 淡出用） | R3 用 duck on/off；`player stop` 本脚本不直接用（停声以 stat 为准） |
+| 按键事件 | `evt post BUTTON`（payload `action=短按`，经 event_bus → voice_session R4 链路） | **必须在 SPEAKING 时投**：IDLE 下该事件会被 `voice_session` 当成"按键起一轮" |
+| 打断链路日志 | `AFE: feed paused (holds=0x…)` / `VS: 打断当前会话（state=…）` / `PLAYER: fade out <ms> ms → stop` / `VC: interrupt sent sid=` / `AFE: feed resumed (discard 50 ms, hold_mask=0x…)` / `VS: state SPEAKING -> IDLE（…原因=interrupt）` | 全部按**子串/正则**匹配（日志含中文与耗时字段，不绑死整行）；`PLAYER: stop` 不一定单独打，停声证据用 `player stat` 的 `last_stop_ms` |
+| 相关 Kconfig（默认值） | `AUDIO_PLAYER_INTERRUPT_FADE_MS=80`、`AUDIO_FE_RESUME_DISCARD_MS=50`（→800 样本 @16k）、`AUDIO_PLAYER_DUCK_DB=12`（≈0.25 倍）、`AUDIO_PLAYER_DUCK_RAMP_MS=100`、`AUDIO_PLAYER_TAIL_DELAY_MS=300` | 改这些值会改变断言阈值（`last_stop_ms`/`discard_samples`/duck 比率/恢复时机），改前先同步脚本口径 |
+| R4 固件流程 | `vs_interrupt()`：player 淡出请求 → `audio_fe_feed_discard_ms(50)`（TTS hold 还压着时记 pending，release 时才真正开窗）→ `vc_interrupt()` 发 interrupt 报文 + 本地作废本轮 → 回 IDLE；TTS 的 hold 位由播放完成回调释放 | 所以脚本在"播放中（hold 之后）`mic reset`"时 **holds 会被清零、releases 仍 ≥1**：R4 只断言 releases≥1 + discard/hold_mask/收音，**不断言 holds 具体值** |
+
+**`--interrupt`（R4）断言清单**：
+
+1. **用 `vs start` 起轮**（不能用 `vc start`：T2.4 的确定性探针不经过 `voice_session`，VS 会停在 IDLE，`evt post BUTTON` 会被当成「按键开始对话」起新轮、走不到 `vs_interrupt`；这是真机联调实测踩到的，见下）→ `vc stop` → `tts_start` → mock 真实 MP3 播放中：`stream active=1`、已解码 ≥`--interrupt-after-frames`（默认 8 帧 ≈0.4s）、**`vs status == SPEAKING`**；
+2. **统一门控证据**：播放中 `mic stat` 的 `hold_mask == 0x2`（只有 TTS 位）+ 收音「暂停」；日志 `AFE: feed paused (holds=0x02)`（`holds` 掩码按十六进制解析，精确等于 TTS 位）；
+3. **打断前 `mic reset`**（只清计数、hold_mask 保留）→ 串口发 `evt post BUTTON`；
+4. 打断链路：`VC: interrupt sent sid=`（sid 与本轮一致）、`VS: 打断当前会话`、`PLAYER: fade out <ms> ms`、`VS: state SPEAKING -> IDLE`（原因含 interrupt/button）、`AFE: feed resumed`（若带 `discard <n> ms` 再断言 20~100ms）、vc 回 IDLE、stream `active=0`；
+5. 停声证据：`player stat` 的 `duck: … last_stop_ms=<n>` **< `--stop-ms-max`（默认 100ms）**，打印 `stops/duck on/gain_q8/out_peak`；
+6. 设备侧不再出现本轮 `tts_end`；mock 日志出现 `<-- interrupt sid=` **恰好 1 次**（= `interrupts` 计数 1）、`下发被取消 sid=`，且 **没有 `--> tts_end sid=`**；
+7. `mic stat`（打断后等 300ms）：`discard_samples≈800`（50ms@16k，容差 ±320=±1 帧）、`hold_mask=0x0`、收音「开启」、**releases≥1**（holds 取决于 reset 与 hold 的先后——脚本在 hold 之后 reset，holds 会被清零；**不断言 holds 具体值**，只打印）；
+8. 回归：`vc reset`+`player reset`+`mic reset` 后再跑一轮正常播放（全套正常断言 + R5 discard==0 + mock 下发完成），证明打断没有破坏后续轮次。
+
+> **R4 真机联调坑（2026-11-01）**：首版脚本用 `vc start` 起轮，`evt post BUTTON` 被
+> `vs_on_app_evt` 的 IDLE 分支当成「按键开始对话」（日志 `VS: 按键开始对话（IDLE 短按 → LISTENING）`，
+> 原轮次 `round aborted（new-round）`），打断链路完全没触发。产品路径（唤醒→VS LISTENING→TTS→SPEAKING）
+> 天然满足"必须 SPEAKING"，所以这是**测试注入方式**的问题、不是固件缺陷：R4 场景必须用 `vs start`
+> 让 VS 真正进 SPEAKING，并在发 BUTTON 前断言 `vs status`。已真机验证通过。
+
+**`--r5` 断言清单**：`mic reset` → 正常一轮 → `mic stat` 断言 `discard_samples==0`、`hold_mask=0x0`、收音「开启」、holds/releases ≥1（既有 `check_no_discard()`；`--interrupt` 的回归轮被同一函数覆盖）。
+
+**`--r3-duck` 断言清单**：PC 侧 lameenc 现生成恒定幅度 1kHz 音调 MP3（`--duck-seconds` 默认 4s）→ `player load` 上传 → `player mp3` 播放 → 播放中读 `out_peak` 基线 → `player duck on` 等 `--duck-window`（默认 **0.55s**）→ `out_peak` 为基线 **0.15~0.45 倍**（目标 0.25）→ `player duck off` 等一个窗口 → 恢复 **≥0.7 倍**基线；全程校验 `duck on` 字段 0/1。**为什么窗口默认 0.55s 而不是刚好 0.32s**：`out_peak` 是最近 **320ms** 输出峰值（PEAK_RING_LEN=32×10ms），而 duck 增益按 **100ms** 斜坡走完；窗口太短会把「斜坡开始时还很响的块」算进峰值，导致比率虚高、随机 FAIL。0.55s ≈ 320ms 窗口 + 100ms 斜坡 + 串口往返余量。该场景依赖 `CONFIG_DIAG_ENABLE_PLAYER_TEST=y`（`player load/mp3/duck` 探针，**开发期探针，量产必须关**）。
+
+**`--prompt-r1` 断言清单**：先等 vc IDLE（播放器忙时唤醒会被丢弃）→ `afplay tools/lexin.wav`
+（Mac 扬声器**外放**，系统音量临时到 `--volume` 默认 50、结束恢复、支持 `--wake-retries` 默认 2 次）→
+等 `AFE: feed paused`（R1）→ **立即**读 `mic stat`：`hold_mask==0x1`（仅 PROMPT 位）、收音「暂停」、
+日志 `holds=0x01` → 等 `prompt done, feed resumed`（R2）→ 再读 `hold_mask==0x0`、收音「开启」。
+该场景放在所有 vc/duck 场景**最后**执行（唤醒会让 VS 进 LISTENING，可能自动起一轮）。
+
+**前置条件与注意事项**：
+
+- **固件必须含 T3.2 契约**（`mic stat` 门控行 / `player stat` duck+stop 行 / `evt post BUTTON` 短按打断 / R4 链路日志）；固件未就绪时这些场景会 FAIL（输出会提示契约缺失），不要据此判断实现好坏。
+- 这些场景**独占串口**：真机验证前先和 Lead 确认时间窗（同一时间只能一个人用设备），并先关 `idf.py monitor`。
+- `--interrupt` 需要脚本**自己拉起 mock**（`--tts-mp3`）：`--no-mock` / mock 端口被占用（复用外部 mock）时会 WARN 并跳过打断场景（mock 侧 `interrupt`/`tts_end` 无法断言）。
+- `--r3-duck` 需要开发探针配置 `CONFIG_DIAG_ENABLE_PLAYER_TEST=y`；与 mock / vc 无关，放在所有 vc 场景之后执行（`player mp3` 直连播放路径）。
+- `--prompt-r1` 会**外放**（`afplay tools/lexin.wav`）并依赖 Mac 扬声器→设备麦克风；系统静音/音量过低/环境噪声大时会漏唤醒（脚本按 `--wake-retries` 重试，仍失败记 FAIL + WARN「属环境问题」）。排查唤醒先用 `uv run tools/voice_test.py --volume 50 --wakes 3`，不要据此判断门控逻辑。
+- 断言阈值都可用 `--stop-ms-max` 等参数微调，但**不要为通过而放宽**：R4 `<100ms`、R5 `discard==0`、R3 `0.15~0.45`、hold_mask 精确位（0x2/0x1/0x0）都是 T3.2 的验收口径。
+
+### T3.2 真机验收基线（2026-11-01，固件 T3.2 最终版）
+
+| 跑法 | 结果 | 说明 |
+|---|---|---|
+| 全量 `--interrupt --r5 --r3-duck` | **307/307 PASS，exit 0** | **基础 193 项全绿** + 114 项 T3.2 R4/R5/R3 新断言 |
+| 聚焦 `--interrupt --r5 --r3-duck --prompt-r1 --skip-heap --skip-abort --skip-scenarios` | **162/162 PASS，exit 0** | 四个附加场景（含提示音 R1 原因位）一次跑全绿 |
+| `--prompt-r1` 单独（`--skip-heap --skip-abort --skip-scenarios`） | **48/48 PASS**（复跑 2 次） | 环境噪声高时需 1~3 次回放唤醒（`--wake-retries 4`），未改固件断言 |
+
+关键实测值（真机）：
+
+- `hold_mask` 四条证据：TTS 播放中 **0x2**（仅 TTS 位）→ R4 打断后 **0x0**；提示音期间 **0x1**（仅 PROMPT 位）→ 播完 **0x0**；配 `AFE: feed paused (holds=0x02/0x01)` 日志；
+- R4：`last_stop_ms` **80 / 77 / 64 ms**（三次，全部 `<100`；64 略低于初始估计的 79~95，断言只设上界）、`stops=1`、`PLAYER: fade out 80 ms → stop`、`VC: interrupt sent sid=`（mock 侧 `<-- interrupt` 计数=1、`下发被取消`、无 `--> tts_end`）；
+- R4 丢弃：`discard_samples=800`、`last_discard_ms=50`、`discards=1`（512+288，与 AFE chunksize 口径一致）；
+- R5/回归轮：`discard_samples=0`、`hold_mask=0x0`、收音开启、holds=1/releases=1；
+- R3 duck：`out_peak` 基线 **15563** → duck 后 **3890**（0.25×）→ 恢复 **15563**（1.00×）；
+- 10 轮堆稳定：PSRAM 首末差 **0 B**、内部堆波动达标、全程无 ERROR/panic。
+
+环境口径：本机当前环境底噪偏高（`mic stat` RMS 1000~1500、VAD 常报人声），`--prompt-r1` 唤醒会抖；按 `--wake-retries` 重试，仍失败按 README「环境失败」处理（先用 `voice_test.py --volume 50 --wakes 3` 排查），**不要改固件断言**。
+
 ### 与 voice_cloud_test.py 的分工（P2 验收两条都要跑）
 
-| | `voice_cloud_test.py`（T2.5） | `tts_stream_test.py`（T2.4） |
+| | `voice_cloud_test.py`（T2.5） | `tts_stream_test.py`（T2.4 / T3.2） |
 |---|---|---|
 | 触发方式 | 回放唤醒词 + 交互语音（真实用户路径） | `vc start`→`vc stop`（确定性，不依赖唤醒/VAD） |
 | mock 下发 | **合成帧**（只验协议/帧计数，不可解码） | **真实 MP3**（按帧切分、实时节奏） |
 | 关注点 | 握手/上行 Opus/ASR-LLM-TTS 事件/sid 过滤/收尾/内存水位 | 首帧延迟/预缓冲/欠载/解码对拍/abort 停声/排空/10 轮堆稳定 |
-| 额外参数 | `--inject-late`（sid 迟到事件） | `--tts-late-bin`（窗口外 0x02 帧）、`--stall-*` |
+| T3.2 半双工 | 端到端路径（唤醒→R1/R2） | **R4 按键打断 / R5 无丢弃 / R3 ducking / 提示音 R1 原因位**（确定性注入） |
+| 额外参数 | `--inject-late`（sid 迟到事件） | `--tts-late-bin`（窗口外 0x02 帧）、`--stall-*`、`--interrupt`/`--r5`/`--r3-duck` |
 
 ### 参数 / 依赖 / 限制
 
@@ -387,19 +488,29 @@ preroll=3 时 dur=5342ms，均落在物理范围内（通用 ±10% 上限 5332ms
   `--round-timeout`（默认 30s）、`--think-ms`（mock 首事件延时，默认 100）、`--pace-pct`（默认 80，
   见下）、`--material-repeats`（默认 3）、`--kbps`（默认 32）、`--heap-rounds`（默认 10）、
   `--stall-ms`/`--stall-at`（默认 600/30）、`--skip-heap|--skip-abort|--skip-stall|--skip-late|--skip-synthetic|--skip-scenarios`。
+- **T3.2 可选场景参数**：`--interrupt`、`--r5`、`--r3-duck`、`--prompt-r1`；`--interrupt-after-frames`（默认 8，
+  起播后解码多少帧再打断）、`--interrupt-timeout`（默认 5s，等打断链路日志）、`--stop-ms-max`
+  （默认 100ms，`last_stop_ms` 上限）、`--duck-seconds`/`--duck-warmup`/`--duck-window`
+  （R3 音调素材时长 4s / 基线窗口 0.6s / duck 窗口 0.55s，见 R3 断言清单）；`--prompt-r1` 相关：
+  `--volume`（默认 50=用户定稿上限，0=不改系统音量）、`--wake-timeout`（默认 5s）、
+  `--wake-retries`（默认 2）、`--prompt-timeout`（默认 8s）；`--self-test` 只做离线解析自检。
 - **`--pace-pct` 为什么默认 80 而不是 100**：mock 缺省实时节奏（100% = 契约默认）；但 macOS
   `asyncio.sleep` 每帧超调约 1.7ms（≈7%），100% 会让发送平均慢于播放、产生**假欠载**。本脚本用
   80%（≈20.9ms/帧 vs 播放 24ms/帧）让发送略快，给端侧留缓冲；真实欠载由场景 4 的 stall 强制制造。
 - 依赖：PEP 723 内联 `pyserial` / `lameenc` / `av` / `numpy`，`uv run` 自动安装。脚本**独占串口**
-  （先关 `idf.py monitor`）；**不改系统音量**（本测试不依赖 Mac 扬声器回放，与 `voice_test.py`
-  的音量口径无关，也不会外放）。
+  （先关 `idf.py monitor`）；**默认不改系统音量、不外放**（T2.4 场景不依赖 Mac 扬声器回放）；
+  只有 `--prompt-r1` 例外：外放 `afplay lexin.wav`，并临时把系统音量调到 `--volume`（默认 50）后恢复。
 - 场景 4~6 需要脚本自己拉起 mock 并在场景间**重启 mock**（切换 `--tts-mp3`/stall/late 参数），
   重启后脚本用 `ws reconnect` 让设备快速重连；`--no-mock` 或端口被占用（复用外部 mock）时这三项跳过。
 - mock 已默认对所有连接开 `TCP_NODELAY`（T2.4-C2）。若真机稳态仍出现 `underrun>0`，先确认跑的是带
   NODELAY 修复的 mock（`ws_mock_server.py --self-test` 含该断言、启动横幅有 `TCP_NODELAY=1` 标注），
   再排查；**不要通过放宽 underrun 阈值或调大 pace 掩盖**（真实云端同样应关 Nagle）。
 - 设备侧探针：`player stat` 的 stream 行由 T2.4-A 常驻提供；`player reset` 会清空流式统计（契约 §1.3），
-  每个场景前脚本都会 `vc reset` + `player reset` 让计数从 0 开始。
+  每个场景前脚本都会 `vc reset` + `player reset` 让计数从 0 开始。T3.2 的 `--r3-duck` 还依赖
+  `CONFIG_DIAG_ENABLE_PLAYER_TEST=y` 的 `player load/mp3/duck` 探针（开发期，量产必须关）。
+- **离线先自检**：`--self-test`（33 项，不连设备）验证 T3.2 新契约的正则/解析/阈值判定（含负例、hold_mask 原因位）；
+  `--dry-run` 额外生成素材 + PyAV 参考并跑同一套自检。真机跑 `--interrupt/--r5/--r3-duck` 前务必
+  先跑这两个，避免把脚本自身问题误判成固件问题。
 
 ## e2e_voice_test.py —— 端到端语音真机自测（T2.6，P2 收口）
 
@@ -499,13 +610,13 @@ uv run tools/e2e_voice_test.py --no-reset --log /tmp/e2e.log
 
 ### 与 voice_cloud_test.py / tts_stream_test.py 的分工（P2 验收三条都要跑）
 
-| | `voice_cloud_test.py`（T2.5） | `tts_stream_test.py`（T2.4） | `e2e_voice_test.py`（T2.6） |
+| | `voice_cloud_test.py`（T2.5） | `tts_stream_test.py`（T2.4 / T3.2） | `e2e_voice_test.py`（T2.6） |
 |---|---|---|---|
 | 触发方式 | 回放唤醒词 + 交互语音（真实路径，1 轮） | `vc start→stop` 确定性触发（不依赖唤醒） | **回放唤醒词 + 交互语音，10 轮** |
 | mock 下发 | 合成帧（只验协议/帧计数） | 真实 MP3 | **真实 MP3** |
 | 关注点 | 上行 Opus、ASR/TTS 事件、sid 过滤、stop/cancel 收尾 | 首帧延迟/欠载/解码对拍/abort/排空/10 轮堆稳定 | **端到端链路 + R1/R2 + 统计对账 + 10 轮稳定性 + 播放期拾音** |
-| 额外参数 | `--inject-late` | `--tts-late-bin`、`--stall-*` | `--max-retries`、`--allow-max-duration`、`--playback-warmup/window` |
-| 不覆盖 | 真实 MP3 播放、10 轮 | 唤醒/VAD/真实用户路径 | abort 停声延迟、stall 欠载、迟到帧、合成帧降级（这些仍由 tts_stream_test 覆盖） |
+| 额外参数 | `--inject-late` | `--tts-late-bin`、`--stall-*`、`--interrupt`/`--r5`/`--r3-duck` | `--max-retries`、`--allow-max-duration`、`--playback-warmup/window` |
+| 不覆盖 | 真实 MP3 播放、10 轮 | 唤醒/VAD/真实用户路径 | abort 停声延迟、stall 欠载、迟到帧、合成帧降级、R4 打断/R5 无丢弃/R3 ducking（这些仍由 tts_stream_test 覆盖） |
 
 ### 参数 / 依赖 / 限制
 
@@ -744,7 +855,7 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 
 ## 后续（未做）
 
-- `voice_cloud_test.py` 已承接 P2 端到端断言（唤醒 → 上行 Opus → ASR/LLM/TTS → 收尾/中止 + sid 过滤）；`mp3_test.py` 承接下行解码断言（T2.3 已交付）；**`tts_stream_test.py` 承接 T2.4 流式播放断言**（真实 MP3 → 首帧延迟/欠载/解码对拍/abort/排空/堆稳定）；P3 起增加会话状态机、半双工、打断断言；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
+- `voice_cloud_test.py` 已承接 P2 端到端断言（唤醒 → 上行 Opus → ASR/LLM/TTS → 收尾/中止 + sid 过滤）；`mp3_test.py` 承接下行解码断言（T2.3 已交付）；**`tts_stream_test.py` 承接 T2.4 流式播放断言**（真实 MP3 → 首帧延迟/欠载/解码对拍/abort/排空/堆稳定）；P3 半双工：T3.1 会话状态机由 `voice_cloud_test.py` 覆盖，**T3.2 R4 按键打断 / R5 无丢弃 / R3 ducking 由 `tts_stream_test.py` 的 `--interrupt`/`--r5`/`--r3-duck` 覆盖**（真机验收等 Lead 固件就绪后跑）；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
 - 下行流式播放断言（T2.4）→ **已交付 `tts_stream_test.py`**；mock 真实 MP3 下发 → **已交付 `--tts-mp3`**。
 - HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求），P4（T4.1/T4.2）前补。
 - `wss` + 自签证书（T1.4 决定证书策略后）。

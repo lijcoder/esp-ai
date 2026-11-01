@@ -97,6 +97,7 @@ components/<module>/
 - **端到端链路自测（T2.6 起）**：`uv run tools/e2e_voice_test.py` 走真实用户路径（afplay 唤醒 → 提示音 → 自动起轮 → 交互语音 → mock 真实 MP3 流式播放 → R2），10 轮逐轮断言（P2 三条 + 半双工/拾音/堆/PSRAM/任务/无 ERROR）；`--dry-run` 不连设备。与 `voice_cloud_test`（协议/事件、合成帧、`vc start` 手动触发）、`tts_stream_test`（`vc start/stop` + 真实 MP3 播放硬指标、含 abort/stall/late-bin）三方分工。拾音判据带环境噪声兜底（baseline=min(播放前后静音峰)，≥800 重试→WARN），**不要用重试掩盖固件 bug**。
 - **解析 coredump 必须用崩溃那一刻的 ELF**（`build/esp-ai.elf`，含符号与地址布局）：崩溃后先备份该文件再改代码/重建；要交付或现场测试的固件需把 elf 与 commit 一起归档，否则 coredump 无法还原调用栈。
 - **会话状态机调试（T3.1 起）**：`vs status` 看当前状态/sid/轮次与异常计数；`vs start`/`vs interrupt` 手动起轮/打断；迁移日志 `VS: state A -> B（sid=N，停留 M ms，原因=…）`。唤醒链路日志自 T3.1 起由 `VS` 输出（`VS: wake detected` / `VS: prompt done, feed resumed`），测试脚本正则用 `(?:APP|VS)` 兼容新旧固件。错误路径用 mock 验证：`--scenario error`（云端 error → ERROR）、`--think-ms 12000`（THINKING 10s 超时 → ERROR）。
+- **mock 真 ASR（T3.1 起，测试用）**：`uv run --with av --with numpy --with sherpa-onnx tools/ws_mock_server.py --asr sensevoice` 让 mock 把上行 Opus 帧解码后用本地 SenseVoice 识别（`tools/mock_asr.py`，独立于 DSH；默认假 ASR 路径不装这些依赖）；`uv run tools/mock_asr.py --test <wav>` 可离线验证识别；真机回归用 `uv run tools/voice_cloud_test.py --asr --asr-expect <子串>`。限制：离线整段识别、无中间结果，失败回退 `--tts-text`，只用于测试链路。
 
 ## 9. 禁止事项
 

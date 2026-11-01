@@ -126,10 +126,12 @@ uv run tools/voice_cloud_test.py                        # 默认 --volume 50，�
 uv run tools/voice_cloud_test.py --inject-late          # 让 mock 注入 sid+1 的迟到事件，验证端侧过滤
 uv run tools/voice_cloud_test.py --volume 31 --log /tmp/vc.log
 uv run tools/voice_cloud_test.py --no-mock              # 已有 mock 在跑（跳过 mock 侧断言）
+uv run tools/voice_cloud_test.py --asr --asr-expect 天气  # mock 用本地 SenseVoice 真 ASR，断言识别文本
 uv run tools/voice_cloud_test.py --dry-run              # 只检查素材/音量/串口
 ```
 
 **断言**：设备启动 + `hello_ack`；唤醒链路（`wake detected`→`feed paused`→`PLAYER: play`→`prompt done`，T3.1 起未知前缀由 `(?:APP|VS)` 兼容）；`round start` / 上行首帧 <200ms / `audio_end` 原因 `vad-silence` / `tts_start`(mp3/24000) / `tts_end` / `round done`；event_bus 收到 `ASR_FINAL`/`TTS_START`/`TTS_END`；上行帧数 ≥60、平均帧长 20~60B、首帧耗时、下行 100 帧与 `tts_end` 计数一致、`sid` 丢弃/解析失败/云端 error 为 0；mock 侧 sid 一致、逐帧收到、`seq` 无跳变、无坏帧；`vc stop` 收尾原因 `stop-request`、`vc cancel` 立即放弃；**T3.1 会话状态机**：`VS` 迁移序列必须为 `IDLE→LISTENING→THINKING→SPEAKING→IDLE`、迁移日志 `sid` 与本轮一致、event_bus 收到 `VOICE_STATE_CHANGED`、`vs status` 轮次开始/完成各 1 且无异常/超时；内部堆最低水位 ≥30KB、`vc` 任务栈剩余 ≥1KB、无 ERROR。**T3.1 真机实测 50/50 PASS**（含 `--inject-late` 50/50；T2.5 时为 43/43）。
+加 `--asr` 时额外断言：设备 `VC: ASR final` 的文本非空、与 mock 侧 SenseVoice 识别结果一致、不是 `--tts-text` 固定文案；`--asr-expect <子串>` 再校验内容（mock 子进程由脚本用 `uv --with` 拉起，本脚本自身不需要额外依赖）。
 
 ## afe_uplink_test.py —— 上行 PCM 接口真机自测（T2.1）
 
@@ -597,6 +599,44 @@ uv run --with websockets python -m websockets "ws://127.0.0.1:8765/v1/voice?devi
 [23:25:03.436] INFO  C1  连接关闭 | 时长 3.4s | 上行 5 帧/200B | 下行 103 帧/19776B | ping=1 pong=1 | 语音轮次=2 打断=1 坏帧=0 seq跳变=0
 ```
 
+### 3. 真 ASR：mock 用本地 SenseVoice 识别上行音频（T3.1 测试用）
+
+默认 mock 的 `asr_final.text` 是固定文案（`--tts-text`），只能验证链路。加 `--asr` 后，mock 会把
+`audio_start → audio_end` 之间的上行 **Opus 帧**解码成 16 kHz 单声道 PCM，再用
+**SenseVoiceSmall（sherpa-onnx，纯 CPU，离线）** 识别，`asr_partial/asr_final` 用真实识别结果。
+
+实现独立于 DSH：识别/解码代码在 [mock_asr.py](mock_asr.py)（自带 PEP 723 依赖声明），模型按
+固定 revision + SHA-256 校验；只在 `--asr` 时被 mock 延迟 import，**默认假 ASR 路径仍零额外依赖**。
+
+```bash
+# mock 侧（依赖用 uv --with 临时装；首次可加 --asr-download 下载 ~239MB 模型）
+uv run --with av --with numpy --with sherpa-onnx tools/ws_mock_server.py \
+    --asr sensevoice --asr-download --tts-mp3 /tmp/tts.mp3
+# 只准备模型 / 离线验证识别效果（不连设备、不需要 mock）
+uv run tools/mock_asr.py --download
+uv run tools/mock_asr.py --test tools/今天天气如何.wav tools/今天吃了什么.wav
+#   -> '今天天气如何？' / '今天吃的什么？'（音频/推理耗时随行打印）
+
+# 真机回归（脚本自己拉 mock；--asr-expect 可选，断言识别文本包含子串）
+uv run tools/voice_cloud_test.py --asr --asr-expect 天气
+```
+
+mock 日志会打印识别结果与耗时：
+
+```
+[ASR] 加载 SenseVoice（/Users/xxx/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx，threads=2，language=auto）...
+[ASR] 就绪（加载 0.35s）
+C1  --> asr_final sid=7 text='今天天气如何？'
+C1  [ASR] 识别结果: '今天天气如何？'（81 帧 / 音频 1.62s / 推理 0.05s / 总耗时 0.22s）
+```
+
+模型查找顺序：`--asr-model-dir` → 环境变量 `MOCK_ASR_MODEL_DIR` → `~/.cache/esp-ai-mock-asr/sensevoice`
+→ 复用 `~/.dsh/speech-to-text/sensevoice/models/sensevoice-onnx`（纯数据复用，不 import DSH 代码）。
+
+**限制（测试用途，不追求产品级）**：离线整段识别，没有中间结果（`asr_partial` 取文本前半段）；
+识别失败/设备无声时只 WARN 并回退 `--tts-text`，不打断协议链路；单轮默认最多送 30s 音频
+（`--asr-max-seconds`）；SenseVoice 支持 auto/中/英/粤/日/韩（`--asr-language`）。
+
 ## 一轮语音的下发时序（`--scenario normal`）
 
 ```
@@ -637,6 +677,12 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 | `--close-after S` | 0（关） | 到点主动断开（code 1000），测端侧断线重连 |
 | `--save-upload DIR` | 空 | 把上行 payload 按 `c<连接>-sid<sid>-seq<seq>.bin` 落盘（P2 核对"真的在发音频"） |
 | `--inject-late` | 关 | 每轮先注入一个 `sid+1` 的 `asr_final`，验证端侧迟到帧过滤（T2.5） |
+| `--asr {none,sensevoice}` | `none` | **T3.1**：用本地 SenseVoice 识别上行音频（真 ASR）；需 `uv --with av numpy sherpa-onnx` |
+| `--asr-model-dir DIR` | 空（自动找缓存） | SenseVoice 模型目录（`model.int8.onnx` + `tokens.txt`） |
+| `--asr-download` | 关 | 模型缺失时自动下载（约 239MB，带 SHA-256 校验） |
+| `--asr-threads N` | 2 | ONNX 推理线程数 |
+| `--asr-language L` | `auto` | `auto/zh/en/yue/ja/ko` |
+| `--asr-max-seconds S` | 30 | 单轮最多送 ASR 的音频秒数（超出部分不参与识别） |
 | `--verbose` | 关 | 打印上行 payload 前 16 字节（库自身的握手 DEBUG 已压到 WARNING） |
 | `--self-test` | — | 进程内自测，不需要硬件 |
 

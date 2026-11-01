@@ -34,6 +34,13 @@ T3.1 测试用的「真 ASR」（可选，独立实现见 tools/mock_asr.py，�
   用真实识别结果；识别失败/无声时回退 `--tts-text`（只 WARN，不打断协议链路）。
   离线验证识别效果：uv run tools/mock_asr.py --test tools/今天天气如何.wav
 
+T3.1 回声测试（ASR 识别文本 → 本地 Piper 复读，不要固定文案）：
+  uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc \
+    tools/ws_mock_server.py --asr sensevoice --tts-piper
+  设备说的话先被识别，再用 Piper 把识别文本合成 24k MP3 下发给设备复读；
+  识别文本会走 asr_partial/asr_final，合成失败只 WARN 并回退合成帧。
+  （--tts-piper 与 --tts-mp3 互斥；需先准备 Piper 音色：uv run tools/mock_tts.py --download）
+
 传输说明：本地 mock 是 ws://（不加密）；线上契约是 wss://（ARCH §6.1）。
 TLS/证书策略在 T1.4 决定，见 docs/PRODUCT_IDEAS.md §8 X2。
 每条 accept 的连接都开 TCP_NODELAY（关 Nagle）：Nagle + 端侧 delayed ACK 会把均匀发送的
@@ -256,6 +263,12 @@ class Config:
     asr_threads: int = 2         # ONNX 推理线程数
     asr_language: str = "auto"   # SenseVoice 语言提示
     asr_max_seconds: float = 30.0  # 单轮最多送 ASR 的音频时长（超出截断）
+    # ---- T3.1 测试：ASR 文本 → 本地 TTS（Piper）复读（回声测试） ----
+    tts_piper: bool = False          # True：把 ASR 识别文本用 Piper 合成后下发（需 --asr）
+    tts_piper_voice: str = "zh_CN-huayan-medium"
+    tts_piper_speed: float = 1.0     # Piper length_scale：>1 更慢
+    tts_piper_model_dir: str = ""    # Piper 音色目录（空=自动找缓存）
+    tts_piper_download: bool = False # 音色缺失时下载（约 60MB）
     quiet: bool = False          # 自测用：只打 WARN 及以上
     verbose: bool = False        # 打印上行 payload 前 16 字节
 
@@ -559,6 +572,33 @@ class Session:
     def _music_url(self) -> str:
         return f"http://{self.server.banner_host()}:{self.server.port}/media/mock.mp3"
 
+    def _synthesize_echo_frames(self, text: str) -> list[Mp3Frame]:
+        """把 ASR 文本用 Piper 合成为 24k 单声道 MP3，再按 MP3 帧切分（回声测试用）。
+
+        同步阻塞（piper CLI + 编码，约 1~2s/句），调用方用 asyncio.to_thread 执行。
+        """
+        module = self.server.tts_piper_module
+        assert module is not None
+        cfg = self.cfg
+        started = time.monotonic()
+        audio, duration = module.synthesize_mp3(
+            text,
+            voice=cfg.tts_piper_voice,
+            model_dir=cfg.tts_piper_model_dir or None,
+            speed=cfg.tts_piper_speed,
+            download=cfg.tts_piper_download,
+            log=lambda message: LOG.info("%s", message),
+        )
+        frames = parse_mp3_frames(audio, source="<asr-echo>")
+        if not frames:
+            raise RuntimeError("Piper 合成结果不是可解析的 MP3")
+        self._log(
+            logging.INFO,
+            f"[TTS] 复读合成：{text!r} → {len(frames)} 帧 / {duration:.2f}s 音频 "
+            f"（耗时 {time.monotonic() - started:.2f}s）",
+        )
+        return frames
+
     # ---- 一轮语音下发（等价于"云端 ASR + LLM + TTS 流"） ----
 
     def _late_bin_payload(self) -> bytes:
@@ -646,6 +686,15 @@ class Session:
                 return
 
             text = await self._asr_text(asr_packets)
+
+            # 回声测试：把识别文本用本地 Piper 合成为 TTS 音频（失败回退合成帧）
+            echo_frames: list[Mp3Frame] | None = None
+            if self.server.tts_piper_module is not None:
+                try:
+                    echo_frames = await asyncio.to_thread(self._synthesize_echo_frames, text)
+                except Exception as exc:  # noqa: BLE001 - 单轮合成失败不拖垮 mock
+                    self._log(logging.WARNING, f"[TTS] 复读合成失败（回退合成帧）：{exc}")
+
             await self._send_json({"t": "asr_partial", "sid": sid, "text": text[: max(1, len(text) // 2)]})
             await self._send_json({"t": "asr_final", "sid": sid, "text": text})
             for offset in range(0, len(text), 5):
@@ -665,7 +714,7 @@ class Session:
                 await self._send_json(
                     {"t": "tts_start", "sid": sid, "codec": TTS_CODEC, "sr": TTS_SAMPLE_RATE}
                 )
-                frames = self.server.tts_mp3_frames
+                frames = echo_frames if echo_frames is not None else self.server.tts_mp3_frames
                 if frames is None:
                     total = max(1, self.cfg.max_tts_frames)
                     for index in range(total):
@@ -693,7 +742,7 @@ class Session:
             if not self.cfg.no_tts and self.cfg.tts_late_bin:
                 # tts_end 之后：端侧窗口已关闭，必须丢弃（不计数、不播放）
                 await self._send_bin(self._late_bin_payload(), note="late-post")
-            mode = "mp3" if self.server.tts_mp3_frames is not None else "synth"
+            mode = "mp3" if (echo_frames is not None or self.server.tts_mp3_frames is not None) else "synth"
             if not self.cfg.no_tts:
                 self.stats.tts_frames += sent_frames
                 self.stats.tts_bytes += sent_bytes
@@ -764,10 +813,11 @@ def _process_request(connection: Any, request: Any) -> None:
 
 
 class MockServer:
-    def __init__(self, cfg: Config, asr: Any = None) -> None:
+    def __init__(self, cfg: Config, asr: Any = None, tts_piper_module: Any = None) -> None:
         self.cfg = cfg
         self.port = cfg.port
         self.asr = asr  # mock_asr.MockAsr 实例（--asr）；None = 固定文案假 ASR
+        self.tts_piper_module = tts_piper_module  # tools/mock_tts.py 模块（--tts-piper）
         self._server: Any = None
         self._next_conn = 1
         self.active: dict[int, Session] = {}
@@ -941,6 +991,11 @@ def _print_banner(server: MockServer) -> None:
             if server.asr is not None
             else "ASR 模式: 关闭（asr_final 固定用 --tts-text 文案）"
         ),
+        (
+            f"TTS 复读: 开（ASR 文本 → Piper {cfg.tts_piper_voice} 合成；失败回退合成帧）"
+            if server.tts_piper_module is not None
+            else "TTS 复读: 关"
+        ),
         "传输: 每条 accept 连接 TCP_NODELAY=1（关 Nagle；避免 delayed ACK 攒批造成端侧假欠载）",
         "直连 URL（设备端填 CONFIG_AI_WS_URL）：",
     ]
@@ -958,7 +1013,12 @@ def _tts_mode_line(server: MockServer) -> str:
     """横幅里的 TTS 下发模式摘要：真实 MP3 的帧数/时长，或合成帧提示。"""
     cfg = server.cfg
     frames = server.tts_mp3_frames
-    if frames is None:
+    if server.tts_piper_module is not None:
+        mode = (
+            f"TTS 模式: 回声（ASR 识别文本 → Piper {cfg.tts_piper_voice} → 24k MP3，"
+            f"按帧下发，节奏={cfg.tts_pace_pct}%）"
+        )
+    elif frames is None:
         mode = f"TTS 模式: 合成帧（协议测试用，非可解码 MP3）chunk={cfg.chunk_bytes}B/{cfg.chunk_ms}ms"
     else:
         total_ms = sum(frame.duration_ms for frame in frames)
@@ -1546,6 +1606,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="SenseVoice 语言提示",
     )
     parser.add_argument("--asr-max-seconds", type=float, default=30.0, help="单轮最多送 ASR 的音频秒数")
+    # ---- T3.1 测试：ASR 文本 → 本地 Piper 复读（回声测试） ----
+    parser.add_argument(
+        "--tts-piper",
+        action="store_true",
+        help="回声测试：把 --asr 识别出的文本用本地 Piper 合成后下发（需 --asr，依赖 piper-tts/lameenc）",
+    )
+    parser.add_argument("--tts-piper-voice", default="zh_CN-huayan-medium", help="Piper 音色名")
+    parser.add_argument("--tts-piper-speed", type=float, default=1.0,
+                        help="Piper 语速（length_scale：>1 更慢）")
+    parser.add_argument("--tts-piper-model-dir", default="", help="Piper 音色目录（空=自动找缓存）")
+    parser.add_argument("--tts-piper-download", action="store_true", help="Piper 音色缺失时下载（约 60MB）")
     # ---- T2.4：真实 MP3 下发（契约 §6） ----
     parser.add_argument(
         "--tts-mp3",
@@ -1585,9 +1656,14 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--tts-stall-at 必须 >= 0（当前 {args.tts_stall_at}）")
     if not 1 <= args.tts_pace_pct <= 400:
         raise SystemExit(f"--tts-pace-pct 必须在 1~400（当前 {args.tts_pace_pct}）")
+    if args.tts_piper and args.tts_mp3:
+        raise SystemExit("--tts-piper（回声测试）与 --tts-mp3（固定音频）互斥，二选一")
+    if args.tts_piper and args.asr == "none":
+        raise SystemExit("--tts-piper 是回声测试：需要同时开 --asr sensevoice 才有识别文本可复读")
     max_tts_frames = args.max_tts_frames
     if max_tts_frames is None:
-        max_tts_frames = 0 if args.tts_mp3 else 100
+        # 真实音频（固定 MP3 / 回声合成）默认全发；合成帧默认 100 帧 ≈ 2s
+        max_tts_frames = 0 if (args.tts_mp3 or args.tts_piper) else 100
     cfg = Config(
         host=args.host,
         port=args.port,
@@ -1615,6 +1691,11 @@ def main(argv: list[str] | None = None) -> int:
         asr_threads=args.asr_threads,
         asr_language=args.asr_language,
         asr_max_seconds=args.asr_max_seconds,
+        tts_piper=args.tts_piper,
+        tts_piper_voice=args.tts_piper_voice,
+        tts_piper_speed=args.tts_piper_speed,
+        tts_piper_model_dir=args.tts_piper_model_dir,
+        tts_piper_download=args.tts_piper_download,
         quiet=args.self_test,
         verbose=args.verbose,
     )
@@ -1650,7 +1731,30 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"mock ASR 初始化失败：{exc}") from exc
         LOG.info("ASR 已启用：asr_final 使用本地 SenseVoice 识别结果")
 
-    server = MockServer(cfg, asr_backend)
+    tts_piper_module = None
+    if args.tts_piper:
+        try:
+            import mock_tts  # 同目录模块：自带 PEP 723 依赖（piper-tts/lameenc/numpy）
+        except ImportError as exc:
+            raise SystemExit(
+                f"--tts-piper 需要额外依赖（{exc}）。请改用：\n"
+                "  uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc \\\n"
+                "    tools/ws_mock_server.py --asr sensevoice --tts-piper ...\n"
+                "首次使用可先准备音色：uv run tools/mock_tts.py --download（约 60MB）"
+            ) from exc
+        try:
+            mock_tts.ensure_voice(
+                args.tts_piper_voice,
+                args.tts_piper_model_dir or None,
+                download=args.tts_piper_download,
+                log=lambda message: LOG.info("%s", message),
+            )
+        except SystemExit as exc:
+            raise SystemExit(f"Piper 音色未就绪：{exc}") from exc
+        tts_piper_module = mock_tts
+        LOG.info("TTS 复读已启用：ASR 文本 → Piper %s 合成后下发", args.tts_piper_voice)
+
+    server = MockServer(cfg, asr_backend, tts_piper_module)
     try:
         return asyncio.run(_serve_forever(server))
     except KeyboardInterrupt:

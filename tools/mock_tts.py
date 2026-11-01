@@ -222,6 +222,25 @@ def encode_mp3(pcm: np.ndarray, rate: int = TARGET_RATE) -> bytes:
     return encoder.encode(pcm.tobytes()) + encoder.flush()
 
 
+def synthesize_mp3(
+    text: str,
+    *,
+    voice: str = "zh_CN-huayan-medium",
+    model_dir: str | Path | None = None,
+    speed: float = 1.0,
+    download: bool = False,
+    log=print,
+) -> tuple[bytes, float]:
+    """文字 → 24kHz 单声道 MP3 字节；返回 (mp3_bytes, 音频时长秒)。
+
+    供 `ws_mock_server.py --tts-piper` 做「ASR 文本 → 复读」回声测试复用。
+    """
+    onnx, config = ensure_voice(voice, model_dir, download=download, log=log)
+    pcm, rate = piper_tts(text, onnx, config, speed=speed)
+    pcm24 = resample(pcm, rate)
+    return encode_mp3(pcm24), pcm24.size / TARGET_RATE
+
+
 # ---------------------------------------------------------------- CLI
 
 

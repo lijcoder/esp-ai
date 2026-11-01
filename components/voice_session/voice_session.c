@@ -44,12 +44,26 @@ static uint16_t s_next_sid;
 static int64_t s_state_since_us;
 static bool s_prompt_playing; /* LISTENING 阶段应答提示音在播（R1 由本组件恢复） */
 static vs_stats_t s_stats;
+static bool s_followup_enabled = CONFIG_VS_FOLLOWUP_ENABLE; /* 运行期开关（T3.7） */
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* ERROR 状态停留（T3.6 播错误提示音用；=0 时立即回 IDLE，不创建计时器） */
 #if CONFIG_VS_ERROR_HOLD_MS > 0
 static esp_timer_handle_t s_error_timer;
 #endif
+
+/* ---- T3.7 连续对话：续听窗口（一次性 esp_timer，不新建任务） ---- */
+#if CONFIG_VS_FOLLOWUP_ENABLE
+static esp_timer_handle_t s_followup_timer;
+static int64_t s_followup_deadline_us; /* s_mux 保护 */
+static uint32_t s_followup_rounds;     /* 本次会话已用续听轮数，s_mux 保护 */
+static bool s_followup_confirming;     /* VAD 人声确认中（s_mux 保护） */
+static void vs_followup_stop(void);
+static void vs_start_followup_round(void);
+#endif
+
+/* 前向声明：vs_transition 需要按目标/来源停止/启动续听窗口计时器 */
+static bool vs_transition(vs_state_t expect, vs_state_t to, vs_reason_t reason);
 
 /* ---------------- 状态迁移 ---------------- */
 
@@ -61,6 +75,7 @@ const char *vs_state_name(vs_state_t state)
     case VS_STATE_THINKING: return "THINKING";
     case VS_STATE_SPEAKING: return "SPEAKING";
     case VS_STATE_ERROR: return "ERROR";
+    case VS_STATE_FOLLOW_UP: return "FOLLOW_UP";
     default: return "UNKNOWN";
     }
 }
@@ -86,9 +101,126 @@ const char *vs_reason_name(vs_reason_t reason)
     case VS_REASON_START_FAILED: return "start-failed";
     case VS_REASON_ERROR_DONE: return "error-done";
     case VS_REASON_ROUND_ABORT: return "round-abort";
+    case VS_REASON_FOLLOWUP_SPEECH: return "followup-speech";
+    case VS_REASON_FOLLOWUP_TIMEOUT: return "followup-timeout";
+    case VS_REASON_FOLLOWUP_MAX: return "followup-max";
+    case VS_REASON_FOLLOWUP_WAKE: return "followup-wake";
+    case VS_REASON_FOLLOWUP_OFF: return "followup-off";
     default: return "unknown";
     }
 }
+
+/* ---------------- T3.7 连续对话（续听窗口） ---------------- */
+
+#if CONFIG_VS_FOLLOWUP_ENABLE
+static void vs_followup_arm(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    s_followup_deadline_us = esp_timer_get_time() + (int64_t)CONFIG_VS_FOLLOWUP_WINDOW_MS * 1000;
+    s_followup_confirming = false;
+    portEXIT_CRITICAL(&s_mux);
+    esp_timer_stop(s_followup_timer);
+    esp_err_t err = esp_timer_start_once(s_followup_timer, (uint64_t)CONFIG_VS_FOLLOWUP_WINDOW_MS * 1000);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "续听窗口计时启动失败: %s", esp_err_to_name(err));
+    }
+}
+
+static void vs_followup_stop(void)
+{
+    if (s_followup_timer != NULL) {
+        esp_timer_stop(s_followup_timer);
+    }
+    portENTER_CRITICAL(&s_mux);
+    s_followup_deadline_us = 0;
+    s_followup_confirming = false;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+static void vs_followup_timer_cb(void *arg)
+{
+    (void)arg;
+    bool confirming = false;
+    portENTER_CRITICAL(&s_mux);
+    confirming = s_followup_confirming;
+    s_followup_confirming = false;
+    if (!confirming) {
+        s_followup_deadline_us = 0;
+    }
+    portEXIT_CRITICAL(&s_mux);
+
+    if (confirming) {
+        /* 确认期满：VAD 人声持续了 confirm_ms，真正起轮 */
+        ESP_LOGD(TAG, "续听人声确认通过（%d ms）", CONFIG_VS_FOLLOWUP_CONFIRM_MS);
+        vs_start_followup_round();
+        return;
+    }
+
+    if (vs_transition(VS_STATE_FOLLOW_UP, VS_STATE_IDLE, VS_REASON_FOLLOWUP_TIMEOUT)) {
+        portENTER_CRITICAL(&s_mux);
+        s_stats.followup_timeouts++;
+        portEXIT_CRITICAL(&s_mux);
+        ESP_LOGI(TAG, "续听窗口超时（%d ms 无语音）→ IDLE", CONFIG_VS_FOLLOWUP_WINDOW_MS);
+    }
+}
+
+/* 窗口内 VAD 人声开始：先确认 CONFIG_VS_FOLLOWUP_CONFIRM_MS，再起轮（抗短噪声） */
+static void vs_followup_on_voice_start(void)
+{
+#if CONFIG_VS_FOLLOWUP_CONFIRM_MS > 0
+    int64_t remain_us;
+    portENTER_CRITICAL(&s_mux);
+    if (s_followup_confirming) {
+        portEXIT_CRITICAL(&s_mux);
+        return; /* 已在确认中 */
+    }
+    s_followup_confirming = true;
+    remain_us = s_followup_deadline_us - esp_timer_get_time();
+    portEXIT_CRITICAL(&s_mux);
+    if (remain_us <= (int64_t)CONFIG_VS_FOLLOWUP_CONFIRM_MS * 1000) {
+        /* 窗口即将结束：直接起轮，不再确认 */
+        portENTER_CRITICAL(&s_mux);
+        s_followup_confirming = false;
+        portEXIT_CRITICAL(&s_mux);
+        vs_start_followup_round();
+        return;
+    }
+    esp_timer_stop(s_followup_timer);
+    esp_timer_start_once(s_followup_timer, (uint64_t)CONFIG_VS_FOLLOWUP_CONFIRM_MS * 1000);
+#else
+    vs_start_followup_round();
+#endif
+}
+
+/* 确认期间 VAD 人声结束：取消确认，恢复剩余窗口计时 */
+static void vs_followup_on_voice_end(void)
+{
+#if CONFIG_VS_FOLLOWUP_CONFIRM_MS > 0
+    int64_t remain_us;
+    portENTER_CRITICAL(&s_mux);
+    if (!s_followup_confirming) {
+        portEXIT_CRITICAL(&s_mux);
+        return;
+    }
+    s_followup_confirming = false;
+    remain_us = s_followup_deadline_us - esp_timer_get_time();
+    portEXIT_CRITICAL(&s_mux);
+    esp_timer_stop(s_followup_timer);
+    if (remain_us <= 0) {
+        if (vs_transition(VS_STATE_FOLLOW_UP, VS_STATE_IDLE, VS_REASON_FOLLOWUP_TIMEOUT)) {
+            portENTER_CRITICAL(&s_mux);
+            s_stats.followup_timeouts++;
+            portEXIT_CRITICAL(&s_mux);
+        }
+        return;
+    }
+    esp_timer_start_once(s_followup_timer, (uint64_t)remain_us);
+#endif
+}
+#else
+static void vs_followup_arm(void) {}
+static void vs_followup_stop(void) {}
+#endif
 
 /* 迁移完成后的日志 + 事件广播（在临界区外做，避免在关中断时 printf） */
 static void vs_notify(vs_state_t from, vs_state_t to, vs_reason_t reason, uint16_t sid,
@@ -137,18 +269,29 @@ static bool vs_transition(vs_state_t expect, vs_state_t to, vs_reason_t reason)
     }
     portEXIT_CRITICAL(&s_mux);
 
+    /* 离开 FOLLOW_UP 时停窗；进入 FOLLOW_UP 时开窗（T3.7） */
+    if (from == VS_STATE_FOLLOW_UP) {
+        vs_followup_stop();
+    }
     vs_notify(from, to, reason, sid, dur_ms);
+    if (to == VS_STATE_FOLLOW_UP) {
+        vs_followup_arm();
+#if CONFIG_VS_FOLLOWUP_ENABLE
+        ESP_LOGI(TAG, "续听窗口开启（%d ms，静音超时/轮数上限/按键退出）",
+                 CONFIG_VS_FOLLOWUP_WINDOW_MS);
+#endif
+    }
     return true;
 }
 
-/* 开始新一轮（IDLE → LISTENING）：分配 sid；返回 false 表示已有会话/未初始化 */
-static bool vs_begin_session(vs_reason_t reason, uint16_t *sid_out)
+/* 开始新一轮（IDLE → LISTENING；T3.7 也用于 FOLLOW_UP → LISTENING 重新唤醒） */
+static bool vs_begin_session(vs_state_t expect, vs_reason_t reason, uint16_t *sid_out)
 {
     const int64_t now = esp_timer_get_time();
     uint16_t sid;
 
     portENTER_CRITICAL(&s_mux);
-    if (!s_inited || s_state != VS_STATE_IDLE) {
+    if (!s_inited || s_state != expect) {
         portEXIT_CRITICAL(&s_mux);
         return false;
     }
@@ -159,6 +302,9 @@ static bool vs_begin_session(vs_reason_t reason, uint16_t *sid_out)
     sid = s_next_sid;
     s_sid = sid;
     s_prompt_playing = false;
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    s_followup_rounds = 0; /* 重新唤醒：连续对话计数清零 */
+#endif
     s_state = VS_STATE_LISTENING;
     s_state_since_us = now;
     s_stats.transitions++;
@@ -168,11 +314,114 @@ static bool vs_begin_session(vs_reason_t reason, uint16_t *sid_out)
     s_stats.state = (uint8_t)VS_STATE_LISTENING;
     portEXIT_CRITICAL(&s_mux);
 
-    vs_notify(VS_STATE_IDLE, VS_STATE_LISTENING, reason, sid, 0);
+    vs_notify(expect, VS_STATE_LISTENING, reason, sid, 0);
     if (sid_out != NULL) {
         *sid_out = sid;
     }
     return true;
+}
+
+/* T3.7：续听窗口内检测到人声 → FOLLOW_UP → LISTENING，直接起下一轮（不播提示音、不唤醒） */
+static bool vs_begin_followup_round(uint16_t *sid_out)
+{
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    const int64_t now = esp_timer_get_time();
+    uint16_t sid;
+
+    portENTER_CRITICAL(&s_mux);
+    if (!s_inited || s_state != VS_STATE_FOLLOW_UP) {
+        portEXIT_CRITICAL(&s_mux);
+        return false;
+    }
+    s_next_sid++;
+    if (s_next_sid == 0) {
+        s_next_sid = 1;
+    }
+    sid = s_next_sid;
+    s_sid = sid;
+    s_followup_rounds++;
+    s_state = VS_STATE_LISTENING;
+    s_state_since_us = now;
+    s_stats.transitions++;
+    s_stats.rounds_started++;
+    s_stats.followup_rounds++;
+    s_stats.followup_hits++;
+    s_stats.last_sid = sid;
+    s_stats.last_state_ms = 0;
+    s_stats.state = (uint8_t)VS_STATE_LISTENING;
+    portEXIT_CRITICAL(&s_mux);
+
+    vs_notify(VS_STATE_FOLLOW_UP, VS_STATE_LISTENING, VS_REASON_FOLLOWUP_SPEECH, sid, 0);
+    if (sid_out != NULL) {
+        *sid_out = sid;
+    }
+    return true;
+#else
+    (void)sid_out;
+    return false;
+#endif
+}
+
+/* T3.7：确认通过后真正起一个续听轮（不播提示音） */
+static void vs_start_followup_round(void)
+{
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    uint16_t sid;
+    if (!vs_begin_followup_round(&sid)) {
+        return;
+    }
+    ESP_LOGI(TAG, "续听窗口内检测到人声 → 起续听轮（sid=%u，不播提示音）", (unsigned)sid);
+    esp_err_t err = vc_start(sid);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "续听起轮失败（sid=%u）: %s（云端未就绪，回 IDLE）", (unsigned)sid,
+                 esp_err_to_name(err));
+        (void)vs_transition(VS_STATE_LISTENING, VS_STATE_IDLE, VS_REASON_CLOUD_NOT_READY);
+    }
+#endif
+}
+
+/*
+ * 一轮正常播完：进入续听窗口（T3.7）或回 IDLE。
+ * ok=false（播放被打断/失败）不续听，直接回 IDLE。
+ */
+static void vs_round_completed(vs_reason_t reason, bool ok)
+{
+    int entered = -1;
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    if (ok && s_followup_enabled && vs_get_state() == VS_STATE_SPEAKING) {
+        uint32_t used;
+        portENTER_CRITICAL(&s_mux);
+        used = s_followup_rounds;
+        portEXIT_CRITICAL(&s_mux);
+        if (used >= CONFIG_VS_FOLLOWUP_MAX_ROUNDS) {
+            portENTER_CRITICAL(&s_mux);
+            s_stats.followup_max_exits++;
+            portEXIT_CRITICAL(&s_mux);
+            entered = 1;
+            ESP_LOGI(TAG, "连续对话达到轮数上限（%d 轮）→ 回 IDLE",
+                     CONFIG_VS_FOLLOWUP_MAX_ROUNDS);
+        } else if (vs_transition(VS_STATE_SPEAKING, VS_STATE_FOLLOW_UP, reason)) {
+            entered = 0;
+        }
+    }
+#else
+    (void)ok;
+#endif
+
+    if (entered == 0) {
+        portENTER_CRITICAL(&s_mux);
+        s_stats.rounds_completed++;
+        portEXIT_CRITICAL(&s_mux);
+        return;
+    }
+    if (vs_get_state() != VS_STATE_SPEAKING) {
+        return;
+    }
+    (void)vs_transition(VS_STATE_SPEAKING, VS_STATE_IDLE,
+                        entered == 1 ? VS_REASON_FOLLOWUP_MAX : reason);
+    portENTER_CRITICAL(&s_mux);
+    s_stats.rounds_completed++;
+    portEXIT_CRITICAL(&s_mux);
 }
 
 /* 任意活跃状态 → IDLE（打断/断链/云端取消；ERROR 状态不在这里收，由 ERROR 保持计时器收尾） */
@@ -230,12 +479,9 @@ static void vs_on_round_end(vc_round_end_t result)
 {
     switch (result) {
     case VC_ROUND_DONE:
-        /* 正常收尾：有音频正在排空时等 STREAM_DONE；无音频可播（tts_start 未到/坏帧）直接回 IDLE */
-        if (vs_get_state() == VS_STATE_SPEAKING && !audio_player_stream_active() &&
-            vs_transition(VS_STATE_SPEAKING, VS_STATE_IDLE, VS_REASON_ROUND_DONE)) {
-            portENTER_CRITICAL(&s_mux);
-            s_stats.rounds_completed++;
-            portEXIT_CRITICAL(&s_mux);
+        /* 正常收尾：有音频正在排空时等 STREAM_DONE；无音频可播直接结束本轮（可能进续听窗口） */
+        if (vs_get_state() == VS_STATE_SPEAKING && !audio_player_stream_active()) {
+            vs_round_completed(VS_REASON_ROUND_DONE, true);
         }
         return;
 
@@ -313,13 +559,10 @@ static void vs_on_play_done(audio_player_src_t src, bool ok, void *arg)
     (void)arg;
 
     if (src == AUDIO_PLAYER_SRC_TTS_STREAM) {
-        /* TTS 流式播放结束（成功/失败/打断）：R2 恢复收音在 voice_cloud，本组件只收状态 */
-        if (vs_transition(VS_STATE_SPEAKING, VS_STATE_IDLE, VS_REASON_STREAM_DONE)) {
-            portENTER_CRITICAL(&s_mux);
-            s_stats.rounds_completed++;
-            portEXIT_CRITICAL(&s_mux);
-            ESP_LOGI(TAG, "speaking done（ok=%d）→ IDLE", (int)ok);
-        }
+        /* TTS 流式播放结束（成功/失败/打断）：R2 恢复收音在 voice_cloud，本组件收状态。
+         * T3.7：播放正常结束 → FOLLOW_UP 续听窗口；ok=false（打断/失败）直接回 IDLE。 */
+        ESP_LOGI(TAG, "speaking done（ok=%d）", (int)ok);
+        vs_round_completed(VS_REASON_STREAM_DONE, ok);
         return;
     }
 
@@ -364,7 +607,13 @@ static void vs_on_play_done(audio_player_src_t src, bool ok, void *arg)
 static void vs_on_wake(void)
 {
     ESP_LOGI(TAG, "wake detected");
-    if (vs_get_state() != VS_STATE_IDLE) {
+    const vs_state_t prev = vs_get_state();
+    const bool from_followup = (prev == VS_STATE_FOLLOW_UP);
+    if (from_followup) {
+        /* T3.7：续听窗口内再次唤醒 = 重开一轮（播应答提示音、续听计数清零） */
+        ESP_LOGI(TAG, "续听窗口内再次唤醒 → 重开一轮（播应答提示音，续听计数清零）");
+        vs_followup_stop();
+    } else if (prev != VS_STATE_IDLE) {
         portENTER_CRITICAL(&s_mux);
         s_stats.wakes_dropped++;
         portEXIT_CRITICAL(&s_mux);
@@ -389,7 +638,13 @@ static void vs_on_wake(void)
     }
 
     uint16_t sid;
-    if (!vs_begin_session(VS_REASON_WAKE, &sid)) {
+    const vs_state_t expect = from_followup ? VS_STATE_FOLLOW_UP : VS_STATE_IDLE;
+    const vs_reason_t reason = from_followup ? VS_REASON_FOLLOWUP_WAKE : VS_REASON_WAKE;
+    if (!vs_begin_session(expect, reason, &sid)) {
+        if (from_followup) {
+            /* 兜底：重开失败时不能让状态机卡在无计时器的 FOLLOW_UP */
+            vs_abort_to_idle(VS_REASON_ROUND_ABORT);
+        }
         return;
     }
 
@@ -431,6 +686,32 @@ static void vs_on_net_down(const app_evt_data_t *data)
     vs_abort_to_idle(VS_REASON_NET_DOWN);
 }
 
+/* T3.7：续听窗口内 VAD 判到人声 → 确认后起下一轮（不播提示音、不再唤醒） */
+static void vs_on_vad_speech_start(void)
+{
+    if (vs_get_state() != VS_STATE_FOLLOW_UP) {
+        ESP_LOGD(TAG, "VAD 人声开始（state=%s）", vs_state_name(vs_get_state()));
+        return;
+    }
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    vs_followup_on_voice_start();
+#else
+    ESP_LOGD(TAG, "VAD 人声开始（FOLLOW_UP 未启用）");
+#endif
+}
+
+/* T3.7：续听窗口内 VAD 人声提前结束（未达确认时长）→ 取消本次确认 */
+static void vs_on_vad_speech_end(void)
+{
+    if (vs_get_state() != VS_STATE_FOLLOW_UP) {
+        ESP_LOGD(TAG, "VAD 人声结束（state=%s）", vs_state_name(vs_get_state()));
+        return;
+    }
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    vs_followup_on_voice_end();
+#endif
+}
+
 static void vs_on_app_evt(void *arg, app_evt_t evt, const app_evt_data_t *data)
 {
     (void)arg;
@@ -440,10 +721,10 @@ static void vs_on_app_evt(void *arg, app_evt_t evt, const app_evt_data_t *data)
         vs_on_wake();
         break;
     case APP_EVT_VAD_SPEECH_START:
-        ESP_LOGD(TAG, "VAD 人声开始（state=%s）", vs_state_name(vs_get_state()));
+        vs_on_vad_speech_start();
         break;
     case APP_EVT_VAD_SPEECH_END:
-        ESP_LOGD(TAG, "VAD 人声结束（state=%s）", vs_state_name(vs_get_state()));
+        vs_on_vad_speech_end();
         break;
     case APP_EVT_NET_DOWN:
         vs_on_net_down(data);
@@ -515,11 +796,33 @@ esp_err_t vs_init(void)
     }
 #endif
 
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    const esp_timer_create_args_t followup_args = {
+        .callback = vs_followup_timer_cb,
+        .name = "vs_fup",
+    };
+    err = esp_timer_create(&followup_args, &s_followup_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "创建续听窗口计时器失败: %s", esp_err_to_name(err));
+        (void)audio_player_unsubscribe_done(vs_on_play_done);
+        (void)vc_register_cb(NULL, NULL);
+        (void)app_evt_unregister(APP_EVT_ANY, vs_on_app_evt, NULL);
+        return err;
+    }
+#endif
+
     s_state_since_us = esp_timer_get_time();
     s_state = VS_STATE_IDLE;
     s_inited = true;
-    ESP_LOGI(TAG, "ready（%d 态事件驱动，无独立任务；异常保持 %d ms；sid 由本组件分配）",
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    ESP_LOGI(TAG,
+             "ready（%d 态事件驱动，无独立任务；异常保持 %d ms；续听窗口 %d ms / 最多 %d 轮）",
+             (int)VS_STATE_COUNT, CONFIG_VS_ERROR_HOLD_MS, CONFIG_VS_FOLLOWUP_WINDOW_MS,
+             CONFIG_VS_FOLLOWUP_MAX_ROUNDS);
+#else
+    ESP_LOGI(TAG, "ready（%d 态事件驱动，无独立任务；异常保持 %d ms；续听窗口关）",
              (int)VS_STATE_COUNT, CONFIG_VS_ERROR_HOLD_MS);
+#endif
     return ESP_OK;
 }
 
@@ -530,7 +833,7 @@ esp_err_t vs_start(void)
     }
 
     uint16_t sid;
-    if (!vs_begin_session(VS_REASON_START, &sid)) {
+    if (!vs_begin_session(VS_STATE_IDLE, VS_REASON_START, &sid)) {
         ESP_LOGW(TAG, "已有会话进行中（%s），忽略 vs_start", vs_state_name(vs_get_state()));
         return ESP_ERR_INVALID_STATE;
     }
@@ -600,8 +903,38 @@ esp_err_t vs_stats_read(vs_stats_t *out)
     *out = s_stats;
     out->state = (uint8_t)s_state;
     out->last_sid = s_sid;
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    out->followup_remaining_ms = 0;
+    if (s_state == VS_STATE_FOLLOW_UP && s_followup_deadline_us > 0) {
+        const int64_t remain_us = s_followup_deadline_us - esp_timer_get_time();
+        out->followup_remaining_ms = remain_us > 0 ? (uint32_t)(remain_us / 1000) : 0;
+    }
+#endif
     portEXIT_CRITICAL(&s_mux);
     return ESP_OK;
+}
+
+esp_err_t vs_set_followup_enabled(bool enabled)
+{
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    portENTER_CRITICAL(&s_mux);
+    s_followup_enabled = enabled;
+    portEXIT_CRITICAL(&s_mux);
+    if (!enabled && vs_get_state() == VS_STATE_FOLLOW_UP) {
+        vs_followup_stop();
+        (void)vs_transition(VS_STATE_FOLLOW_UP, VS_STATE_IDLE, VS_REASON_FOLLOWUP_OFF);
+    }
+    ESP_LOGI(TAG, "续听窗口运行期开关：%s", enabled ? "开" : "关");
+    return ESP_OK;
+#else
+    (void)enabled;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+bool vs_followup_enabled(void)
+{
+    return s_followup_enabled;
 }
 
 esp_err_t vs_stats_reset(void)

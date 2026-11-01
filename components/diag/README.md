@@ -34,10 +34,11 @@
 | `vc start [sid]` | 手动发起一轮端云会话（云端未 READY 时拒绝；不带 sid 则自增） |
 | `vc stop` / `vc cancel` | 优雅收尾（补尾帧 + audio_end）/ 立即放弃（不发 audio_end） |
 | `vc reset` | 清零 VC 统计（保留最近 sid/用时） |
-| `vs status` / `vs stat` | 会话状态机观测（T3.1）：当前状态与 sid、VC 状态、轮次（开始/完成/异常/中止）、打断/唤醒丢弃/超时/云端 error 计数、迁移次数与上次状态停留时长 |
+| `vs status` / `vs stat` | 会话状态机观测（T3.1/T3.7）：当前状态与 sid、VC 状态、轮次（开始/完成/异常/中止）、打断/唤醒丢弃/超时/云端 error 计数、迁移次数与上次状态停留时长、**续听（续听轮/命中/超时退出/上限退出、窗口剩余）** |
 | `vs start` | 手动开始一轮会话（不播唤醒应答提示音，直接进入 `LISTENING`；已有会话时拒绝） |
 | `vs interrupt` | 打断当前会话：`vc cancel` + 回 `IDLE`（R4 完整淡出与按键来源归 T3.2/T3.4） |
 | `vs reset` | 清零 VS 统计（保留最近 sid/停留时长） |
+| `vs followup on\|off` | **T3.7**：连续对话续听窗口运行期开关（不持久化，重启恢复 Kconfig）；关闭时若正在 FOLLOW_UP 立即回 IDLE |
 | `wifi status` | 网络状态：state、SSID、IP、RSSI、SNTP 是否对时、累计重连次数与当前退避 |
 | `wifi reconnect` | 主动断开并重连（重置退避）；已联网时先投 `NET_DOWN` 再恢复，用于验证重连链路 |
 | `ws status` | WebSocket 状态：状态机、脱敏端点（不回显 token）、握手次数、心跳 RTT、收发/丢弃/坏帧计数、队列占用 |

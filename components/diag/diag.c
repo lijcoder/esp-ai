@@ -1480,13 +1480,26 @@ static void print_vs_status(void)
            st.interrupts, st.wakes_dropped, st.timeouts, st.cloud_errors);
     printf("  迁移: 共 %" PRIu32 " 次；最近 sid=%u，上次状态停留 %" PRIu32 " ms\n",
            st.transitions, (unsigned)st.last_sid, st.last_state_ms);
-    printf("  说明: 唤醒自动进 LISTENING；手动调试用 vs start / vs interrupt；状态迁移日志看 TAG VS\n");
+#if CONFIG_VS_FOLLOWUP_ENABLE
+    printf("  续听: 续听轮 %" PRIu32 " / 命中 %" PRIu32 "；超时退出 %" PRIu32
+           " / 上限退出 %" PRIu32 "\n",
+           st.followup_rounds, st.followup_hits, st.followup_timeouts, st.followup_max_exits);
+    if ((vs_state_t)st.state == VS_STATE_FOLLOW_UP) {
+        printf("        窗口剩余 %" PRIu32 " ms（窗口 %d ms / 上限 %d 轮）\n",
+               st.followup_remaining_ms, CONFIG_VS_FOLLOWUP_WINDOW_MS,
+               CONFIG_VS_FOLLOWUP_MAX_ROUNDS);
+    }
+#else
+    printf("  续听: 关闭（CONFIG_VS_FOLLOWUP_ENABLE=n）\n");
+#endif
+    printf("  说明: 唤醒自动进 LISTENING；TTS 播完进 FOLLOW_UP 续听窗口；"
+           "手动调试用 vs start / vs interrupt\n");
 }
 
 static int cmd_vs(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("用法: vs status | start | interrupt | reset\n");
+        printf("用法: vs status | start | interrupt | reset | followup on|off\n");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1520,7 +1533,29 @@ static int cmd_vs(int argc, char **argv)
         return err;
     }
 
-    printf("未知子命令: %s（可用: status | start | interrupt | reset）\n", sub);
+    if (strcmp(sub, "followup") == 0) {
+        if (argc < 3 || (strcmp(argv[2], "on") != 0 && strcmp(argv[2], "off") != 0)) {
+            printf("用法: vs followup on|off（连续对话续听窗口运行时开关）\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        const bool on = (strcmp(argv[2], "on") == 0);
+        esp_err_t err = vs_set_followup_enabled(on);
+        if (err != ESP_OK) {
+            printf("切换失败: %s（CONFIG_VS_FOLLOWUP_ENABLE=n 时不可用）\n",
+                   esp_err_to_name(err));
+            return err;
+        }
+#if CONFIG_VS_FOLLOWUP_ENABLE
+        printf("连续对话续听窗口：%s（窗口 %d ms / 上限 %d 轮 / 人声确认 %d ms）\n",
+               on ? "开" : "关", CONFIG_VS_FOLLOWUP_WINDOW_MS, CONFIG_VS_FOLLOWUP_MAX_ROUNDS,
+               CONFIG_VS_FOLLOWUP_CONFIRM_MS);
+#else
+        printf("连续对话续听窗口：CONFIG 未启用\n");
+#endif
+        return ESP_OK;
+    }
+
+    printf("未知子命令: %s（可用: status | start | interrupt | reset | followup on|off）\n", sub);
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -2255,8 +2290,8 @@ static esp_err_t register_commands(void)
         },
         {
             .command = "vs",
-            .help = "会话状态机：vs status | start | interrupt | reset（T3.1）",
-            .hint = "status|start|interrupt|reset",
+            .help = "会话状态机：vs status | start | interrupt | reset | followup on|off（T3.1/T3.7）",
+            .hint = "status|start|interrupt|reset|followup",
             .func = cmd_vs,
         },
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST

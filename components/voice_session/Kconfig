@@ -14,4 +14,45 @@ menu "Voice Session (会话状态机)"
             本组件不新建任务（见 CONVENTIONS §4 的内部 RAM 水位约束），该值只影响
             esp_timer 的一次性计时，不占任务栈。
 
+    config VS_FOLLOWUP_ENABLE
+        bool "连续对话（免唤醒续听窗口，T3.7）"
+        default y
+        help
+            ARCHITECTURE §7：TTS 回答播完后不直接回 IDLE，而是进入 FOLLOW_UP 续听窗口：
+            用户在窗口内直接说话（VAD 判到人声）就开始下一轮，不用再说唤醒词、不再播应答提示音；
+            窗口内静音超时 / 达到轮数上限 / 按键打断 / 断网 → 回 IDLE。
+            窗口内再次说出唤醒词 = 重开一轮（播应答提示音、轮数清零）。
+
+            关闭后行为与 T3.1 完全一致（SPEAKING 结束直接回 IDLE）。
+            窗口计时用一次 esp_timer（不新增任务；内存实测见 STATUS 基线）。
+
+    config VS_FOLLOWUP_WINDOW_MS
+        int "续听窗口时长（毫秒）"
+        range 1000 15000
+        default 5000
+        depends on VS_FOLLOWUP_ENABLE
+        help
+            TTS 播完后等待用户开口的时长；窗口内没有 VAD 人声就回 IDLE。
+            太短用户来不及接话，太长会放大环境噪声误触发；默认 5s（常见语音助手取值）。
+
+    config VS_FOLLOWUP_CONFIRM_MS
+        int "续听起轮的人声确认时长（毫秒）"
+        range 0 1000
+        default 250
+        depends on VS_FOLLOWUP_ENABLE
+        help
+            VAD 报"人声开始"后先观察这么久，仍然是人声才真正起下一轮：
+            过滤短促的环境噪声/咔哒声，避免连续对话被噪声误触发。
+            0 = 不确认（VAD 一报就起轮，抗噪最差）。
+
+    config VS_FOLLOWUP_MAX_ROUNDS
+        int "连续对话最多续听轮数"
+        range 1 20
+        default 5
+        depends on VS_FOLLOWUP_ENABLE
+        help
+            首轮唤醒之后，最多允许 CONTINUE 的免唤醒轮数（默认 5 轮）。
+            达到上限后本次会话回到 IDLE，避免环境噪声导致无限空转/持续云端请求。
+            每次重新唤醒会清零计数。
+
 endmenu

@@ -2,10 +2,14 @@
  * voice_session —— 语音会话状态机（L4 业务编排）的唯一对外头文件。
  *
  * 职责边界（ARCHITECTURE §7、§8.1–8.2、§4.1；PROTOCOL.md §3.3）：
- *   - 会话状态机 IDLE / LISTENING / THINKING / SPEAKING / ERROR，**状态迁移只在本组件发生**；
+ *   - 会话状态机 IDLE / LISTENING / THINKING / SPEAKING / FOLLOW_UP / ERROR，
+ *     **状态迁移只在本组件发生**；
  *   - 每轮 `sid` 分配（uint16 自增、0 保留），通过 `vc_start(sid)` 交给 voice_cloud 执行；
  *   - 超时与错误处理策略：THINKING 10s 超时（计时在 voice_cloud 的协议超时里）→ ERROR；
  *     云端 `error` 码 → ERROR；断链/打断 → IDLE；ERROR 同轮不重试；
+ *   - 连续对话（T3.7）：TTS 正常播完后进入 FOLLOW_UP 续听窗口（`CONFIG_VS_FOLLOWUP_*`），
+ *     窗口内 VAD 判到人声即起下一轮（不再唤醒、不再播应答提示音）；静音超时/轮数上限/
+ *     按键/断网 → IDLE；窗口内再次唤醒 = 重开一轮（播应答提示音、轮数清零）；
  *   - 唤醒编排（T1.2b）：订阅 event_bus 的 WAKE_DETECTED / VAD / NET_DOWN，唤醒后播应答提示音
  *     （R1 暂停收音）→ 提示音播完恢复收音（R2 由 voice_cloud 负责 TTS 侧的对应规则）→ 起一轮；
  *   - 打断接口 `vs_interrupt()`：打断骨架，按键来源由 T3.4 `dev_ctrl` 接线。
@@ -38,6 +42,7 @@ typedef enum {
     VS_STATE_THINKING,      /* audio_end 已发，等 ASR/TTS */
     VS_STATE_SPEAKING,      /* 正在播放 TTS（R1：麦克风输入关闭） */
     VS_STATE_ERROR,         /* 超时/云端错误：上报日志 + 播错误提示（提示音 T3.6） */
+    VS_STATE_FOLLOW_UP,     /* 连续对话续听窗口（T3.7）：TTS 播完等用户直接说话 */
     VS_STATE_COUNT,
 } vs_state_t;
 
@@ -61,6 +66,11 @@ typedef enum {
     VS_REASON_START_FAILED = 15,  /* 起轮失败（编码器/上行占用/发送失败） */
     VS_REASON_ERROR_DONE = 16,    /* ERROR 状态处理结束，回 IDLE */
     VS_REASON_ROUND_ABORT = 17,   /* voice_cloud 报告的其它异常结束（cancel/new/setup） */
+    VS_REASON_FOLLOWUP_SPEECH = 18,  /* 续听窗口内检测到人声，直接起下一轮（T3.7） */
+    VS_REASON_FOLLOWUP_TIMEOUT = 19, /* 续听窗口超时无语音，回 IDLE */
+    VS_REASON_FOLLOWUP_MAX = 20,     /* 达到连续对话轮数上限，回 IDLE */
+    VS_REASON_FOLLOWUP_WAKE = 21,    /* 续听窗口内再次唤醒：重开一轮（播提示音） */
+    VS_REASON_FOLLOWUP_OFF = 22,     /* 运行期关闭连续对话，退出续听窗口 */
 } vs_reason_t;
 
 /* 观测统计（diag `vs status` / 测试脚本断言用；累计值，临界区内合并） */
@@ -74,6 +84,12 @@ typedef struct {
     uint32_t wakes_dropped;    /* 会话中/播放器忙时忽略的唤醒数 */
     uint32_t timeouts;         /* THINKING 超时数 */
     uint32_t cloud_errors;     /* 云端 error 数 */
+    /* ---- T3.7 连续对话（FOLLOW_UP） ---- */
+    uint32_t followup_rounds;  /* 免唤醒续听轮数（不含首轮唤醒轮） */
+    uint32_t followup_hits;    /* 窗口内检测到人声、成功起轮次数 */
+    uint32_t followup_timeouts;/* 窗口静音超时回 IDLE 次数 */
+    uint32_t followup_max_exits; /* 达到轮数上限回 IDLE 次数 */
+    uint32_t followup_remaining_ms; /* 当前续听窗口剩余（非 FOLLOW_UP 时为 0） */
     uint16_t last_sid;         /* 最近一轮 sid */
     uint32_t last_state_ms;    /* 上一次状态停留时长（ms） */
     uint8_t state;             /* 当前 vs_state_t（快照） */
@@ -110,6 +126,11 @@ const char *vs_reason_name(vs_reason_t reason);
 
 /* 当前轮次 sid（IDLE 时为最近一轮的 sid） */
 uint16_t vs_current_sid(void);
+
+/* 连续对话续听窗口的运行时开关（默认取 CONFIG_VS_FOLLOWUP_ENABLE；T3.7）
+ * 关闭时立即退出 FOLLOW_UP；用于测试/调试保持单轮行为。CONFIG 关闭时返回 NOT_SUPPORTED。 */
+esp_err_t vs_set_followup_enabled(bool enabled);
+bool vs_followup_enabled(void);
 
 /* 读统计快照 / 清零统计（任意任务上下文可调用） */
 esp_err_t vs_stats_read(vs_stats_t *out);

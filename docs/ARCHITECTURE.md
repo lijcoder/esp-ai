@@ -90,6 +90,7 @@ TTS(MP3) ─┐
 | R5 | 恢复 feed 后丢弃最早 50ms 的音频，避免打断瞬间的噪声触发 VAD |
 
 > **T2.4 实现状态**：R1/R2 已用于 TTS 流式播放（`tts_start` → `audio_fe_set_feed_enabled(false)`；完成/打断回调 → 300ms 尾部延时后恢复）；R3–R5 随 T3.2/P4 落地。
+> **T3.1**：唤醒应答提示音的 R1/R2 由 `voice_session` 负责（播提示音前暂停收音、`prompt done` 后恢复），与 TTS 侧的 R1/R2 相互独立、互不复用标志。
 
 ### 3.4 提示音
 
@@ -164,14 +165,14 @@ TTS(MP3) ─┐
 | `net_mgr` | L1 基础服务 | WiFi STA 连接、退避重连、SNTP 对时、网络事件（无独立任务：事件回调 + 一次性定时器） | `net_init()`, `net_is_up()`, `net_wait_ready(ms)`, `net_is_time_synced()`, `net_get_info()`, `net_reconnect()` |
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发；入站回调支持主回调 + 附加订阅（T2.5，业务与 console 观测并存） | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_subscribe()`, `ws_unsubscribe()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
-| `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 回调、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
+| `audio_fe` | L2 音频引擎 | AFE 封装：feed 开关、唤醒/VAD 事件（T1.2b 起投 `APP_EVT_WAKE_DETECTED`/`APP_EVT_VAD_*` 到 event_bus，回调仅调试兼容）、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_set_feed_enabled()`, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
 | `audio_player` | L2 音频引擎 | 播放引擎：PCM/整段 MP3/**流式 MP3（T2.4）** + 重采样到 48k + 软件音量 + 淡入淡出；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；多通道/HTTP 随 P3–P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_set_volume()`, `audio_player_stats_read()` |
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms，定点实现 + VBR，状态/伪栈在 PSRAM，不建任务） | `enc_open()`, `enc_encode(pcm, samples, out, cap, &out_len)`, `enc_flush()`, `enc_reset()`, `enc_close()`, `enc_stats_read()` |
-| `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发、**下行 0x02 接入 `audio_player` 流式播放 + R1/R2（T2.4）**；**不含会话状态机**（归 T3.1 `voice_session`） | `vc_init()`, `vc_start()`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_is_busy()`, `vc_register_cb()`, `vc_stats_read()` |
+| `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发、**下行 0x02 接入 `audio_player` 流式播放 + R1/R2（T2.4）**；**不含会话状态机**（归 T3.1 `voice_session`）；T3.1 起回调增加 `VC_EVT_UPLINK_END`/`VC_EVT_ROUND_END` 供状态机驱动，`sid` 由会话机传入 | `vc_init()`, `vc_start(sid)`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_is_busy()`, `vc_register_cb()`, `vc_stats_read()` |
 | `music_cloud` | L3 能力 | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
 | `dev_ctrl` | L3 能力 | 按键事件（短按/长按）、LED 状态模式、静音切换 | `dev_init()`, `dev_register_cb()` |
 | `diag` | L3 能力 | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
-| `voice_session` | L4 业务编排 | 会话状态机 + 半双工调度 + 超时重试 | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_get_state()` |
+| `voice_session` | L4 业务编排 | 会话状态机（IDLE/LISTENING/THINKING/SPEAKING/ERROR）、每轮 `sid` 分配、超时/错误策略（THINKING 超时与云端 error → ERROR，同轮不重试）、唤醒编排（T1.2b：订阅 event_bus，播应答提示音并做 R1/R2）；**不建任务**（事件驱动，见 §9.3） | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_is_busy()`, `vs_get_state()`, `vs_state_name()`, `vs_reason_name()`, `vs_current_sid()`, `vs_stats_read()`, `vs_stats_reset()` |
 | `music_session` | L4 业务编排 | 音乐播放控制：播放/暂停/继续/停止/切歌；与语音抢占 | `ms_init()`, `ms_play()`, `ms_pause()`, `ms_resume()`, `ms_stop()` |
 | `assets`（临时） | 资源（不分层） | 内置提示音 PCM 资源；P3（T3.5）迁到 `assets` 分区后删除该组件 | `prompt_wo_zai_ne_pcm[]` |
 
@@ -203,12 +204,14 @@ typedef enum {
 | `APP_EVT_ASR_PARTIAL` / `APP_EVT_ASR_FINAL` | `app_evt_asr_t { uint16_t sid; uint16_t len; char text[28]; }`（T2.5 定稿；`len` 为实际拷贝字节数，UTF-8 中文约 9 字，超出截断） |
 | `APP_EVT_TTS_START` | `app_evt_tts_start_t { uint16_t sid; uint8_t codec; uint8_t reserved; uint32_t sr; }`（`codec=1` 为 MP3） |
 | `APP_EVT_TTS_END` | `app_evt_tts_end_t { uint16_t sid; uint16_t frames; }`（`frames` = 本轮收到的下行音频帧数） |
+| `APP_EVT_VOICE_STATE_CHANGED` | `app_evt_voice_state_t { uint16_t sid; uint8_t from, to; uint8_t reason; uint8_t reserved[3]; uint32_t dur_ms; }`（T3.1 定稿；`from`/`to` 为 §7 状态枚举数值、`reason` 为迁移原因码、`dur_ms` 为迁移前状态停留时长；由 `voice_session` 在每次迁移后投递） |
 
 **投递与线程约束**：
 
 - 独立循环不占系统 default loop（避免与 WiFi/`esp_netif` 处理器互相阻塞），队列长度 `CONFIG_EVENT_BUS_QUEUE_SIZE`（默认 16），投递一律非阻塞（`ticks_to_wait = 0`），满则丢弃 + WARN；
 - 处理器在 `evt` 任务上下文执行，不得做耗时/阻塞操作；
 - **音频实时任务（`afe_feed`/`afe_fetch`）只能投递无 payload 事件**：esp_event 带 payload 时会内部 `calloc` 拷贝，违反 §4.3 第 2 条。
+- **T1.2b 落地（T3.1）**：`audio_fe` 在 fetch 任务里投递 `APP_EVT_WAKE_DETECTED` / `APP_EVT_VAD_*`（均无 payload，满足上一条），业务侧由 `voice_session` 的 `APP_EVT_ANY` 处理器消费；`audio_fe_init(cb)` 的回调参数保留但产品路径传 `NULL`（仅调试/兼容用）。
 
 ### 4.3 依赖规则（强制）
 
@@ -364,6 +367,15 @@ esp-ai/
 3. 所有迁移打 INFO 日志（`voice` tag），包含 `sid` 与停留时长；
 4. `ERROR` 状态不自动重试，由用户再次唤醒触发新一轮。
 
+> **T3.1 实现状态（2026-11-01）**：
+> - 状态机在 `components/voice_session`（L4）。迁移统一经 `vs_transition()`/`vs_begin_session()` 的 CAS（期望状态 → 目标状态），并发来源（`evt` 任务、`ws_client`、`player` 完成回调、console/timer）不会打乱状态；
+> - `sid` 由 `voice_session` 分配（uint16 自增、0 保留），经 `vc_start(sid)` 交给 `voice_cloud`；`vc_start_auto()` 只留给 console 探针与测试脚本；
+> - `LISTENING` 的收尾（VAD 静音 800ms / 累计 8s）仍在 `voice_cloud`（协议执行器），发出 `audio_end` 后回调 `VC_EVT_UPLINK_END` 驱动 `LISTENING → THINKING`；
+> - `THINKING` 的 10s 计时也在 `voice_cloud`（`CONFIG_VC_RESPONSE_TIMEOUT_MS`；收到 TTS 数据会刷新为"数据断流超时"），超时回调 `VC_EVT_ROUND_END(TIMEOUT)` 驱动 `THINKING → ERROR`——状态机决策、协议侧计时，避免两套计时器互相打架；
+> - `SPEAKING → IDLE` 在 `player` 完成回调（`STREAM_DONE`）或"本轮无可播音频"的 `VC_EVT_ROUND_END(DONE)` 时发生，保证 TTS 排空后再收状态；
+> - `ERROR` 目前不播错误提示音（资源归 T3.6），由 `CONFIG_VS_ERROR_HOLD_MS` 控制停留（默认 0 = 立即回 IDLE，迁移日志仍完整）；同轮不重试；
+> - 断链（`NET_DOWN` / `VC_ROUND_ABORT_LINK`）→ 取消本轮 → `IDLE`；按键打断骨架 `vs_interrupt()`（完整 R4 淡出与按键来源归 T3.2/T3.4）。
+
 ---
 
 ## 8. 关键流程
@@ -446,6 +458,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 > **T2.5 实测（2026-10-31，见 STATUS §5）**：加入 `voice_cloud`（`vc` 任务 8KB）后，静态 DIRAM **196,670 B**（+208 B）；`ws://` 内部堆峰值 223,620 B / 最低水位 38,451 B；**wss 握手期（公网 `wss://`）峰值 227,988 B、最低水位 32,339 B、最大块 31,744 B** → 静态 + 堆峰值 = **424,658 B ≤ 440KB（余 25.9KB）**，wss 最低水位高于 30KB 线 2.3KB（预计 ~31KB，实测 32.3KB，符合预期但余量不大）。PSRAM 峰值 902,908 B；`vc` 任务栈 8KB，编码/上行轮次中的历史最低剩余 3,212 B（IDLE 时 7,436 B）。**T2.3/T2.4 加 MP3 解码任务栈与解码缓冲后需再按本口径复核。**
 > **T2.3 实测（2026-10-31，见 STATUS §5）**：加入 minimp3（解码状态/临时区/PCM 缓冲全 PSRAM）后，静态 DIRAM **196,782 B（+112 B）**、`player` 任务栈仍 6KB（MP3 解码后余 3,672 B，补丁把 16.3KB 临时区从栈移到 PSRAM）；`ws://` 内部堆最低水位 36,535 B；**wss 握手期（公网 `wss://echo.websocket.org/.ws`，2 次）峰值 227,552~227,724 B、最低水位 32,471~32,643 B** → 静态 + 堆峰值 = **424,506 B ≤ 440KB（余 26,054 B）**，wss 最低水位高于 30KB 线 2.5~2.6KB。**PSRAM 峰值抬到 2,895,336 B**：MP3 PCM 预分配 1.5MB + 解码状态 27,532 B + `player load` 上传探针 512KB（仅开发期）；常驻（不含上传探针）2,395,008 B。T2.4 改流式后可下调 PCM 预分配。
 > **T2.4 实测（2026-10-31，见 STATUS §5）**：加入流式播放（ring 64KB + stage 6.9KB + 收尾环 9.6KB + ring 读暂存 2KB 全 PSRAM）后，静态 DIRAM **196,998 B（+216 B，全为状态/计数，无新缓冲）**、`player` 栈仍 6KB（流式播放中余 3,544 B）；**wss 握手期（公网 echo，2 次）内部堆峰值 227,432~227,480 B、最低水位 32,671~32,719 B** → 静态 + 堆峰值 = **424,478 B ≤ 440KB（余 26,082 B）**，wss 最低水位高于 30KB 线 **1.95~2.05KB**；**PSRAM 峰值降到 1,446,724 B**（PCM 上限 1.5MB→512KB，常驻不含开发期上传探针）；无新增任务。**注意**：水位余量已不足 2KB，后续任务不得再增加内部 RAM 静态/堆占用。
+> **T3.1 实测（2026-11-01，见 STATUS §5）**：加入会话状态机 `voice_session` 后，静态 DIRAM **197,094 B（+96 B，状态/统计变量）**、**无新增任务/任务栈**（状态机事件驱动，见 §9.3）；`ws://` 内部堆峰值 **227,736 B**、最低水位 **31,891~32,971 B**（`tts_stream`/`voice_cloud`/e2e 三脚本口径）→ 静态 + 堆峰值 = **424,830 B ≤ 440KB（余 25,888 B）**，`ws://` 最低水位仍 ≥ 30KB。**wss 握手期未复测**：本次没有新增任务/缓冲，wss 路径代码未变，按 T2.4 的 32,671~32,719 B 减去 ~100B 估算仍在 30KB 以上，T5.3 24h 压测时复测入基线。
 
 ### 9.3 任务与核心（确定）
 
@@ -458,7 +471,6 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `ws` | 0 | 5 | 6KB | WS 状态机/退避/心跳/发送队列（TLS 收发在库任务 `ws_client`） |
 | `vc` | 0 | 4 | 8KB | 上行 Opus 编码 + 发送、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、**下行 0x02 → `audio_player` 流式播放 + R1/R2（T2.4）**（编码在本任务内串行，伪栈在 PSRAM，见 §3.6） |
 | `music_http` | 0 | 4 | 6KB | HTTP 拉流 |
-| `voice_session` | 0 | 4 | 4KB | 状态机事件循环 |
 | `dev` | 0 | 3 | 3KB | 按键扫描 + LED 驱动 |
 | `diag` | 0 | 1 | 8KB | console + 周期监控（T2.2：`enc test` 在 REPL 任务里调 libopus，实测 4KB 会栈溢出 → 8KB） |
 
@@ -466,6 +478,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 
 > 上表是**应用任务**；IDF 库任务（`sys_evt`、`wifi`、`esp_timer`、`Tmr Svc`、`IDLE`、`ipc`）不在此表。
 > `transport_ws` 的 `esp_websocket_client` 另建一个库任务 `ws_client`（核 0 / 优先级 5 / 6KB，T1.4 起），收包回调在它上面执行。
+> `voice_session`（T3.1）**不建任务**：状态机事件驱动，handler 分别跑在 `evt`、`ws_client`、`player` 完成回调与 console/timer 上下文。原计划的 4KB 任务会击穿内部 RAM 水位（T2.4 实测 wss 握手期最低只剩 32.7KB，CONVENTIONS §4 要求 ≥30KB），故不采用；状态迁移是纯内存操作，不需要独立任务上下文。
 > `net_mgr` 的 WiFi/IP 事件处理器运行在 `sys_evt` 任务上，其栈由 `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096` 提供（P1 T1.3 实测默认 2304 B 时只剩 380 B，已加栈）。
 
 ---
@@ -497,6 +510,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `ws status` / `ws reconnect` | WebSocket 观测：状态/脱敏端点/握手与重连计数/心跳 RTT/收发送与丢弃计数/队列水位；主动重连（T1.4 提前交付） |
 | `ws send <json>` / `ws sendbin [len]` / `ws rxlog on\|off` | WebSocket 双向联调探针（T1.6）：原样发送文本/上行二进制帧、打印下行帧（T2.5 起 rxlog 走附加订阅，与 voice_cloud 并存） |
 | `vc status` / `vc start [sid]` / `vc stop` / `vc cancel` / `vc stat` / `vc reset` | 语音云观测与手动起轮（T2.5/T2.4）：链路状态/sid、轮次与上行帧统计、首帧耗时、下行事件与 `sid` 丢弃计数、**下行音频丢弃帧/字节（窗口外/收尾后/播放器不可用）**；手动起一轮、优雅收尾（补尾帧 + audio_end）、立即放弃（同时打断在播 TTS） |
+| `vs status` / `vs start` / `vs interrupt` / `vs reset` | 会话状态机观测（T3.1）：当前状态/sid 与 VC 状态、轮次（开始/完成/异常/中止）、打断/唤醒丢弃/超时/云端 error 计数、迁移次数与上次状态停留；`vs start` 手动开始一轮（不播应答提示音）、`vs interrupt` 打断当前会话（`vc cancel` + 回 IDLE） |
 | `player stat` / `player reset` / `player mp3` / `player pcm <off> <n>` / `player load begin\|chunk\|<base64>\|end` / `player stream [chunk] [gap_ms]` / `player stream abort` | 播放探针（T2.3/T2.4，`CONFIG_DIAG_ENABLE_PLAYER_TEST` 仅开发期）：base64 分块上传素材到 PSRAM；`player mp3` 整段解码播放；`player stream` 把上传素材按 chunk 喂流式路径（`gap_ms` 制造欠载）、`player stream abort` 打断；`player stat` 追加流式统计行（含 `first_sound_us`/`underrun`/`dur_ms`）；`player pcm` 取回整段解码 PCM 对拍 |
 | `net ping <host>` | 网络连通性 |
 | `mic stat` | 麦克风 RMS/峰值、VAD 状态 |

@@ -41,8 +41,8 @@
 - I2S DMA 缓冲必须内部 RAM：`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`。
 - 内部 RAM 预算（**X3-E 定稿，2026-10-31**）：**静态 DIRAM + 运行期堆峰值 ≤ 440KB**，且**最坏场景（wss/TLS 握手期）`sys heap` 最低水位 ≥ 30KB**；超预算先改设计，不靠砍功能硬压。
   - 口径与实测：`idf.py size` 的 DIRAM 已用 + `sys heap` 的「峰值占用」（internal），两者相加对照 440KB；`sys heap` 的「最低水位」对照 30KB。
-  - 当前值（T2.4 后，2026-10-31）：静态 **196,998 B** + wss 堆峰值 **227,480 B** = **424,478 B**（距 440KB 上限余量 26,082 B），wss 最低水位 **32,671~32,719 B**（距 30KB 线余量 1.95~2.05KB）；`ws://` 内部堆峰值约 226.5KB；PSRAM 峰值 **1,446,724 B**（wss 冷启动口径；PCM 上限 1.5MB→512KB 后大幅下降）。T2.3 时为 424,506 B / 32,471~32,643 B / PSRAM 2,895,336 B；T2.5 时为 424,658 B / 32,339 B / PSRAM 902,908 B；T2.2 时为 409,918 B / 47,051~52,839 B。
-  - 两条必须同时满足；**最坏场景下「最低水位 ≥30KB」是更强约束**（堆总量 ~259,843 B → 堆峰值上限约 229,843 B，折合静态+堆 ≤426.8KB）；440KB 上限用于吸收静态 DIRAM 后续增长。**T2.4 后水位余量只剩 ~2KB：后续任务不得再新增内部 RAM 任务栈/静态/堆占用，需要缓冲时放 PSRAM 或复用现有任务。**
+  - 当前值（T3.1 后，2026-11-01）：静态 **197,094 B** + `ws://` 堆峰值 **227,736 B** = **424,830 B**（距 440KB 上限余量 25,888 B），`ws://` 最低水位 **31,891~32,971 B**（≥30KB）；PSRAM 峰值 **1,556,032 B**（ws:// 冷启动口径）。**wss 握手期 T3.1 未复测**（未新增任务/缓冲，T2.4 时为 32,671~32,719 B，按 ~100B 静态增量估算仍 >30KB，T5.3 复测入基线）。T2.4 时为 424,478 B / 32,671~32,719 B / PSRAM 1,446,724 B；T2.3 时为 424,506 B / 32,471~32,643 B / PSRAM 2,895,336 B；T2.5 时为 424,658 B / 32,339 B / PSRAM 902,908 B；T2.2 时为 409,918 B / 47,051~52,839 B。
+  - 两条必须同时满足；**最坏场景下「最低水位 ≥30KB」是更强约束**（堆总量 ~259,843 B → 堆峰值上限约 229,843 B，折合静态+堆 ≤426.8KB）；440KB 上限用于吸收静态 DIRAM 后续增长。**T2.4 后水位余量只剩 ~2KB：后续任务不得再新增内部 RAM 任务栈/静态/堆占用，需要缓冲时放 PSRAM 或复用现有任务。T3.1 即据此把 `voice_session` 改为事件驱动、不新建任务（ARCH §9.3）。**
   - TLS 记录缓冲与握手堆自 X3-F 起在 PSRAM，不计入内部 RAM；旧口径「峰值 ≤310KB」写于 P0（未含 WiFi 栈且只统计堆），已作废。
 - 长时运行场景必须监控堆水位（`diag`），不允许无限增长。
 
@@ -96,6 +96,7 @@ components/<module>/
   `idf.py -p <PORT> coredump-info`（寄存器/调用栈/任务列表）、`idf.py -p <PORT> coredump-debug`（gdb）；也可 `-s core.dump` 存盘后 `coredump-info -c core.dump` 离线解析。
 - **端到端链路自测（T2.6 起）**：`uv run tools/e2e_voice_test.py` 走真实用户路径（afplay 唤醒 → 提示音 → 自动起轮 → 交互语音 → mock 真实 MP3 流式播放 → R2），10 轮逐轮断言（P2 三条 + 半双工/拾音/堆/PSRAM/任务/无 ERROR）；`--dry-run` 不连设备。与 `voice_cloud_test`（协议/事件、合成帧、`vc start` 手动触发）、`tts_stream_test`（`vc start/stop` + 真实 MP3 播放硬指标、含 abort/stall/late-bin）三方分工。拾音判据带环境噪声兜底（baseline=min(播放前后静音峰)，≥800 重试→WARN），**不要用重试掩盖固件 bug**。
 - **解析 coredump 必须用崩溃那一刻的 ELF**（`build/esp-ai.elf`，含符号与地址布局）：崩溃后先备份该文件再改代码/重建；要交付或现场测试的固件需把 elf 与 commit 一起归档，否则 coredump 无法还原调用栈。
+- **会话状态机调试（T3.1 起）**：`vs status` 看当前状态/sid/轮次与异常计数；`vs start`/`vs interrupt` 手动起轮/打断；迁移日志 `VS: state A -> B（sid=N，停留 M ms，原因=…）`。唤醒链路日志自 T3.1 起由 `VS` 输出（`VS: wake detected` / `VS: prompt done, feed resumed`），测试脚本正则用 `(?:APP|VS)` 兼容新旧固件。错误路径用 mock 验证：`--scenario error`（云端 error → ERROR）、`--think-ms 12000`（THINKING 10s 超时 → ERROR）。
 
 ## 9. 禁止事项
 

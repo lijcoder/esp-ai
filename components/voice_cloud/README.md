@@ -11,9 +11,9 @@
 
 | 属于本组件 | **不**属于本组件 |
 |---|---|
-| 一轮上行链路（读 PCM → 编码 → 发帧 → 收尾） | 会话状态机 `IDLE/LISTENING/THINKING/SPEAKING`（T3.1 `voice_session`） |
-| `audio_start` / `audio_end` 报文与 `sid` 生成（T2.5 简化版） | VAD/唤醒事件接线、半双工 R1–R5（T2.5 用 stats 轮询静音，T3.1 接管） |
-| 下行语音事件解析、`sid` 过滤、事件/回调分发 | 错误提示音（T3.6）、按键打断（T3.2） |
+| 一轮上行链路（读 PCM → 编码 → 发帧 → 收尾）、协议超时 | 会话状态机 `IDLE/LISTENING/THINKING/SPEAKING/ERROR`（T3.1 `voice_session`，已落地） |
+| `audio_start` / `audio_end` 报文（`sid` 由 `voice_session` 传入） | VAD/唤醒事件接线（T1.2b 已由 `voice_session` 消费）、会话级错误策略与提示音 |
+| 下行语音事件解析、`sid` 过滤、事件/回调分发 | 错误提示音（T3.6）、按键打断（T3.2/T3.4） |
 | 下行 0x02 → `audio_player` 流式播放的接线（开流/写帧/收尾/打断 + R1/R2） | MP3 解码与 I2S 输出本身（`audio_player`，T2.4-A） |
 | 上行/下行统计（`vc status`） | 音乐协议（T4.2） |
 
@@ -22,18 +22,18 @@
 | 接口 | 说明 |
 |---|---|
 | `vc_init()` | 注册 WS 主接收回调 + 建 `vc` 任务（核 0 / 优先级 4 / 8KB，ARCH §9.3）。必须在 `ws_init()` 之后调用 |
-| `vc_start(sid)` / `vc_start_auto()` | 发起一轮（异步）；`*_auto` 每轮 sid 自增（T2.5 简化口径，T3.1 接管后由会话状态机传入）。云端未 READY 返回 `ESP_ERR_INVALID_STATE`，调用方按"网络未就绪"降级，**不要重试等待** |
+| `vc_start(sid)` / `vc_start_auto()` | 发起一轮（异步）。**产品路径由 `voice_session` 传入它分配的 sid**；`*_auto` 只留给 console 探针与测试脚本（每轮自增，0 保留）。云端未 READY 返回 `ESP_ERR_INVALID_STATE`，调用方按"网络未就绪"降级，**不要重试等待** |
 | `vc_stop()` | 优雅收尾：补 `enc_flush` 尾帧 + 发 `audio_end`（用于调试/按键路径） |
 | `vc_cancel()` | 立即放弃：不补尾帧、不发 `audio_end` |
 | `vc_is_busy()` / `vc_get_state()` / `vc_state_name()` / `vc_current_sid()` | 三态观测（`IDLE` / `UPLINK` / `WAIT_RESPONSE`） |
-| `vc_register_cb(cb, arg)` | 业务回调（覆盖语义），与 `event_bus` 事件同时分发；回调在 `ws_client` 任务上下文，**禁止阻塞**，`text` 只在回调内有效 |
+| `vc_register_cb(cb, arg)` | 业务回调（覆盖语义），与 `event_bus` 事件同时分发；回调在 `ws_client` 任务上下文，**禁止阻塞**，`text` 只在回调内有效。T3.1 起事件枚举增加 `VC_EVT_UPLINK_END`（`code`=收尾原因）与 `VC_EVT_ROUND_END`（`round_end`=`vc_round_end_t`），供 `voice_session` 驱动状态机 |
 | `vc_stats_read()` / `vc_stats_reset()` | 轮次/上行帧/字节/首帧耗时/下行事件/`sid` 丢弃/解析失败/下行音频播放与丢弃等统计（`diag` 的 `vc status` 使用） |
 
 ## 一轮的时序
 
 ```
-APP（提示音播完，收音已恢复）
-  └─ vc_start_auto()
+voice_session（IDLE→LISTENING，提示音播完、sid 已分配）
+  └─ vc_start(sid)
        └─ [vc 任务] enc_open → audio_fe_uplink_start → ws "audio_start"
             └─ 循环：audio_fe_uplink_read(320) → enc_encode → ws_send_bin(0x01)
                  ├─ VAD 连续静音 800ms（至少出现过人声）→ 收尾
@@ -41,15 +41,18 @@ APP（提示音播完，收音已恢复）
                  ├─ vc_stop() → 收尾
                  └─ vc_cancel() / WS 掉线 → 直接放弃（不发 audio_end）
             └─ 收尾：enc_flush 尾帧 → ws "audio_end" → enc_close → uplink_stop
-            └─ WAIT_RESPONSE：等 asr/llm/tts 事件（10s 超时）
+            └─ WAIT_RESPONSE：等 asr/llm/tts 事件（10s 超时，收到数据后刷新为"断流超时"）
                  ├─ tts_start → audio_player_stream_open(1, sr) + 暂停收音（R1）
                  │    └─ 窗口内 0x02 帧 → audio_player_stream_write()（≤2KB/次）
                  ├─ tts_end   → audio_player_stream_end()（排空 + 100ms fade + 300ms 尾部）
-                 │    └─ 播放完成回调（src=TTS_STREAM）→ 恢复收音（R2）→ round done，回 IDLE
+                 │    └─ 播放完成回调（src=TTS_STREAM）→ 恢复收音（R2）→ round done
                  ├─ error / 断链 / 新轮次 / 响应超时 / vc_cancel()
                  │    └─ audio_player_stream_abort()（立即停声，回调 ok=false → R2）
-                 └─ 超时      → WARN，回 IDLE
+                 └─ 超时      → WARN + VC_EVT_ROUND_END(TIMEOUT)，回 IDLE
 ```
+
+> T3.1 起，`audio_end` 发出后回调 `VC_EVT_UPLINK_END`、每轮结束回调 `VC_EVT_ROUND_END`；
+> 状态迁移由 `voice_session` 决定，本组件只报告事实。
 
 ## 下行事件处理
 
@@ -58,7 +61,7 @@ APP（提示音播完，收音已恢复）
 | `asr_partial` / `asr_final` | 投 `APP_EVT_ASR_PARTIAL/FINAL`（`app_evt_asr_t`，文本截断到 28B）+ `vc_register_cb` 回调；完整文本打 INFO 日志 |
 | `llm_delta` | 仅回调 + DEBUG 日志（ARCH §4.2 未定义对应 event_bus 事件） |
 | `tts_start` | 校验 `codec=mp3`、记 `sr`；`audio_player_stream_open(1, sr)` 成功 → `audio_fe_set_feed_enabled(false)`（R1），失败只 WARN；投 `APP_EVT_TTS_START` + 回调；打开下行 0x02 接收窗口 |
-| `tts_end` | `audio_player_stream_end()` 排空收尾；投 `APP_EVT_TTS_END`（带本轮下行帧数）+ 回调；关闭窗口，本轮结束 |
+| `tts_end` | `audio_player_stream_end()` 排空收尾；投 `APP_EVT_TTS_END`（带**本轮**下行帧数，T3.1 修正了原先的会话累计口径）+ 回调；关闭窗口，本轮结束 |
 | `error` | ERROR 日志（码表见 PROTOCOL §4）+ `audio_player_stream_abort()` + 回调；结束本轮，不自动重试 |
 | 下行 0x02 帧 | 窗口内（`WAIT_RESPONSE` 且未收 `tts_end`）→ `audio_player_stream_write()`（成功计入「音频帧」）；窗口外/收尾后/播放器未开流/ring 满 → 丢弃 + 计入「音频丢弃」帧/字节（限频 WARN） |
 | 其它 `t` | WARN 后忽略（契约外事件，如 T2.5 阶段的 `music_track`） |
@@ -81,7 +84,7 @@ APP（提示音播完，收音已恢复）
 | `VC_VAD_SILENCE_MS` | 800 | VAD 连续静音多久收尾（ARCH §3.6） |
 | `VC_MAX_UTTER_MS` | 8000 | 单轮上行上限（用户不说话时兜底） |
 | `VC_READ_TIMEOUT_MS` | 50 | `audio_fe_uplink_read()` 等待上限；也决定 `vc_cancel()` 的响应粒度 |
-| `VC_RESPONSE_TIMEOUT_MS` | 10000 | `audio_end` 后等云端响应超时（ARCH §7 THINKING 10s） |
+| `VC_RESPONSE_TIMEOUT_MS` | 10000 | 等云端响应超时（ARCH §7 THINKING 10s）；收到 `tts_start`/0x02 数据会把 deadline 刷新为"连续无数据 10s"，避免长 TTS/短暂抖动被误判超时 |
 
 ## 关键约束
 
@@ -89,12 +92,13 @@ APP（提示音播完，收音已恢复）
 2. **编码器按轮次 open/close**：轮次中 `enc test`/`enc open`/`enc close` 会被 `diag` 拒绝（提示先 `vc cancel`）；IDLE 时 console 探针可用。
 3. **上行接口独占**：轮次中 `afe uplink on` 会被拒绝；反之若检测到上行已被 console 占用，本轮跳过（WARN）。
 4. **发送一律非阻塞**：`ws_send_text/bin` 失败只计数 + 限频 WARN，绝不等待重试；队列满丢帧由传输层负责。
-5. **`sid` 由本组件维护（T2.5 简化）**：T3.1 落地后改为调用方传入，迟到帧规则不变（PROTOCOL §3.3）。
+5. **`sid` 由 `voice_session` 分配**（T3.1 已完成，PROTOCOL §3.3）：`vc_start(sid)` 传入；`vc_start_auto()` 仅测试/探针用，迟到帧规则不变。
 6. **文本截断**：event_bus payload 定长 32B，ASR 文本最多 28B（约 9 个汉字）；完整文本在 VC 日志/回调里。
 7. `vc_start*` 是异步的：返回 `ESP_OK` 只表示已受理，真正开轮要看 `vc status` / 日志。
 8. **流式播放的写帧在 `ws_client` 任务上下文**（下行回调里）：`audio_player_stream_write()` 只做 PSRAM ring 拷贝（单次 ≤2KB，非阻塞）；ring 满返回 `ESP_ERR_NO_MEM`，本组件计入「音频丢弃」并限频 WARN，不重试。
 9. **R2 恢复收音靠完成回调，不在 `vc` 任务里做**：`vc_init()` 里 `audio_player_subscribe_done()` 注册一次（附加槽，≤3 个，不要重复注册）；回调在 `player` 任务上下文，只做一次 `audio_fe_set_feed_enabled(true)`，禁止阻塞/耗时。成功、失败、打断都会回调。
 10. **打断是立即关 TX（无淡出）**：`vc_cancel`/云端 error/断链/新轮次/响应超时都调 `audio_player_stream_abort()`；未开流时返回 `ESP_ERR_INVALID_STATE` 按无操作处理，不刷屏。
+11. **VAD 静音仍用 `audio_fe_stats_read().vad_active` 轮询**（50Hz）：T1.2b 已把 VAD 事件接到 event_bus，但本组件在 `vc` 任务里需要一个同步快照判"连续静音"，轮询成本可忽略；改为事件驱动留待后续按需优化。
 
 ## 真机验收（T2.5，2026-10-31）
 
@@ -129,8 +133,18 @@ APP（提示音播完，收音已恢复）
 4. **`ws rxlog` 与业务回调互斥（已修）**：P1 的单回调 API 会被 `diag` 的 `ws rxlog` 覆盖、静默丢业务事件；T2.5 给 `transport_ws` 加了附加订阅（`ws_subscribe`），rxlog 走附加槽位。
 5. **非契约端点会刷 WARN**：用公网 `wss://echo.websocket.org` 测 TLS/内存时，回显端点会把 `hello` 回显成非契约下行文本，`voice_cloud` 按"未知事件/非法文本"WARN 后忽略，属预期（见 PROTOCOL §8）。
 
-## 后续（T3.1 起）
+## 真机验收（T3.1，2026-11-01）
 
-- 会话状态机接管 `vc_start` 的 `sid` 分配与超时/错误提示（T3.1/T3.6）；
-- 按键打断走 `vc_cancel()` + `interrupt` 报文（T3.2）；
-- VAD/唤醒改走 `event_bus`（T1.2b），本组件去掉 stats 轮询。
+- `voice_cloud_test.py` **50/50 PASS**（T2.5 的 43 项 + 7 项会话语义）：VS 迁移序列
+  `IDLE→LISTENING→THINKING→SPEAKING→IDLE`、迁移 `sid` 一致、event_bus 收到
+  `VOICE_STATE_CHANGED`、`vs status` 开始/完成各 1 且无异常/超时；`--inject-late` 同为 50/50。
+- `tts_stream_test.py` **193/193 PASS**（`TTS end（本轮下行音频 30 帧）` 验证 per-round 计数；
+  手动 `vc start/stop/cancel` 路径不受状态机影响）。
+- 手动验证错误路径：云端 `error` → VS `THINKING→ERROR→IDLE`；mock `--think-ms 12000` →
+  `THINKING` 停留 10000 ms 后 `→ERROR`，迟到帧按窗口外丢弃；`vs interrupt` 立即中止轮次。
+
+## 后续
+
+- 错误提示音（T3.6）接入后，ERROR 状态的停留时长改为提示音时长（`CONFIG_VS_ERROR_HOLD_MS`）；
+- 按键打断（T3.2/T3.4）改为 R4 完整路径（100ms 淡出 + interrupt 报文 + 50ms 丢弃）；
+- 如需进一步降 CPU，可把 VAD 静音判定改为事件驱动（T1.2b 已具备事件源）。

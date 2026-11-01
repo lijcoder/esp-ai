@@ -122,14 +122,14 @@ uv run tools/voice_test.py --no-reset --wakes 1   # 设备已在跑、不想复�
 **作用**：一条命令完成「起本地 mock → 复位设备 → 回放唤醒词 → 回放交互语音 → 断言上行/下行/统计 → 测 `vc stop`/`vc cancel`」，覆盖 T2.5 的端到端链路。脚本会自己拉起 `ws_mock_server.py`（端口被占用时复用并跳过 mock 侧断言），独占串口；音量默认临时调到 50% 上限、结束恢复。
 
 ```bash
-uv run tools/voice_cloud_test.py                        # 默认 --volume 50，全量 43 项
+uv run tools/voice_cloud_test.py                        # 默认 --volume 50，全量 50 项（T3.1 起含 VS 断言）
 uv run tools/voice_cloud_test.py --inject-late          # 让 mock 注入 sid+1 的迟到事件，验证端侧过滤
 uv run tools/voice_cloud_test.py --volume 31 --log /tmp/vc.log
 uv run tools/voice_cloud_test.py --no-mock              # 已有 mock 在跑（跳过 mock 侧断言）
 uv run tools/voice_cloud_test.py --dry-run              # 只检查素材/音量/串口
 ```
 
-**断言**：设备启动 + `hello_ack`；唤醒链路（`wake detected`→`feed paused`→`PLAYER: play`→`prompt done`）；`round start` / 上行首帧 <200ms / `audio_end` 原因 `vad-silence` / `tts_start`(mp3/24000) / `tts_end` / `round done`；event_bus 收到 `ASR_FINAL`/`TTS_START`/`TTS_END`；上行帧数 ≥60、平均帧长 20~60B、首帧耗时、下行 100 帧与 `tts_end` 计数一致、`sid` 丢弃/解析失败/云端 error 为 0；mock 侧 sid 一致、逐帧收到、`seq` 无跳变、无坏帧；`vc stop` 收尾原因 `stop-request`、`vc cancel` 立即放弃；内部堆最低水位 ≥30KB、`vc` 任务栈剩余 ≥1KB、无 ERROR。**T2.5 真机实测 43/43 PASS**（含 `--inject-late`）。
+**断言**：设备启动 + `hello_ack`；唤醒链路（`wake detected`→`feed paused`→`PLAYER: play`→`prompt done`，T3.1 起未知前缀由 `(?:APP|VS)` 兼容）；`round start` / 上行首帧 <200ms / `audio_end` 原因 `vad-silence` / `tts_start`(mp3/24000) / `tts_end` / `round done`；event_bus 收到 `ASR_FINAL`/`TTS_START`/`TTS_END`；上行帧数 ≥60、平均帧长 20~60B、首帧耗时、下行 100 帧与 `tts_end` 计数一致、`sid` 丢弃/解析失败/云端 error 为 0；mock 侧 sid 一致、逐帧收到、`seq` 无跳变、无坏帧；`vc stop` 收尾原因 `stop-request`、`vc cancel` 立即放弃；**T3.1 会话状态机**：`VS` 迁移序列必须为 `IDLE→LISTENING→THINKING→SPEAKING→IDLE`、迁移日志 `sid` 与本轮一致、event_bus 收到 `VOICE_STATE_CHANGED`、`vs status` 轮次开始/完成各 1 且无异常/超时；内部堆最低水位 ≥30KB、`vc` 任务栈剩余 ≥1KB、无 ERROR。**T3.1 真机实测 50/50 PASS**（含 `--inject-late` 50/50；T2.5 时为 43/43）。
 
 ## afe_uplink_test.py —— 上行 PCM 接口真机自测（T2.1）
 
@@ -479,6 +479,21 @@ uv run tools/e2e_voice_test.py --no-reset --log /tmp/e2e.log
   最低水位 31,595~32,351 B（ws:// mock 口径；wss 口径见 T2.4 基线）。
 - 环境：系统音量 28% → 临时 50% → 恢复；安静段底噪 RMS 56~467、峰值 88~2,262（间歇人声会拉高，
   是环境重试与拾音 inconclusive 的来源）。
+
+### 实测基线（2026-11-01，T3.1 会话状态机，本地 ws mock）
+
+- **10/10 轮 PASS、677 项断言全过**（失败项 0）；唤醒 10/10、内部堆 43,051~43,103 B（波动 52 B、
+  非单调）、PSRAM 首末差 0、任务数恒 17（**未新增任务**）、欠载 0、无 ERROR/panic。
+- 逐轮：上行 191~277 帧、首帧 22,970~30,693 us、`first_sound_us` **7,986/16,918/29,864**
+  （min/中位/max，全部 <150000）、`underrun=0`、`decoded=fed=202`、`dur=4849~4853 ms`。
+- 拾音判据 3/10 轮 inconclusive（环境 baseline 1055/1298/3516 ≥ 800，播放峰 2195~4559），
+  按 T2.6-A2 口径记 WARN 不判 FAIL，硬断言仍全绿。
+- 会话状态机：本轮日志出现 `VS: state IDLE -> LISTENING` → `LISTENING -> THINKING` →
+  `THINKING -> SPEAKING` → `SPEAKING -> IDLE`（sid 恒定），与 `voice_cloud_test` 的状态断言一致。
+- **环境噪声口径**：同日中午环境底噪升高（基线峰 1,100~2,000）后复跑，出现 8/10（失败轮 2）与
+  7/10（失败轮 3），失败轮**全部**是 `max-duration`（VAD 8000ms 未静音）的环境失败，成功轮断言全绿；
+  同期 `voice_test.py --volume 50 --wakes 3` 仍 16/16（唤醒 3/3、底噪 RMS 1008），确认非固件回归。
+  按 T2.6-A2 口径：环境失败不计入硬断言，需在安静环境复跑取 10/10 记录。
 
 ### 与 voice_cloud_test.py / tts_stream_test.py 的分工（P2 验收三条都要跑）
 

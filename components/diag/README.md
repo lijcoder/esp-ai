@@ -6,7 +6,7 @@
 
 | 接口 | 说明 |
 |---|---|
-| `diag_init()` | 打印启动横幅 → 在 UART0（115200，GPIO43/44）起 REPL → 注册 `help`/`sys`/`log`/`mic`/`cfg`/`evt`/`wifi`/`ws`；只能在 `app_main` 最前部调用一次，重复调用返回 `ESP_ERR_INVALID_STATE` |
+| `diag_init()` | 打印启动横幅 → 在 UART0（115200，GPIO43/44）起 REPL → 注册 `help`/`sys`/`log`/`mic`/`cfg`/`evt`/`wifi`/`ws`/`vc`/`vs`；只能在 `app_main` 最前部调用一次，重复调用返回 `ESP_ERR_INVALID_STATE` |
 
 ## console 命令（本轮）
 
@@ -34,6 +34,10 @@
 | `vc start [sid]` | 手动发起一轮端云会话（云端未 READY 时拒绝；不带 sid 则自增） |
 | `vc stop` / `vc cancel` | 优雅收尾（补尾帧 + audio_end）/ 立即放弃（不发 audio_end） |
 | `vc reset` | 清零 VC 统计（保留最近 sid/用时） |
+| `vs status` / `vs stat` | 会话状态机观测（T3.1）：当前状态与 sid、VC 状态、轮次（开始/完成/异常/中止）、打断/唤醒丢弃/超时/云端 error 计数、迁移次数与上次状态停留时长 |
+| `vs start` | 手动开始一轮会话（不播唤醒应答提示音，直接进入 `LISTENING`；已有会话时拒绝） |
+| `vs interrupt` | 打断当前会话：`vc cancel` + 回 `IDLE`（R4 完整淡出与按键来源归 T3.2/T3.4） |
+| `vs reset` | 清零 VS 统计（保留最近 sid/停留时长） |
 | `wifi status` | 网络状态：state、SSID、IP、RSSI、SNTP 是否对时、累计重连次数与当前退避 |
 | `wifi reconnect` | 主动断开并重连（重置退避）；已联网时先投 `NET_DOWN` 再恢复，用于验证重连链路 |
 | `ws status` | WebSocket 状态：状态机、脱敏端点（不回显 token）、握手次数、心跳 RTT、收发/丢弃/坏帧计数、队列占用 |
@@ -65,7 +69,7 @@
 
 ## 依赖
 
-- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计）、`config_store`（`cfg` 读写 NVS）、`event_bus`（`evt` 投递/订阅）、`net_mgr`（`wifi status/reconnect`）、`transport_ws`（`ws status/reconnect/send/sendbin/rxlog`）、`voice_cloud`（`vc status/start/stop/cancel`），均为**私有依赖**，不对外暴露头文件。
+- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计）、`config_store`（`cfg` 读写 NVS）、`event_bus`（`evt` 投递/订阅）、`net_mgr`（`wifi status/reconnect`）、`transport_ws`（`ws status/reconnect/send/sendbin/rxlog`）、`voice_cloud`（`vc status/start/stop/cancel`）、`voice_session`（`vs status/start/interrupt/reset`），均为**私有依赖**，不对外暴露头文件。
 - IDF 配置：`CONFIG_FREERTOS_USE_TRACE_FACILITY`（任务枚举）与 `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` + `COUNTER_TYPE_U64`（CPU 占比，64 位计数避免 esp_timer 32 位约 71 分钟回绕）。已固化在 `sdkconfig.defaults.esp32s3`；若关掉 trace facility，`sys tasks` 会提示不可用而不是编译失败。
 - 硬件：UART0 115200，GPIO43/44（见 `docs/HARDWARE.md`）。
 

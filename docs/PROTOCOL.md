@@ -115,10 +115,10 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 
 ### 3.3 `sid` 规则与迟到帧过滤
 
-- 每轮语音 `sid` 由**端侧**生成、uint16 自增（T2.5 简化：`voice_cloud` 内部计数，T3.1 接管后由会话状态机分配）；
+- 每轮语音 `sid` 由**端侧**生成、uint16 自增（T3.1 起由 `voice_session` 分配，经 `vc_start(sid)` 传给 `voice_cloud`；`vc_start_auto()` 仅 console 探针/测试脚本使用）；
 - 服务端下发语音事件时必须原样回填 `sid`；
 - 端侧规则：**无 `sid`、`sid` 非法、或与当前轮次不一致的事件一律丢弃**，计入 `vc status` 的「sid 丢弃」；不报错、不结束本轮。
-- 迟到帧过滤已用 mock `--inject-late`（每轮注入一个 `sid+1` 的 `asr_final`）做真机验证。
+- 迟到帧过滤已用 mock `--inject-late`（每轮注入一个 `sid+1` 的 `asr_final`）做真机验证；T3.1 回归仍 50/50 PASS。
 
 ### 3.4 未知事件 / 非法文本
 

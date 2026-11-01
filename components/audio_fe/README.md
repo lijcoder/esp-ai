@@ -41,8 +41,12 @@
 
 ## 事件
 
-`AUDIO_FE_EVT_WAKE`、`AUDIO_FE_EVT_VAD_SPEECH_START`、`AUDIO_FE_EVT_VAD_SPEECH_END`。
-回调运行在 fetch 任务上下文，**不要做耗时操作**。
+- **产品路径（T1.2b 起）：`event_bus`** —— fetch 任务里投递
+  `APP_EVT_WAKE_DETECTED` / `APP_EVT_VAD_SPEECH_START` / `APP_EVT_VAD_SPEECH_END`（均**无 payload**，
+  满足"音频任务只能投无 payload 事件"的约束）。业务订阅方是 `voice_session`（T3.1）。
+- **回调（调试/兼容）**：`audio_fe_init(cb, arg)` 的 `AUDIO_FE_EVT_WAKE` / `AUDIO_FE_EVT_VAD_SPEECH_START` /
+  `AUDIO_FE_EVT_VAD_SPEECH_END` 仍保留，但 `main` 传 `NULL`；不要与事件订阅同时消费，避免双份业务处理。
+- 两种通知都运行在 fetch 任务上下文，**不要做耗时操作**。
 
 ## 配置（Kconfig）
 
@@ -64,12 +68,11 @@
 
 ## 依赖
 
-`audio_io`（采集）、`espressif/esp-sr`（见 `idf_component.yml`）。
+`audio_io`（采集）、`event_bus`（唤醒/VAD 事件，L1）、`espressif/esp-sr`（见 `idf_component.yml`）。
 
 ## 后续
 
-- T2.2 `codec_enc` 用 `audio_fe_uplink_read()` 取 320 样本编码（上行接口已就绪，2026-10-31 T2.1）；
-- 唤醒/VAD 回调改走 `event_bus`（T1.2b，随 T2.5/T3.1 落地）；
+- ✅ 唤醒/VAD 改走 `event_bus`（T1.2b，T3.1 完成；业务方 `voice_session`）；
 - 双麦/参考通道支持（`"MMR"`）随硬件升级（见 PRODUCT_IDEAS H1）。
 
 对应架构：[docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) §2、§3.1、§3.3、§4。

@@ -21,7 +21,8 @@
 | `APP_EVT_ASR_PARTIAL` / `APP_EVT_ASR_FINAL` | `app_evt_asr_t { sid, len, char text[28] }`（T2.5 定稿；超长截断） |
 | `APP_EVT_TTS_START` | `app_evt_tts_start_t { sid, codec(1=mp3), sr }` |
 | `APP_EVT_TTS_END` | `app_evt_tts_end_t { sid, frames }`（本轮下行音频帧数） |
-| 其余 11 个事件 | 暂无（post 时传 `NULL`），使用方落地时补定义并同步 ARCHITECTURE §4.2 |
+| `APP_EVT_VOICE_STATE_CHANGED` | `app_evt_voice_state_t { sid, from, to, reason, dur_ms }`（T3.1 定稿；`voice_session` 每次迁移后投递） |
+| 其余 10 个事件 | 暂无（post 时传 `NULL`），使用方落地时补定义并同步 ARCHITECTURE §4.2 |
 
 payload 统一装进定长 32 字节的 `app_evt_data_t`：投递时整块拷贝，**发布方不需要保活数据**，处理器拿到的 `data` 只在本次回调内有效。文本类 payload 的定长/截断口径已由 T2.5 定稿（ASR 文本最多 28B，完整文本走 `voice_cloud` 日志/回调）；**不要自行往 union 里加变长字段**，新增字段先改 ARCHITECTURE §4.2。
 
@@ -43,7 +44,7 @@ payload 统一装进定长 32 字节的 `app_evt_data_t`：投递时整块拷贝
 - **音频实时任务（`afe_feed`/`afe_fetch`）只允许投递无 payload 事件**：esp_event 在带 payload 时会内部 `calloc` 一份拷贝（IDF 5.4 实现），在音频任务里调用违反 CONVENTIONS §3 的"禁止 malloc/阻塞"。
 - 投递一律非阻塞（`ticks_to_wait = 0`），失败立即返回错误码 + WARN，不允许在音频/实时路径上等待。
 - 处理器运行在 `evt` 任务上下文：不要做耗时操作，也不要在处理器里阻塞等待别的任务（会卡住整个事件分发）。
-- 处理器槽位固定 8 个（`EVT_MAX_HANDLERS`），注册失败返回 `ESP_ERR_NO_MEM`；P1 用量：diag 的 `evt trace` 占 1 个。
+- 处理器槽位固定 8 个（`EVT_MAX_HANDLERS`），注册失败返回 `ESP_ERR_NO_MEM`；当前用量 4 个：`transport_ws` 的 `NET_UP`/`NET_DOWN`（2）、`diag` 的 `evt trace`（`ANY`，按需）、`voice_session` 的会话事件（`ANY`，T3.1 起）。
 - 事件 ID 数值即调试口可见的 ID：只在末尾追加，禁止插队/改序，改必须同步 ARCHITECTURE §4.2。
 
 ## 调试
@@ -61,6 +62,6 @@ evt trace on|off                  # 订阅/取消订阅全部事件，在 evt �
 
 ## 后续
 
-- T1.2b：把 `main`/`audio_fe` 的唤醒、VAD 接线迁到事件（随 T2.5/T3.1 落地，避免 P2 返工）。
-- T1.3 `net_mgr` 投递 `NET_UP`/`NET_DOWN`；T1.4 `transport_ws` 订阅 `NET_UP` 触发连接。
+- ✅ T1.2b（T3.1 完成）：`audio_fe` 投递 `WAKE_DETECTED`/`VAD_*`，业务侧 `voice_session` 用 `APP_EVT_ANY` 消费；
+  `main` 不再注册 `audio_fe` 回调。
 - 事件数增多后如果处理器槽位不够，再评估扩容或改成"每事件独立注册"的接口，并同步 README 与 ARCHITECTURE §4.2。

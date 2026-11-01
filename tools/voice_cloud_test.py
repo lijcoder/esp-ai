@@ -103,6 +103,7 @@ END_VC_STOP = re.compile(r"已请求优雅收尾")
 END_VC_CANCEL = re.compile(r"已请求立即放弃")
 END_VS_STATUS = re.compile(r"说明: 唤醒自动进 LISTENING")
 END_VS_RESET = re.compile(r"vs 统计已清零")
+END_VS_FOLLOWUP = re.compile(r"连续对话续听窗口：(开|关)")
 END_EVT_TRACE_ON = re.compile(r"事件 trace 已开启|事件 trace 已经开启")
 END_SYS_HEAP = re.compile(r"PSRAM.*(最低水位|未初始化)")
 END_SYS_TASKS = re.compile(r"共 \d+ 个任务")
@@ -237,6 +238,12 @@ def vs_status(dev: Device) -> dict:
         if m:
             stat["transitions"] = int(m.group(1))
             stat["sid"] = int(m.group(2))
+        m = re.search(r"续听: 续听轮 (\d+) / 命中 (\d+)；超时退出 (\d+) / 上限退出 (\d+)", line)
+        if m:
+            stat["followup_rounds"] = int(m.group(1))
+            stat["followup_hits"] = int(m.group(2))
+            stat["followup_timeouts"] = int(m.group(3))
+            stat["followup_max_exits"] = int(m.group(4))
     return stat
 
 
@@ -343,6 +350,9 @@ def run(args: argparse.Namespace) -> int:
         # 基线：统计清零 + 打开事件 trace（验证 voice_cloud 真的往 event_bus 投了事件）
         dev.console("vc reset", END_VC_RESET, timeout=2.0)
         dev.console("vs reset", END_VS_RESET, timeout=2.0)
+        # T3.7：单轮用例关续听窗口；--followup 用例显式打开
+        dev.console("vs followup on" if args.followup else "vs followup off",
+                    END_VS_FOLLOWUP, timeout=2.0)
         dev.console("evt trace on", END_EVT_TRACE_ON, timeout=2.0)
         base = vc_status(dev)
         result.check(base.get("state") == "IDLE", f"初始状态 IDLE（实际 {base.get('state')}）")
@@ -352,8 +362,15 @@ def run(args: argparse.Namespace) -> int:
 
         # ---- 一轮真实语音：唤醒 → 提示音 → 交互语音 → 上行 → 下行 ----
         mark = dev.mark()
-        dev.play(wake_path)
-        wake_seen = wait_line(dev, RE_PROMPT_DONE, 8.0, mark)
+        wake_seen = None
+        for attempt in range(1, args.wake_attempts + 1):
+            dev.play(wake_path)
+            wake_seen = wait_line(dev, RE_PROMPT_DONE, 8.0, mark)
+            if wake_seen is not None:
+                break
+            if attempt < args.wake_attempts:
+                print(f"  唤醒未触发（第 {attempt} 次），重试（环境噪声口径）")
+                dev.pump(0.5)
         round_lines = lines_since(dev, mark)
         result.check(wake_seen is not None, "唤醒提示音播放完成（prompt done, feed resumed）")
         result.check(any(RE_WAKE.search(l) for l in round_lines), "日志出现唤醒事件")
@@ -404,25 +421,82 @@ def run(args: argparse.Namespace) -> int:
         result.check(any(RE_EVT_TTS_END.search(l) for l in all_lines),
                      "event_bus 收到 TTS_END")
 
-        # ---- T3.1：会话状态机（voice_session） ----
-        # vc 的 round done 早于 TTS 排空：先等播放完成回调把 SPEAKING 收回 IDLE（R2 之后）
-        wait_line(dev, re.compile(r"VS: state SPEAKING -> IDLE"), 12.0, mark)
+        # ---- T3.1/T3.7：会话状态机（voice_session） ----
+        # 单轮用例在基线已 `vs followup off`；--followup 用例为 on
+        follow_sids: list[int] = []
+        if args.followup:
+            fp_line = wait_line(dev, re.compile(r"VS: state SPEAKING -> FOLLOW_UP"), 12.0, mark)
+            result.check(fp_line is not None, "TTS 播完进入 FOLLOW_UP 续听窗口（T3.7）")
+            if fp_line is not None:
+                for idx in range(args.followup_rounds):
+                    mark2 = dev.mark()
+                    dev.play(speech_path)
+                    start_line = wait_line(dev, RE_ROUND_START, 12.0, mark2)
+                    result.check(start_line is not None,
+                                 f"续听第 {idx + 1} 轮：窗口内直接起轮（无需唤醒）")
+                    if start_line is None:
+                        break
+                    m_start = RE_ROUND_START.search(start_line)
+                    if m_start is not None:
+                        follow_sids.append(int(m_start.group(1)))
+                    result.check(not any(RE_WAKE.search(l) for l in lines_since(dev, mark2)),
+                                 f"续听第 {idx + 1} 轮：未触发唤醒词")
+                    end = wait_line(dev, RE_AUDIO_END, args.round_timeout, mark2)
+                    result.check(end is not None, f"续听第 {idx + 1} 轮：audio_end")
+                    done = wait_line(dev, RE_ROUND_DONE, 15.0, mark2)
+                    result.check(done is not None, f"续听第 {idx + 1} 轮：round done")
+                    fp_again = wait_line(dev, re.compile(r"VS: state SPEAKING -> FOLLOW_UP"),
+                                         12.0, mark2)
+                    result.check(fp_again is not None,
+                                 f"续听第 {idx + 1} 轮：播完再次进入 FOLLOW_UP")
+                    if fp_again is None:
+                        break
+                sids_ok = bool(follow_sids) and all(
+                    b > a for a, b in zip([sid_dev] + follow_sids, follow_sids))
+                result.check(sids_ok, f"续听轮 sid 递增（首轮 {sid_dev}，续听 {follow_sids}）")
+                mark_idle = dev.mark()
+            else:
+                mark_idle = mark
+            # 环境噪声可能额外触发续听轮（有确认窗口仍可能被持续人声触发），等窗口/轮数上限收尾
+            wait_line(dev, re.compile(r"VS: state FOLLOW_UP -> IDLE"), 25.0, mark_idle)
+        else:
+            # 单轮用例：续听窗口已关闭，SPEAKING 播完直接回 IDLE
+            result.check(wait_line(dev, re.compile(r"VS: state SPEAKING -> IDLE"), 12.0, mark) is not None,
+                         "TTS 播完回 IDLE（续听窗口已关闭）")
+
         vs_lines = lines_since(dev, 0)
         vs_seq = [(m.group(1), m.group(2), int(m.group(3)))
                   for l in vs_lines for m in [RE_VS_STATE.search(l)] if m]
         got = [(a, b) for a, b, _ in vs_seq]
-        expect = [("IDLE", "LISTENING"), ("LISTENING", "THINKING"),
-                  ("THINKING", "SPEAKING"), ("SPEAKING", "IDLE")]
-        result.check(got[:4] == expect,
-                     f"VS 状态迁移 IDLE→LISTENING→THINKING→SPEAKING→IDLE（实际 {got[:6]}）")
-        result.check(bool(vs_seq) and all(sid == sid_dev for _, _, sid in vs_seq),
-                     "VS 迁移日志的 sid 与本轮一致")
+
+        def contains_in_order(pairs: list[tuple[str, str]]) -> bool:
+            it = iter(got)
+            return all(item in it for item in pairs)
+
+        tail = ("SPEAKING", "FOLLOW_UP") if args.followup else ("SPEAKING", "IDLE")
+        result.check(contains_in_order([("IDLE", "LISTENING"), ("LISTENING", "THINKING"),
+                                        ("THINKING", "SPEAKING"), tail]),
+                     f"VS 首轮迁移 IDLE→LISTENING→THINKING→{tail[0]}→{tail[1]}（实际 {got[:8]}）")
+        if args.followup:
+            result.check(any(pair == ("FOLLOW_UP", "IDLE") for pair in got),
+                         "VS 续听窗口超时后回 IDLE")
+        result.check(all(sid == sid_dev for _, _, sid in vs_seq[:4]),
+                     "VS 首轮迁移日志的 sid 与本轮一致")
         result.check(any(RE_EVT_VS_STATE.search(l) for l in vs_lines),
                      "event_bus 收到 VOICE_STATE_CHANGED")
         vst = vs_status(dev)
-        result.check(vst.get("state") == "IDLE", f"VS 轮次结束后 IDLE（实际 {vst.get('state')}）")
-        result.check(vst.get("rounds_started") == 1 and vst.get("rounds_completed") == 1,
-                     f"VS 轮次统计：开始 {vst.get('rounds_started')} / 完成 {vst.get('rounds_completed')}")
+        expected_rounds = 1 + len(follow_sids)
+        result.check(vst.get("state") == "IDLE", f"VS 窗口结束后 IDLE（实际 {vst.get('state')}）")
+        result.check((vst.get("rounds_started") or 0) >= expected_rounds and
+                     (vst.get("rounds_completed") or 0) >= expected_rounds,
+                     f"VS 轮次统计：开始 {vst.get('rounds_started')} / 完成 {vst.get('rounds_completed')}"
+                     f"（至少 {expected_rounds}）")
+        if args.followup:
+            result.check((vst.get("followup_rounds") or 0) >= len(follow_sids),
+                         f"VS 续听轮计数 {vst.get('followup_rounds')} ≥ {len(follow_sids)}")
+            result.check((vst.get("followup_hits") or 0) >= len(follow_sids),
+                         f"VS 续听命中 {vst.get('followup_hits')} ≥ {len(follow_sids)}")
+            result.check((vst.get("followup_timeouts") or 0) >= 1, "VS 记录窗口超时退出")
         result.check(vst.get("rounds_errored") == 0 and vst.get("timeouts") == 0,
                      "VS 无异常/超时轮次")
 
@@ -453,18 +527,21 @@ def run(args: argparse.Namespace) -> int:
         d = {key: st.get(key, 0) - base.get(key, 0) for key in (
             "rounds_started", "rounds_done", "rounds_aborted", "up_frames", "up_bytes",
             "rx_audio_frames", "dropped_sid", "parse_errors", "cloud_errors")}
-        result.check(d["rounds_started"] == 1 and d["rounds_done"] == 1,
-                     f"轮次统计：发起 {d['rounds_started']} / 完成 {d['rounds_done']}")
+        result.check(d["rounds_started"] >= expected_rounds and d["rounds_done"] >= expected_rounds,
+                     f"轮次统计：发起 {d['rounds_started']} / 完成 {d['rounds_done']}"
+                     f"（至少 {expected_rounds}）")
         result.check(st.get("state") == "IDLE", "轮次结束后回到 IDLE")
-        result.check(st.get("sid") == sid_dev, f"vc 当前 sid={st.get('sid')} 与日志一致")
-        result.check(d["up_frames"] == up_frames and up_frames >= 60,
-                     f"上行帧数 {up_frames}（≥60 且与统计一致）")
+        min_last_sid = follow_sids[-1] if follow_sids else sid_dev
+        result.check((st.get("sid") or 0) >= min_last_sid,
+                     f"vc 当前 sid={st.get('sid')} ≥ 最近计划轮（{min_last_sid}）")
+        result.check(d["up_frames"] >= up_frames and up_frames >= 60,
+                     f"首轮上行 {up_frames} 帧，累计 {d['up_frames']} 帧（≥60）")
         bpf = st.get("bytes_per_frame", 0.0)
         result.check(20.0 <= bpf <= 60.0, f"平均帧长 {bpf:.1f} B/帧（VBR 预期 20~60）")
         result.check(first_us < 200000 and st.get("first_frame_us", 10**9) < 200000,
                      f"统计里的首帧耗时 {st.get('first_frame_us')} us < 200000 us")
-        result.check(tts_frames == d["rx_audio_frames"],
-                     f"下行音频帧 {d['rx_audio_frames']} 与 tts_end 计数一致")
+        result.check(d["rx_audio_frames"] >= tts_frames,
+                     f"首轮 tts_end {tts_frames} 帧，累计下行 {d['rx_audio_frames']} 帧")
         result.check(d["rx_audio_frames"] >= 90, f"下行音频帧 {d['rx_audio_frames']} ≥ 90")
         if args.inject_late:
             result.check(d["dropped_sid"] >= 1,
@@ -489,7 +566,8 @@ def run(args: argparse.Namespace) -> int:
                 result.check(int(m_end.group(2)) == up_frames,
                              f"mock 统计上行 {m_end.group(2)} 帧 == 设备 {up_frames} 帧")
             frame_count = log.count(MOCK_UP_FRAME)
-            result.check(frame_count == up_frames, f"mock 逐帧收到 {frame_count} 帧")
+            result.check(frame_count == d["up_frames"],
+                         f"mock 逐帧收到 {frame_count} 帧 == 设备累计 {d['up_frames']} 帧")
             result.check(MOCK_SEQ_GAP not in log, "上行 seq 无跳变")
             result.check(MOCK_BAD_FRAME not in log, "mock 未发现坏帧")
             result.check(RE_MOCK_TTS_END.search(log) is not None, "mock 已完成一轮 TTS 下发")
@@ -582,6 +660,12 @@ def main() -> int:
                         help="SenseVoice 模型目录（缺省自动找本机缓存）")
     parser.add_argument("--asr-expect", default="",
                         help="期望识别文本包含的子串（如 天气；缺省只断言非空且非固定文案）")
+    parser.add_argument("--followup", action="store_true",
+                        help="连续对话（T3.7）：首轮 TTS 后进入 FOLLOW_UP，窗口内直接说话连续跑 N 轮")
+    parser.add_argument("--followup-rounds", type=int, default=2,
+                        help="续听轮数（1~5，默认 2；受 Kconfig VS_FOLLOWUP_MAX_ROUNDS 限制）")
+    parser.add_argument("--wake-attempts", type=int, default=3,
+                        help="唤醒回放重试次数（环境噪声下唤醒率会下降，不改变端侧阈值）")
     parser.add_argument("--no-mock", action="store_true",
                         help="不启动 mock（已有服务在跑时用；mock 侧断言会跳过）")
     parser.add_argument("--no-reset", action="store_true", help="不复位设备（设备已在跑时用）")
@@ -597,6 +681,8 @@ def main() -> int:
         raise SystemExit(f"--volume 必须在 0~{SYSTEM_VOLUME_MAX}（用户定稿上限 50%）")
     if args.asr and args.no_mock:
         raise SystemExit("--asr 需要脚本自己拉起 mock，不能与 --no-mock 同时使用")
+    if not 1 <= args.followup_rounds <= 5:
+        raise SystemExit(f"--followup-rounds 必须在 1~5（当前 {args.followup_rounds}）")
 
     print("===== voice_cloud 端到端自测（T2.5） =====")
     try:

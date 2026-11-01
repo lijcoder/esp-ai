@@ -127,11 +127,19 @@ uv run tools/voice_cloud_test.py --inject-late          # 让 mock 注入 sid+1 
 uv run tools/voice_cloud_test.py --volume 31 --log /tmp/vc.log
 uv run tools/voice_cloud_test.py --no-mock              # 已有 mock 在跑（跳过 mock 侧断言）
 uv run tools/voice_cloud_test.py --asr --asr-expect 天气  # mock 用本地 SenseVoice 真 ASR，断言识别文本
+uv run tools/voice_cloud_test.py --followup --followup-rounds 2  # T3.7：免唤醒连续对话 2 轮
+uv run tools/voice_cloud_test.py --wake-attempts 3     # 唤醒失败时重试（环境噪声口径）
 uv run tools/voice_cloud_test.py --dry-run              # 只检查素材/音量/串口
 ```
 
 **断言**：设备启动 + `hello_ack`；唤醒链路（`wake detected`→`feed paused`→`PLAYER: play`→`prompt done`，T3.1 起未知前缀由 `(?:APP|VS)` 兼容）；`round start` / 上行首帧 <200ms / `audio_end` 原因 `vad-silence` / `tts_start`(mp3/24000) / `tts_end` / `round done`；event_bus 收到 `ASR_FINAL`/`TTS_START`/`TTS_END`；上行帧数 ≥60、平均帧长 20~60B、首帧耗时、下行 100 帧与 `tts_end` 计数一致、`sid` 丢弃/解析失败/云端 error 为 0；mock 侧 sid 一致、逐帧收到、`seq` 无跳变、无坏帧；`vc stop` 收尾原因 `stop-request`、`vc cancel` 立即放弃；**T3.1 会话状态机**：`VS` 迁移序列必须为 `IDLE→LISTENING→THINKING→SPEAKING→IDLE`、迁移日志 `sid` 与本轮一致、event_bus 收到 `VOICE_STATE_CHANGED`、`vs status` 轮次开始/完成各 1 且无异常/超时；内部堆最低水位 ≥30KB、`vc` 任务栈剩余 ≥1KB、无 ERROR。**T3.1 真机实测 50/50 PASS**（含 `--inject-late` 50/50；T2.5 时为 43/43）。
 加 `--asr` 时额外断言：设备 `VC: ASR final` 的文本非空、与 mock 侧 SenseVoice 识别结果一致、不是 `--tts-text` 固定文案；`--asr-expect <子串>` 再校验内容（mock 子进程由脚本用 `uv --with` 拉起，本脚本自身不需要额外依赖）。
+
+**连续对话（T3.7）**：默认单轮用例在基线发 `vs followup off` 保持 T3.1 语义；`--followup` 会先 `vs followup on`，
+首轮 TTS 播完后进入 `FOLLOW_UP`，脚本在 5s 窗口内反复 `afplay` 语音文件（不唤醒）连续起 N 轮（默认 2），
+断言：窗口内直接起轮、日志无唤醒词、`sid` 递增、每轮 `round done` 后重新进入 `FOLLOW_UP`、窗口静音超时回 `IDLE`、
+`vs status` 续听统计 ≥ 预期。环境人声可能额外触发续听轮（人声确认 250ms + 5 轮上限兜底），断言按 ≥ 处理；
+真机跑过 **66/66 PASS**（2 轮），单轮 **51/51 PASS**。
 
 ## afe_uplink_test.py —— 上行 PCM 接口真机自测（T2.1）
 
@@ -713,6 +721,8 @@ uv run tools/e2e_voice_test.py --no-reset --log /tmp/e2e.log
 
 - **10/10 轮 PASS、677 项断言全过**（失败项 0）；唤醒 10/10、内部堆 43,051~43,103 B（波动 52 B、
   非单调）、PSRAM 首末差 0、任务数恒 17（**未新增任务**）、欠载 0、无 ERROR/panic。
+- **T3.7 起**：e2e 每轮 `reset_stats` 会先 `vs followup off`，保持"每轮唤醒 + 应答提示音"的原验收语义；
+  连续对话由 `voice_cloud_test --followup` 专测（见上）。
 - 逐轮：上行 191~277 帧、首帧 22,970~30,693 us、`first_sound_us` **7,986/16,918/29,864**
   （min/中位/max，全部 <150000）、`underrun=0`、`decoded=fed=202`、`dur=4849~4853 ms`。
 - 拾音判据 3/10 轮 inconclusive（环境 baseline 1055/1298/3516 ≥ 800，播放峰 2195~4559），

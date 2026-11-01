@@ -167,8 +167,9 @@ MOCK_SEQ_GAP = "seq 跳变"
 MOCK_BAD_FRAME = "坏帧"
 
 # console 命令结束标记（esp_console 无统一结束符，用命令最后一行输出当哨兵）
-END_VC_STATUS = re.compile(r"说明: 唤醒后由 APP 自动起一轮")
+END_VC_STATUS = re.compile(r"说明: 唤醒后由 voice_session 自动起一轮")
 END_VC_RESET = re.compile(r"vc 统计已清零")
+END_VS_FOLLOWUP = re.compile(r"连续对话续听窗口：(开|关)")
 END_VC_CANCEL = re.compile(r"已请求立即放弃")
 END_SYS_HEAP = re.compile(r"PSRAM.*(最低水位|未初始化)")
 END_SYS_TASKS = re.compile(r"共 \d+ 个任务")
@@ -604,6 +605,8 @@ def wait_stream_idle(dev: Device, timeout: float = 8.0) -> dict | None:
 def reset_stats(dev: Device) -> None:
     dev.console("vc reset", END_VC_RESET, timeout=2.0)
     dev.console("player reset", END_PLAYER_RESET, timeout=2.0)
+    # T3.7 默认开启连续对话；e2e 按"每轮唤醒+提示音"验收，先关闭续听窗口
+    dev.console("vs followup off", END_VS_FOLLOWUP, timeout=2.0)
 
 
 def wait_idle(dev: Device, timeout: float = 8.0) -> bool:

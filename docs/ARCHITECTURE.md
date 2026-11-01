@@ -118,6 +118,8 @@ TTS(MP3 流/整段) ─┐
 > - **R5**：`audio_fe_feed_discard_ms()` 在恢复后把最早 50ms 的麦克风数据喂零并计数（`mic stat` 的 `discard_samples=800`）；只在打断/断链恢复路径使用，正常 TTS 收尾由 R2 的 300ms 覆盖、**不叠加** R5。
 > - **R3**：**T3.3 起 duck 是 `CH_MUSIC` 的通道增益**（`-12dB`，q16=16384，**100ms 线性斜坡**；目标变化时按 100ms 重算步进、块内逐样本推进），不再压整个输出；`player duck on|off` 为探针。真实音乐源在 P4；混音链路本身已支持"音乐 ring 持续供数 + 提示音/TTS 叠加 + 自动 duck"，完整音乐流程（含会话结束恢复音乐）归 T4.4；T3.2 的唤醒路径（音乐播放中唤醒不丢弃 → 淡出抢占）暂时保留，T4.4 接音乐源后再切叠加路径。真机探针：T3.2 的 `out_peak` 15563→3890（0.250）；T3.3 用 `player mix` 三通道复验 1760Hz 峰 8000→2000、440Hz 峰 8000→4000。
 
+> **T3.7 连续对话**：`FOLLOW_UP` 窗口建立在 TTS 的 R2（feed 已恢复）之后；窗口内起轮不再 hold PROMPT（不播提示音），直接进入上行；窗口内按键/断网按 R4/R5 退出。窗口的"人声确认"只依赖 VAD 事件，不改变 R1–R5 语义。
+
 ### 3.4 提示音
 
 - 存放在 `assets` 分区（PCM16 / 16k 单声道），启动时加载索引；
@@ -203,7 +205,7 @@ TTS(MP3 流/整段) ─┐
 | `music_cloud` | L3 能力 | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
 | `dev_ctrl` | L3 能力 | 按键事件（短按/长按）、LED 状态模式、静音切换 | `dev_init()`, `dev_register_cb()` |
 | `diag` | L3 能力 | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
-| `voice_session` | L4 业务编排 | 会话状态机（IDLE/LISTENING/THINKING/SPEAKING/ERROR）、每轮 `sid` 分配、超时/错误策略（THINKING 超时与云端 error → ERROR，同轮不重试）、唤醒编排（T1.2b：订阅 event_bus，播应答提示音并做 R1/R2）、**T3.2：R4 完整打断（淡出→interrupt 报文→R5 丢弃→IDLE）、R3 音乐中唤醒放行、按键事件消费（短按打断/IDLE 起轮）**；**不建任务**（事件驱动，见 §9.3） | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_is_busy()`, `vs_get_state()`, `vs_state_name()`, `vs_reason_name()`, `vs_current_sid()`, `vs_stats_read()`, `vs_stats_reset()` |
+| `voice_session` | L4 业务编排 | 会话状态机（IDLE/LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR）、每轮 `sid` 分配、超时/错误策略（THINKING 超时与云端 error → ERROR，同轮不重试）、唤醒编排（T1.2b：订阅 event_bus，播应答提示音并做 R1/R2）、**T3.2：R4 完整打断（淡出→interrupt 报文→R5 丢弃→IDLE）、R3 音乐中唤醒放行、按键事件消费（短按打断/IDLE 起轮）**、**T3.7：连续对话 FOLLOW_UP 续听窗口（窗口内免唤醒起轮、人声确认、轮数上限、窗口内唤醒重开、运行期开关）**；**不建任务**（事件驱动，见 §9.3） | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_is_busy()`, `vs_get_state()`, `vs_state_name()`, `vs_reason_name()`, `vs_current_sid()`, `vs_set_followup_enabled()`, `vs_followup_enabled()`, `vs_stats_read()`, `vs_stats_reset()` |
 | `music_session` | L4 业务编排 | 音乐播放控制：播放/暂停/继续/停止/切歌；与语音抢占 | `ms_init()`, `ms_play()`, `ms_pause()`, `ms_resume()`, `ms_stop()` |
 | `assets`（临时） | 资源（不分层） | 内置提示音 PCM 资源；P3（T3.5）迁到 `assets` 分区后删除该组件 | `prompt_wo_zai_ne_pcm[]` |
 
@@ -235,7 +237,7 @@ typedef enum {
 | `APP_EVT_ASR_PARTIAL` / `APP_EVT_ASR_FINAL` | `app_evt_asr_t { uint16_t sid; uint16_t len; char text[28]; }`（T2.5 定稿；`len` 为实际拷贝字节数，UTF-8 中文约 9 字，超出截断） |
 | `APP_EVT_TTS_START` | `app_evt_tts_start_t { uint16_t sid; uint8_t codec; uint8_t reserved; uint32_t sr; }`（`codec=1` 为 MP3） |
 | `APP_EVT_TTS_END` | `app_evt_tts_end_t { uint16_t sid; uint16_t frames; }`（`frames` = 本轮收到的下行音频帧数） |
-| `APP_EVT_VOICE_STATE_CHANGED` | `app_evt_voice_state_t { uint16_t sid; uint8_t from, to; uint8_t reason; uint8_t reserved[3]; uint32_t dur_ms; }`（T3.1 定稿；`from`/`to` 为 §7 状态枚举数值、`reason` 为迁移原因码、`dur_ms` 为迁移前状态停留时长；由 `voice_session` 在每次迁移后投递） |
+| `APP_EVT_VOICE_STATE_CHANGED` | `app_evt_voice_state_t { uint16_t sid; uint8_t from, to; uint8_t reason; uint8_t reserved[3]; uint32_t dur_ms; }`（T3.1 定稿；`from`/`to` 为 §7 状态枚举数值（**T3.7 追加 `FOLLOW_UP=5`，只追加不改序**）、`reason` 为迁移原因码、`dur_ms` 为迁移前状态停留时长；由 `voice_session` 在每次迁移后投递） |
 | `APP_EVT_BUTTON` | `app_evt_button_t { uint8_t action; uint8_t reserved[3]; }`（T3.2 定稿；`action`：1=`SHORT` 短按、2=`LONG` 长按，非法值按短按处理。T3.4 的 `dev_ctrl` 只负责 GPIO 扫描/去抖并投递；`voice_session` 消费：会话中短按 = R4 打断、IDLE 短按 = 起一轮，长按归 T3.4 静音） |
 
 **投递与线程约束**：
@@ -390,7 +392,8 @@ esp-ai/
 | `IDLE` | 只听唤醒，音乐可播放 | 上电 / 会话结束 | 唤醒 → `LISTENING`；按键 → `LISTENING` |
 | `LISTENING` | 上行音频，VAD 判停 | 唤醒/按键 | 静音 800ms 或 8s 超时 → `THINKING` |
 | `THINKING` | 等 ASR/TTS，播放提示音可配置 | `LISTENING` 结束 | `tts_start` → `SPEAKING`；10s 超时 → `ERROR` |
-| `SPEAKING` | 播放 TTS，关闭麦克风输入（R1） | `tts_start` | `tts_end` → 延时 300ms 恢复 feed → `IDLE`；按键 → `IDLE` |
+| `SPEAKING` | 播放 TTS，关闭麦克风输入（R1） | `tts_start` | `tts_end` → 延时 300ms 恢复 feed → `FOLLOW_UP`（连续对话开启，T3.7）或 `IDLE`（关闭）；按键 → `IDLE` |
+| `FOLLOW_UP` | 续听窗口：麦克风保持开启，等用户直接说话（不播提示音）；VAD 人声经 250ms 确认 → `LISTENING`（新 sid，免唤醒）；窗口内唤醒词 → 重开一轮（播提示音、轮数清零） | TTS 排空后（连续对话开启） | 窗口静音超时 / 续听轮数上限 / 按键 / 断网 → `IDLE` |
 | `ERROR` | 播放错误提示音，上报日志 | 超时/云端 error | 提示音结束 → `IDLE`（同轮不重试） |
 
 规则：
@@ -399,6 +402,7 @@ esp-ai/
 3. 所有迁移打 INFO 日志（`voice` tag），包含 `sid` 与停留时长；
 4. `ERROR` 状态不自动重试，由用户再次唤醒触发新一轮；
 5. **按键（T3.2）**：任意活跃状态短按 = R4 打断 → `IDLE`；`IDLE` 短按 = `vs_start()` 直接进 `LISTENING`（不播应答提示音）。
+6. **连续对话（T3.7）**：`FOLLOW_UP` 续听窗口默认 5s、最多 5 轮续听、人声确认 250ms；窗口内直接说话免唤醒且不播提示音；窗口内唤醒词 = 重开一轮；静音超时/轮数上限/按键/断网退出；Kconfig `VS_FOLLOWUP_*` + 运行期 `vs followup on|off`。
 
 > **T3.1 实现状态（2026-11-01）**：
 > - 状态机在 `components/voice_session`（L4）。迁移统一经 `vs_transition()`/`vs_begin_session()` 的 CAS（期望状态 → 目标状态），并发来源（`evt` 任务、`ws_client`、`player` 完成回调、console/timer）不会打乱状态；
@@ -408,6 +412,16 @@ esp-ai/
 > - `SPEAKING → IDLE` 在 `player` 完成回调（`STREAM_DONE`）或"本轮无可播音频"的 `VC_EVT_ROUND_END(DONE)` 时发生，保证 TTS 排空后再收状态；
 > - `ERROR` 目前不播错误提示音（资源归 T3.6），由 `CONFIG_VS_ERROR_HOLD_MS` 控制停留（默认 0 = 立即回 IDLE，迁移日志仍完整）；同轮不重试；
 > - 断链（`NET_DOWN` / `VC_ROUND_ABORT_LINK`）→ 取消本轮 → `IDLE`；按键打断骨架 `vs_interrupt()`（完整 R4 淡出与按键来源归 T3.2/T3.4）。
+
+> **T3.7 实现状态（2026-11-01）**：
+> - 新增状态 `FOLLOW_UP`（枚举值 5，追加在末尾不改既有值）；`vc_round_end(DONE)`/`STREAM_DONE(ok=true)` → `SPEAKING → FOLLOW_UP`，ok=false（打断/失败）仍直接回 `IDLE`；
+> - 窗口计时用**一个一次性 `esp_timer`**（`vs_fup`，不建任务；内存实测见 §9.2）；进入窗口时记录 deadline 供 `vs status` 显示剩余；
+> - 窗口内 VAD 人声先经 `CONFIG_VS_FOLLOWUP_CONFIRM_MS`（默认 250ms）确认，持续人声才 `FOLLOW_UP → LISTENING` 并 `vc_start(新 sid)`（不播提示音、不再唤醒）；确认期内 VAD 人声结束则取消确认并恢复剩余窗口；
+> - 轮数上限 `CONFIG_VS_FOLLOWUP_MAX_ROUNDS`（默认 5，仅计续听轮）；达到上限 → `IDLE`（原因 `followup-max`）；每次重新唤醒/按键起轮清零；
+> - 窗口中再次收到唤醒词 → 重开一轮（`FOLLOW_UP → LISTENING`，播应答提示音、计数清零；原因 `followup-wake`）；
+> - 运行期开关 `vs followup on|off`（`vs_set_followup_enabled`，不持久化，重启恢复 Kconfig 默认；关闭时若正在窗口内立即退出）；
+> - 统计：`vs status` 的「续听」行（续听轮/命中/超时退出/上限退出、窗口剩余）；
+> - **已知限制**：环境人声持续时仍可能误触发续听轮（确认窗口只过滤短噪声，轮数上限兜底），嘈杂环境建议 `vs followup off` 或调小窗口/轮数；窗口内说唤醒词可能先被 VAD 当作续听语音（不播提示音），属预期竞争。
 
 ---
 
@@ -419,6 +433,15 @@ esp-ai/
 IDLE ──唤醒──> LISTENING ──VAD静音──> THINKING ──tts_start──> SPEAKING ──tts_end──> IDLE
    │                │                      │                      │
  wake 事件      上行Opus→WS            ASR/LLM事件             TTS MP3帧→解码→48k→喇叭
+```
+
+连续对话（T3.7，默认开启，`CONFIG_VS_FOLLOWUP_ENABLE=y`）：
+
+```
+SPEAKING ──TTS 排空 + R2 恢复收音──> FOLLOW_UP ──VAD 人声≥250ms──> LISTENING（新 sid，不播提示音）──> THINKING → SPEAKING → …
+                                        │
+                                        └── 窗口 5s 无语音 / 达到 5 轮续听 / 按键 / 断网 → IDLE
+                                        └── 窗口内唤醒词 → 重开一轮（播提示音、续听计数清零）
 ```
 
 ### 8.2 按键打断（半双工，T3.2 实现）
@@ -498,6 +521,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 > **T2.4 实测（2026-10-31，见 STATUS §5）**：加入流式播放（ring 64KB + stage 6.9KB + 收尾环 9.6KB + ring 读暂存 2KB 全 PSRAM）后，静态 DIRAM **196,998 B（+216 B，全为状态/计数，无新缓冲）**、`player` 栈仍 6KB（流式播放中余 3,544 B）；**wss 握手期（公网 echo，2 次）内部堆峰值 227,432~227,480 B、最低水位 32,671~32,719 B** → 静态 + 堆峰值 = **424,478 B ≤ 440KB（余 26,082 B）**，wss 最低水位高于 30KB 线 **1.95~2.05KB**；**PSRAM 峰值降到 1,446,724 B**（PCM 上限 1.5MB→512KB，常驻不含开发期上传探针）；无新增任务。**注意**：水位余量已不足 2KB，后续任务不得再增加内部 RAM 静态/堆占用。
 > **T3.3 实测（2026-11-01，见 STATUS §5）**：加入三通道混音（3×8192 帧 ring、TTS 泵中转、探针抓取与混音统计）后，静态 DIRAM **199,046 B（+1,720 B）**、**无新增任务**（混音泵/解码/I2S 仍在 `player` 任务内串行，`player` 栈 6KB 不变）；**wss 握手期（公网 `wss://echo.websocket.org/.ws`，idle）内部堆峰值 224,092 B、最低水位 33,711 B** → 静态 + 堆峰值 = **423,138 B ≤ 440KB（余 26.1KB）**，水位高于 30KB 线 2,991 B；`ws://` + 真实语音轮（voice_cloud_test）峰值 226,296 B、最低水位 **31,571 B**（≥30KB，余 851 B，是当前最紧口径）→ 静态+峰值 **425,342 B**。PSRAM 峰值 **1,596,388 B**（三通道 ring 3×16KB + TTS 中转 960 B + 探针抓取 32KB 首次使用时分配；收尾环 9.6KB 随 T3.3 移除）；任务数 17 不变。**余量提醒**：`ws://` 水位只剩 851 B，下一任务仍不得新增内部 RAM 静态/堆/任务栈；wss 口径 T5.3 24h 压测再复测。
 > **T3.1 实测（2026-11-01，见 STATUS §5）**：加入会话状态机 `voice_session` 后，静态 DIRAM **197,094 B（+96 B，状态/统计变量）**、**无新增任务/任务栈**（状态机事件驱动，见 §9.3）；`ws://` 内部堆峰值 **227,736 B**、最低水位 **31,891~32,971 B**（`tts_stream`/`voice_cloud`/e2e 三脚本口径）→ 静态 + 堆峰值 = **424,830 B ≤ 440KB（余 25,888 B）**，`ws://` 最低水位仍 ≥ 30KB。**wss 握手期未复测**：本次没有新增任务/缓冲，wss 路径代码未变，按 T2.4 的 32,671~32,719 B 减去 ~100B 估算仍在 30KB 以上，T5.3 24h 压测时复测入基线。
+> **T3.7 实测（2026-11-01，见 STATUS §5）**：加入连续对话（FOLLOW_UP 状态 + 一个一次性 `esp_timer` `vs_fup` + 确认/统计字段）后，静态 DIRAM **199,094 B（+48 B vs T3.3，无新任务）**；`ws://` + 真实语音轮（`voice_cloud_test`）内部堆最低水位 **32,983 B（≥30KB）**、峰值占用约 226.5KB → 静态+峰值约 **425.6KB ≤440KB**；新增 esp_timer 约百余字节内部堆（含在峰值内）。**wss 握手期未复测**（T3.3 idle 33,711 B；本次 +~100B 预计仍 ≥33.5KB），T5.3 复测入基线。
 
 ### 9.3 任务与核心（确定）
 
@@ -549,7 +573,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `ws status` / `ws reconnect` | WebSocket 观测：状态/脱敏端点/握手与重连计数/心跳 RTT/收发送与丢弃计数/队列水位；主动重连（T1.4 提前交付） |
 | `ws send <json>` / `ws sendbin [len]` / `ws rxlog on\|off` | WebSocket 双向联调探针（T1.6）：原样发送文本/上行二进制帧、打印下行帧（T2.5 起 rxlog 走附加订阅，与 voice_cloud 并存） |
 | `vc status` / `vc start [sid]` / `vc stop` / `vc cancel` / `vc stat` / `vc reset` | 语音云观测与手动起轮（T2.5/T2.4）：链路状态/sid、轮次与上行帧统计、首帧耗时、下行事件与 `sid` 丢弃计数、**下行音频丢弃帧/字节（窗口外/收尾后/播放器不可用）**；手动起一轮、优雅收尾（补尾帧 + audio_end）、立即放弃（同时打断在播 TTS） |
-| `vs status` / `vs start` / `vs interrupt` / `vs reset` | 会话状态机观测（T3.1）：当前状态/sid 与 VC 状态、轮次（开始/完成/异常/中止）、打断/唤醒丢弃/超时/云端 error 计数、迁移次数与上次状态停留；`vs start` 手动开始一轮（不播应答提示音）、`vs interrupt` 打断当前会话（`vc cancel` + 回 IDLE） |
+| `vs status` / `vs start` / `vs interrupt` / `vs reset` / `vs followup on\|off` | 会话状态机观测（T3.1/T3.7）：当前状态/sid 与 VC 状态、轮次（开始/完成/异常/中止）、打断/唤醒丢弃/超时/云端 error 计数、迁移次数与上次状态停留、**续听（续听轮/命中/超时退出/上限退出、窗口剩余）**；`vs start` 手动开始一轮（不播应答提示音）、`vs interrupt` 打断当前会话（`vc cancel` + 回 IDLE）、`vs followup on\|off` 运行期开关续听窗口（不持久化） |
 | `player stat` / `player reset` / `player mp3` / `player pcm <off> <n>` / `player load begin\|chunk\|<base64>\|end` / `player stream [chunk] [gap_ms]` / `player stream abort` / **`player mix stat\|reset\|vol\|tone\|stop\|cap\|dump`** | 播放探针（T2.3/T2.4/T3.3，`CONFIG_DIAG_ENABLE_PLAYER_TEST` 仅开发期）：base64 分块上传素材到 PSRAM；`player mp3` 整段解码播放；`player stream` 把上传素材按 chunk 喂流式路径（`gap_ms` 制造欠载）、`player stream abort` 打断；`player stat` 追加流式统计行（含 `first_sound_us`/`underrun`/`dur_ms`）；`player pcm` 取回整段解码 PCM 对拍；**`player mix` 是三通道混音探针：`tone <CH> <freq> <ms> [amp]` 往通道塞正弦音调（可叠加）、`stat` 看 `MIXSTAT/MIXCH`（音量/限幅/峰值/通道 gain/水位/抓取状态）、`vol` 运行时改音量、`cap <n>` + `dump <off> <n>` 把混音输出（48k 单声道）抓回 PC 做 FFT/包络断言、`stop` 停探针**（tools/mixer_test.py 的验收通道） |
 | `net ping <host>` | 网络连通性 |
 | `mic stat` | 麦克风 RMS/峰值、VAD 状态 |

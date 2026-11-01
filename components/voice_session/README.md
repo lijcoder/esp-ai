@@ -87,9 +87,9 @@ T3.7 起 TTS 播完默认进入 `FOLLOW_UP` 续听窗口，用户直接说话即
 - **环境限制**：测试时段环境底噪偏高（RMS~1000+、有人声），曾出现环境人声额外触发续听轮
   （人声确认 250ms 只过滤短噪声）；测试脚本对"额外续听轮"做 ≥ 断言并延长窗口等待，不掩盖固件问题；
   安静环境建议复跑取得严格计数。
-- **全量回归（e2e/tts_stream/voice/afe/mp3/opus/mixer）待设备重新连接后补跑**：实现期间设备 USB 两次断开，
-  e2e 跑到一半串口消失（`Device not configured`），不是固件失败；`e2e_voice_test` 已改为每轮先 `vs followup off`
-  保持原"每轮唤醒+提示音"验收语义。
+- **全量回归（设备重连后）全绿**：`e2e_voice_test` **9/10 轮 610 项 PASS**（1 轮环境失败，成功轮全绿）、
+  `tts_stream_test` 193、`voice_test` 16、`afe_uplink_test` 15、`mp3_test` 48、`opus_enc_test` 45、
+  `mixer_test` 113、mock 13；`e2e_voice_test` 每轮先 `vs followup off`，保持原"每轮唤醒+提示音"验收语义。
 - 资源：静态 DIRAM **199,094 B（+48 B vs T3.3）**、无新任务；`ws://` 真实语音轮内部堆峰值 **224,812 B**、
   最低水位 **32,983~33,131 B**（≥30KB）；新增一个一次性 esp_timer（~百余 B）。
 

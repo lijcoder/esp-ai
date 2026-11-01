@@ -512,6 +512,122 @@ preroll=3 时 dur=5342ms，均落在物理范围内（通用 ±10% 上限 5332ms
   `--dry-run` 额外生成素材 + PyAV 参考并跑同一套自检。真机跑 `--interrupt/--r5/--r3-duck` 前务必
   先跑这两个，避免把脚本自身问题误判成固件问题。
 
+## mixer_test.py —— 三通道混音真机验收（T3.3-B）
+
+**作用**：验证 T3.3 的「三通道混音（CH_TTS/CH_PROMPT/CH_MUSIC）→ 音量 → -1dBFS 软限幅 →
+I2S」数值正确性，不做"能出声"的定性判断，而是把 48k 单声道混音输出**抓回 PC 做 FFT/包络/阶跃
+断言**：三通道叠加的幅度比与通道 duck、音量线性、软限幅上限与 limiter/clip 计数、10ms 淡入 /
+100ms 淡出 / 通道启停无 pop、10 轮堆/PSRAM 稳定。只消费固件探针输出、不改固件、不联网、不唤醒、
+不外放（不需要 Mac 扬声器），是 `audio_player` 混音改动后的定点回归手段。
+
+```bash
+uv run tools/mixer_test.py                      # 全量真机验收（默认不复位设备，约 60~90s，独占串口）
+uv run tools/mixer_test.py --self-test          # 离线自检解析/FFT/断言逻辑（50 项，不连设备）
+uv run tools/mixer_test.py --dry-run            # 不连设备：打印执行计划 + 跑同一套离线自检
+uv run tools/mixer_test.py --skip-heap          # 跳过 F 健康场景（快速冒烟）
+uv run tools/mixer_test.py --reset              # 先复位设备再等 console 就绪
+uv run tools/mixer_test.py --port /dev/cu.usbmodemXXXX --log /tmp/mixer_test.log
+```
+
+一条命令完成：打开串口 → 等 `player mix stat` 可解析（确认 T3.3 探针已就绪）→ `player mix stop` +
+`player mix reset` 清理 → 依次跑 6 个场景（每场景前 `stop`/`reset`，场景间留 200ms）→ 汇总
+`[PASS]/[FAIL] 场景名 描述` + 最后一行 `MIXER_TEST: PASS|FAIL`，退出码 0/1。
+
+### 设备侧探针契约（固件输出以此为准，脚本只消费、不猜字段）
+
+契约出处：T3.3-A 固件实现——`components/diag/diag.c` 的 `print_mix_stat()` 与 `player mix`
+子命令（stat/reset/vol/tone/stop/cap/dump 的 printf 格式）、`components/audio_player/include/
+audio_player.h` 的 `audio_player_mix_*` 接口注释、`audio_player.c` 的 `mix_render()`（duck/淡入
+淡出/音量/`mix_soft_limit()`）与 `audio_player_mix_capture*`。**格式以固件实测输出为准**，有偏差
+先回报 Lead 再同步本节；脚本开头的 docstring 是逐字契约副本，本表只列用途：
+
+| 探针 | 输出 | 脚本用途 |
+|---|---|---|
+| `player mix stat` | 4 行：`MIXSTAT vol/vol_q8/vol_target/limiter/limiter_peak/clip/mix_peak/block_max_us/**cap_len/cap_pos**` + `MIXCH ch=TTS\|PROMPT\|MUSIC active/gain_q8/level_ms/peak` | A/C/D/E/F 的 clip/limiter/mix_peak/通道 duck 证据；`cap_len`=武装帧数、`cap_pos`=实际抓到帧数（决定 dump 上界）；就绪探测与初始音量 |
+| `player mix reset` | `MIXRESET ok=1` | 每场景前清 limiter/clip/mix_peak/block_max 与通道 peak |
+| `player mix vol <0..100>` | `MIXVOL vol=<n> err=ESP_OK` | A/C/D/E/F 前置 vol=100；B 的 100/50/0 三档；结束恢复初始音量 |
+| `player mix tone <CH> <freq 100~4000> <ms 50~10000> [amp 100~20000]` | `MIXTONE ch/freq/ms/amp/err` | A/C 三通道叠加；B/D 单通道；E 先后叠加 MUSIC→PROMPT |
+| `player mix stop` | `MIXSTOP ok=1` | 每场景前清理；脚本开头/结束清理 |
+| `player mix cap <1..16384>` | `MIXCAP armed=<frames>` | 抓取武装（取满自动停；播放空闲时等下一块；**叠加场景可在泵运行时重新武装**） |
+| `player mix dump <off> <n 1..512>` | `MIXCAP off=<off> count=<n>` + 每行 16 个 `%04x`（**连写、无分隔符**，一行 64 字符）+ `MIXCAPEND`；越界时只有一行 `MIXCAP err=ESP_ERR_INVALID_STATE` | 取回抓取数据（int16 二补码，`fc18`→-1000）；`off+count > cap_pos` 视为抓取不完整/失败，脚本每个场景先 stat 取 `cap_pos` 再只 dump `[0, cap_pos)` |
+
+字段语义：`gain_q8` 256=0dB、128≈-6dB、64≈-12dB；`mix_peak` 是最近 ~320ms 输出峰值；`limiter`
+是最近窗口内软限幅样本数；`clip` 是硬削波次数（必须恒 0）；`block_max_us` 是最近单块混音+限幅
+耗时（10ms 预算）；`cap_len` 是最近一次 `cap` 武装帧数、`cap_pos` 是**实际已抓帧数**（播放提前
+结束时 < cap_len；A/B/C/E 音调 >341ms 应取满，D 的 300ms 音调 cap_pos=14400）。脚本先 stat 取
+`cap_pos`，再按它决定 dump 范围；`MIXSTAT` 缺这两个字段时脚本直接报"需要最新 T3.3-A 固件"。所有命令发送为一行文本 + `\r\n`；设备日志/console 混流，脚本只按上面固定前缀
+匹配、其它行丢弃，命令发出后最多等 2s（dump 因数据回传放宽到 3s）。
+
+### 场景与断言表
+
+| 场景 | 指令 | 断言（阈值） |
+|---|---|---|
+| A 三通道混音 | 先 tone TTS 1000 / PROMPT 440 / MUSIC 1760（各 **2500ms** amp 8000）→ 等 **0.35s**（duck 斜坡走完）→ 再 `cap 16384` → FFT 窗 0..8192 | 三频幅度 ≈8000/4000/2000（**±8%**，即 prompt duck -6dB、music duck -12dB）；比值 1:0.5:0.25（±8%）；`gain_q8` 256/128/64（±8）；三通道 `active=1`；抓取取满 `cap_pos==cap_len`；`mix_peak` 与抓取峰值一致（±2%）；`clip=0`；`block_max_us` 超 10ms 预算只记 **WARN**（性能观测项，偶发抢占不算功能回归） |
+| B 音量线性 | 先 `vol 100/50/0`，再 `cap` → tone MUSIC 1000/1500ms amp 8000 | 稳态幅度 ≈8000/4000/**0**（**±2%**）；vol 0 档**稳态窗**全零且 `mix_peak=0`（20ms 音量斜坡只在混音泵渲染时推进，0 档抓取开头 ~20ms 有上一档残余音量）；各档 `active=1` |
+| C 软限幅 | `cap` → tone TTS 440 / PROMPT 1000 / MUSIC 1760（各 1500ms amp 20000） | 稳态窗逐样本 `|x|≤29196+32`（-1dBFS）；无 `|x|≥32000` 硬削样本；`limiter>0`；`limiter_peak>29196`；`clip=0`；`mix_peak` 与峰值 ±2% |
+| D 淡入淡出 | **先** `cap 16384` → tone TTS 1000/300ms amp 8000 → 只 dump `cap_pos`（≈14400） | 抓取含整段 300ms（14400±480 帧）；起始 10ms 包络从 0 单调升（首帧很小、首 1ms 峰值 ≤稳态 15%）；结束前 100ms 包络单调降、最后 10ms ≤稳态 15%、**末 1ms 包络 <5% 稳态**；全程相邻样本 `|Δ|≤1600` |
+| E 通道启停不 pop | tone MUSIC 1760/1500ms → 300ms 后 `cap` 武装 → 叠加 tone PROMPT 440/800ms | **用 440Hz 能量定位叠加点 onset**，稳态窗从 `onset+10ms(淡入)+100ms(duck 斜坡)` 起（自适应 4096~8192 帧）：440Hz 峰 ≈8000（7000~9000）；1760Hz 峰 ≈2000（1700~2300，PROMPT 活跃令 MUSIC duck -12dB）；RMS≈5831（5200~6500）；onset 处 10ms 窗 440Hz 仍低（证明抓到叠加点）；全程 `|Δ|≤3480`（1760+440 合成斜率上限），无单点跳变；`clip=0` |
+| F 健康 | 10 轮 `stop/reset → cap 2048 → 三通道 150ms 音调 → sys heap` | 内部堆峰谷差 ≤2KB；PSRAM 峰谷差 ≤4KB；每轮 `clip=0`；全程日志无真错误（`E (`/`ERROR`/`panic`/`assert`/`Guru`）；**连接/重连类既有噪声忽略**：TAG ∈ {NET, WS, wifi, websocket_client, esp-tls, transport_base, transport_ws, transport_ssl, transport_tcp, esp_netif, net80211, phy_init, esp_wifi, wpa_supplicant, …}，或行内含 `Failed to open a new connection`/`Error connecting to host`/`esp_transport_connect`/`WS 错误`/`连接断开`/`后重连`（mixer_test 不起 mock，设备反复重连 192.168.1.11:8765 会刷这些 E 行） |
+
+### 与其它脚本的分工（P3 验收各跑各的，阈值互不复用）
+
+- `mixer_test.py`（本脚本）：**T3.3 混音链路的数值正确性**——三通道叠加/duck/音量/软限幅/
+  淡入淡出/堆稳定。不联网、不唤醒，用 `player mix tone` 探针音调 + `cap/dump` 抓取。
+- `tts_stream_test.py`：**T2.4 真实 MP3 流式播放**的音频硬指标（首帧延迟/欠载/abort/打断），
+  用 mock 下发真实 MP3；`--r3-duck` 是旧的 ducking 探针（`player duck`），与 T3.3 三通道混音
+  的 `MIXCH gain_q8` 是两个层面，不要互相替代。
+- `mp3_test.py`：整段 MP3 **解码对拍**（`player pcm` vs PyAV）；`voice_cloud_test.py`：端云协议/
+  事件/sid 过滤。P3 验收时本脚本与它们都要跑，但各自只看自己的契约。
+
+### 参数 / 依赖 / 限制
+
+- 参数：`--port`、`--log`（设备日志文件；末尾会追加 `[ASSERT]` 断言明细，含每条 FAIL 的实测
+  detail，方便真机跑完事后定位）、`--dry-run`、`--self-test`、`--reset`、`--ready-timeout`（默认 15s）、
+  `--heap-rounds`（默认 10）、`--skip-heap`、`--cap-frames`（默认 16384=341ms）、`--steady-start`
+  （稳态窗起点，默认 4800=100ms）、`--fft-n`（默认 8192≈170ms）、`--dump-chunk`（默认 512）。
+- 依赖：PEP 723 内联 `pyserial>=3.5` + `numpy>=1.26`，`uv run` 自动安装；不用 scipy（rFFT + 汉宁窗，
+  幅度 ≈`2·|X[k]|/sum(win)`，取最近 bin±1 后再按汉宁窗 `sinc(δ)/(1-δ²)` 反卷积校正 scalloping loss——
+  1000Hz/1760Hz 在 8192 点时分别偏离 bin 中心 0.33/0.37 bin，直接取峰会低估 7%~9% 而吃掉 ±8% 容差）。
+- 脚本**独占串口**（先关 `idf.py monitor`）；默认**不复位**设备（烧录后设备已在跑），加 `--reset`
+  才会复位。进入时读一次 `player mix stat` 的 `vol`，A/C/D/E/F 前置 `vol 100` 作为幅度基准，
+  结束 `player mix vol <原值>` 恢复（该探针不落盘，重上电回配置值）。
+- **A/E 真机时序校准（2026-11-02 实测回灌）**：`player mix tone` 每条命令约 100ms 往返，
+  PROMPT/MUSIC 分别在 ~100/~200ms 才真正起播；且 duck 斜坡从"通道真正 active"才开始走。
+  因此 A 必须"先起三路 → 等 0.35s（duck 斜坡走完）→ 再 arm cap"（否则抓取窗前段是部分未 duck
+  的混合区，440/1760 幅度偏高——真机首轮就是这么 FAIL 的）；E 的 cap 与 tone 命令之间也有
+  ~50~100ms 往返，抓取窗开头是"MUSIC 全量"段，必须先用 440Hz 能量找到叠加点 onset，再从
+  `onset+110ms` 起取稳态窗（总抓取 16384 帧在 onset≈50~100ms 时仍够 170ms 窗，不够时自适应缩窗）。
+- **E 为什么不是两路都 8000**：PROMPT 活跃时 MUSIC 会 duck 到 -12dB（固件
+  `voice_on = tts_on || prompt_on`），所以稳态是 440Hz≈8000 + 1760Hz≈2000，RMS≈5831。
+- **D 为什么 dump `cap_pos`（14400）而不是 16384**：`audio_player_mix_capture_read()` 按实际抓取数
+  `cap_pos` 校验（`off+count > cap_pos` 回 `MIXCAP err`）；300ms tone 恰好渲染 30 个 10ms 块 =
+  14400 帧后泵退出，故 `cap_len=16384、cap_pos=14400`，只取 `[0, cap_pos)`。A/B/C/E 音调时长
+  >341ms，抓取取满（`cap_pos==cap_len==16384`），脚本会断言"取满"再按固定稳态窗 dump。
+- **D 的淡出尾值**：固件旧实现淡出步进 `65536/4800` 向下取整=13，走到最后还剩 ~4.8%（真机实测
+  末样本 |x|=381），已由 Lead 改为向上取整改烧；脚本阈值按契约"末 1ms 包络 <5% 稳态"断言，
+  固件修复后应≈0（自检里 4.8% 边界正例 / 6% 负例都覆盖）。
+- **B 的 vol 0 为什么查稳态窗**：音量 20ms 斜坡在 `mix_render()` 里按块推进，set vol 时若泵没在跑，
+  目标值要等下一次泵启动才斜坡过去；从 50 切到 0 时抓取开头 ~20ms 仍有残余音量，100ms 后的稳态窗
+  才能严格全零（`mix_peak` 的 320ms 窗口也已越过这段）。
+- 串口读取用 5ms timeout + 按 `in_waiting` 整批取，而不是既有脚本的 `read(8192)`（pyserial 会等满
+  timeout 才返回，50ms 会在每条命令/每个 sleep 上累积 ~100ms 误差，把 E 的叠加点推出抓取窗）。
+- 抓取数据里的 `mix_peak` 与 `cap` 窗不是同一段时间：A/C 在抓取取满后、音调仍播放时读 `stat`
+  （mix_peak 最近 ~320ms 有效），再 dump 稳态窗，两者峰值应一致（±2%）；D（300ms 音调已结束）不比对
+  mix_peak。
+- **F 的日志错误过滤口径**（与 `voice_test.py`/`tts_stream_test.py` 一致并扩展）：按 TAG 白名单忽略
+  网络/WS/连接重连类 E 行（`NET`/`WS`/`wifi`/`websocket_client`/`esp-tls`/`transport_base`/
+  `transport_ws`/`transport_ssl`/`transport_tcp`/`esp_netif`/`net80211`/`phy_init`/`esp_wifi`/
+  `wpa_supplicant` 等），并加一层行内兜底（`Failed to open a new connection` / `Error connecting to
+  host` / `esp_transport_connect` / `WS 错误` / `连接断开` / `后重连`）。**panic / assert failed /
+  Guru / 其它 `ERROR` 不被白名单放行**，仍判 F FAIL——不掩盖真实错误。mixer_test 不启动 mock，
+  设备反复重连 192.168.1.11:8765 时 `transport_base/transport_ws/websocket_client` 的 E 行属噪声。
+- 环境性失败口径：串口超时、回显被日志冲掉、抓取不足等记 `WARN` 并**整场景重试一次**；固件真的
+  不满足阈值时只 `FAIL`，**不改阈值、不用重试掩盖问题**。
+- **离线先自检**：真机前先跑 `--self-test`（46 项，覆盖 MIXSTAT（含 cap_len/cap_pos 与旧固件兼容）/
+  MIXCH/MIXVOL/MIXTONE/MIXCAP/dump 解析（含固件"连写 `%04x`"格式与 `MIXCAP err`）、uint16→int16、
+  FFT 幅度与幅度比、音量线性、E 的 duck 幅度/RMS、淡入/淡出/斜率/软限幅/堆判定，含正负例）和
+  `--dry-run`（打印执行计划 + 同一套自检）。真机基线（每场景实测值）待 Lead 烧录 T3.3 固件后回填本节。
+
 ## e2e_voice_test.py —— 端到端语音真机自测（T2.6，P2 收口）
 
 **作用**：把 T2.5（`voice_cloud` 端云协议）与 T2.4（`audio_player` 流式播放）拼成**真实用户路径**

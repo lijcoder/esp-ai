@@ -591,7 +591,7 @@ audio_player.h` 的 `audio_player_mix_*` 接口注释、`audio_player.c` 的 `mi
 - 脚本**独占串口**（先关 `idf.py monitor`）；默认**不复位**设备（烧录后设备已在跑），加 `--reset`
   才会复位。进入时读一次 `player mix stat` 的 `vol`，A/C/D/E/F 前置 `vol 100` 作为幅度基准，
   结束 `player mix vol <原值>` 恢复（该探针不落盘，重上电回配置值）。
-- **A/E 真机时序校准（2026-11-02 实测回灌）**：`player mix tone` 每条命令约 100ms 往返，
+- **A/E 真机时序校准（2026-11-01 实测回灌）**：`player mix tone` 每条命令约 100ms 往返，
   PROMPT/MUSIC 分别在 ~100/~200ms 才真正起播；且 duck 斜坡从"通道真正 active"才开始走。
   因此 A 必须"先起三路 → 等 0.35s（duck 斜坡走完）→ 再 arm cap"（否则抓取窗前段是部分未 duck
   的混合区，440/1760 幅度偏高——真机首轮就是这么 FAIL 的）；E 的 cap 与 tone 命令之间也有
@@ -623,7 +623,7 @@ audio_player.h` 的 `audio_player_mix_*` 接口注释、`audio_player.c` 的 `mi
   设备反复重连 192.168.1.11:8765 时 `transport_base/transport_ws/websocket_client` 的 E 行属噪声。
 - 环境性失败口径：串口超时、回显被日志冲掉、抓取不足等记 `WARN` 并**整场景重试一次**；固件真的
   不满足阈值时只 `FAIL`，**不改阈值、不用重试掩盖问题**。
-- **离线先自检**：真机前先跑 `--self-test`（46 项，覆盖 MIXSTAT（含 cap_len/cap_pos 与旧固件兼容）/
+- **离线先自检**：真机前先跑 `--self-test`（50 项，覆盖 MIXSTAT（含 cap_len/cap_pos 与旧固件兼容）/
   MIXCH/MIXVOL/MIXTONE/MIXCAP/dump 解析（含固件"连写 `%04x`"格式与 `MIXCAP err`）、uint16→int16、
   FFT 幅度与幅度比、音量线性、E 的 duck 幅度/RMS、淡入/淡出/斜率/软限幅/堆判定，含正负例）和
   `--dry-run`（打印执行计划 + 同一套自检）。真机基线（每场景实测值）待 Lead 烧录 T3.3 固件后回填本节。

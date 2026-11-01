@@ -46,7 +46,21 @@ typedef enum {
     VC_EVT_TTS_START,       /* 云端 TTS 起播（随后是下行 0x02 音频帧） */
     VC_EVT_TTS_END,         /* 本轮 TTS 结束 */
     VC_EVT_CLOUD_ERROR,     /* 云端 error 事件（错误码见 PROTOCOL.md 错误码表） */
+    /* T3.1：供 voice_session 驱动会话状态机 */
+    VC_EVT_UPLINK_END,      /* audio_end 已发出；code = vc_finish_t（0=vad/1=max/2=stop） */
+    VC_EVT_ROUND_END,       /* 本轮结束（正常/超时/断链/取消/起轮失败）；round_end 给原因 */
 } vc_event_t;
+
+/* 一轮结束的原因（VC_EVT_ROUND_END 的 round_end 字段） */
+typedef enum {
+    VC_ROUND_DONE = 0,        /* 正常：收到 tts_end 并结束 */
+    VC_ROUND_ABORT_TIMEOUT,   /* 等云端响应/数据超时 */
+    VC_ROUND_ABORT_LINK,      /* WS 断链 */
+    VC_ROUND_ABORT_CANCEL,    /* vc_cancel()/打断 */
+    VC_ROUND_ABORT_NEW,       /* 被新轮次覆盖 */
+    VC_ROUND_ABORT_ERROR,     /* 云端 error 事件 */
+    VC_ROUND_ABORT_SETUP,     /* 起轮失败（云端未 READY/编码器/上行接口被占用/发送失败） */
+} vc_round_end_t;
 
 typedef struct {
     vc_event_t evt;
@@ -55,7 +69,8 @@ typedef struct {
     uint16_t text_len;       /* text 实际字节数 */
     uint8_t codec;           /* VC_EVT_TTS_START：1=mp3（0=未知） */
     uint32_t sample_rate;    /* VC_EVT_TTS_START：采样率（Hz） */
-    int32_t code;            /* VC_EVT_CLOUD_ERROR：云端错误码 */
+    int32_t code;            /* VC_EVT_CLOUD_ERROR：云端错误码；VC_EVT_UPLINK_END：vc_finish_t */
+    vc_round_end_t round_end; /* VC_EVT_ROUND_END：本轮结束原因 */
 } vc_event_msg_t;
 
 /* 业务回调：在 `ws_client` 任务上下文执行，禁止阻塞/耗时；text 返回后失效 */

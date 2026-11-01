@@ -88,6 +88,20 @@ typedef struct {
     uint16_t frames;
 } app_evt_tts_end_t;
 
+/* ---------------- 会话状态事件 payload（T3.1 定稿，见 ARCHITECTURE §4.2/§7） ---------------- */
+
+/* APP_EVT_VOICE_STATE_CHANGED：会话状态迁移。from/to 是 voice_session 的 vs_state_t 数值
+ * （0=IDLE / 1=LISTENING / 2=THINKING / 3=SPEAKING / 4=ERROR），reason 是 vs_reason_t 数值。
+ * event_bus 是 L1，不能 include L4 的 voice_session.h，所以这里用显式数值 + 注释契约。 */
+typedef struct {
+    uint16_t sid;
+    uint8_t from;
+    uint8_t to;
+    uint8_t reason;
+    uint8_t reserved[3];
+    uint32_t dur_ms; /* 迁移前状态停留时长（ms） */
+} app_evt_voice_state_t;
+
 /*
  * 事件 payload 统一容器：定长 32 字节，跨任务投递时整块拷贝，发布方无需保活。
  * 新增字段时不得让 union 超过 APP_EVT_DATA_MAX；payload 超过 32B 的文本类数据
@@ -99,6 +113,7 @@ typedef union {
     app_evt_asr_t asr;
     app_evt_tts_start_t tts_start;
     app_evt_tts_end_t tts_end;
+    app_evt_voice_state_t voice_state;
     uint8_t raw[APP_EVT_DATA_MAX];
 } app_evt_data_t;
 

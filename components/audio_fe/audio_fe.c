@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wn_models.h"
+#include "event_bus.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "model_path.h"
@@ -393,6 +394,12 @@ static void fetch_task(void *arg)
             portENTER_CRITICAL(&s_stats_mux);
             s_stat_wake_count++;
             portEXIT_CRITICAL(&s_stats_mux);
+            /* T1.2b：业务走事件总线。音频任务只许投无 payload 事件（esp_event 带 payload
+             * 会内部 calloc，违反 CONVENTIONS §3）。s_cb 保留给调试/兼容，产品路径不注册。 */
+            esp_err_t perr = app_evt_post(APP_EVT_WAKE_DETECTED, NULL);
+            if (perr != ESP_OK) {
+                ESP_LOGD(TAG, "投递 WAKE_DETECTED 失败: %s", esp_err_to_name(perr));
+            }
             if (s_cb) {
                 s_cb(AUDIO_FE_EVT_WAKE, s_cb_arg);
             }
@@ -401,6 +408,11 @@ static void fetch_task(void *arg)
         if (res->vad_state != last_vad) {
             last_vad = res->vad_state;
             s_stat_vad_active = (last_vad == VAD_SPEECH);
+            esp_err_t perr = app_evt_post(
+                last_vad == VAD_SPEECH ? APP_EVT_VAD_SPEECH_START : APP_EVT_VAD_SPEECH_END, NULL);
+            if (perr != ESP_OK) {
+                ESP_LOGD(TAG, "投递 VAD 事件失败: %s", esp_err_to_name(perr));
+            }
             if (s_cb) {
                 s_cb(last_vad == VAD_SPEECH ? AUDIO_FE_EVT_VAD_SPEECH_START
                                             : AUDIO_FE_EVT_VAD_SPEECH_END,

@@ -1,0 +1,17 @@
+menu "Voice Session (会话状态机)"
+
+    config VS_ERROR_HOLD_MS
+        int "ERROR 状态停留时长（毫秒）"
+        range 0 5000
+        default 0
+        help
+            ARCHITECTURE §7：ERROR 状态播错误提示音后回 IDLE，同轮不重试。
+
+            T3.1 还没有错误提示音资源（T3.6 交付），默认 0 = 进入 ERROR 后立即回 IDLE，
+            迁移日志（`VS: state THINKING -> ERROR` → `ERROR -> IDLE`）仍可观测。
+            T3.6 接入提示音后把该值设为提示音时长（如 1200），ERROR 状态就会保持到提示音播完。
+
+            本组件不新建任务（见 CONVENTIONS §4 的内部 RAM 水位约束），该值只影响
+            esp_timer 的一次性计时，不占任务栈。
+
+endmenu

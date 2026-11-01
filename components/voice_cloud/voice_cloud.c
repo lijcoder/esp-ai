@@ -61,6 +61,7 @@ static volatile uint16_t s_sid; /* 当前轮次 sid（IDLE 时是最近一轮）
 static volatile bool s_abort;         /* 立即放弃当前轮次（vc_cancel / 新轮次覆盖 / 断链） */
 static volatile bool s_finish_req;    /* 请求优雅收尾（vc_stop） */
 static volatile bool s_tts_end_seen;  /* 本轮已收到 tts_end（ws_client 任务写） */
+static volatile bool s_cloud_error;   /* 本轮收到云端 error（T3.1：ROUND_END 原因用） */
 static volatile bool s_pending_start; /* 有待处理的 vc_start */
 static volatile uint16_t s_pending_sid;
 
@@ -74,6 +75,7 @@ static int64_t s_round_start_us;
 static int64_t s_wait_deadline_us;
 static uint32_t s_round_frames;
 static uint32_t s_round_bytes;
+static uint32_t s_round_audio_frames; /* 本轮成功交给播放器的 0x02 帧数（T3.1 修 T2.6 遗留⑱） */
 
 /* sid 自增（vc_start_auto）：可能被多个调用方并发触发，用临界区保护 */
 static uint16_t s_next_sid;
@@ -479,6 +481,27 @@ static void vc_stop_waiting(void)
     }
 }
 
+/*
+ * T3.1：刷新"等响应/断流"超时 deadline。
+ * 收到有效下行数据（tts_start / 0x02 帧）时调用 —— 长 TTS（>10s）与播放中的短暂抖动
+ * 不应被误判超时；真正的超时口径 = 连续 CONFIG_VC_RESPONSE_TIMEOUT_MS 没有任何数据。
+ * 写入方在 `ws_client` 任务、读取方在 `vc` 任务：int64 在 32 位核上非原子，必须走临界区。
+ */
+static void vc_refresh_deadline(void)
+{
+    portENTER_CRITICAL(&s_stat_mux);
+    s_wait_deadline_us = esp_timer_get_time() + (int64_t)CONFIG_VC_RESPONSE_TIMEOUT_MS * 1000;
+    portEXIT_CRITICAL(&s_stat_mux);
+}
+
+static int64_t vc_wait_deadline(void)
+{
+    portENTER_CRITICAL(&s_stat_mux);
+    const int64_t deadline = s_wait_deadline_us;
+    portEXIT_CRITICAL(&s_stat_mux);
+    return deadline;
+}
+
 /* ---------------- 下行 TTS 音频（T2.4，0x02 → audio_player 流式播放） ---------------- */
 
 /* 丢弃 1 帧 0x02：计数 + 限频日志（窗口外/收尾后/播放器不可用都会走到这里） */
@@ -667,6 +690,10 @@ static void vc_handle_text(const uint8_t *payload, size_t len)
             ESP_LOGW(TAG, "tts_start codec=%s 非 mp3（端侧只实现 MP3），本轮音频将无法播放", codec);
         }
         ESP_LOGI(TAG, "TTS start sid=%u codec=%s sr=%d", (unsigned)sid, codec, (int)sr_raw);
+        /* T3.1：一旦 TTS 开始下发，超时口径从"等响应"切到"数据断流" */
+        if (s_state == VC_STATE_WAIT_RESPONSE) {
+            vc_refresh_deadline();
+        }
         vc_audio_start(codec_id, (uint32_t)sr_raw);
         vc_post_tts_start(sid, codec_id, (uint32_t)sr_raw);
         vc_emit(VC_EVT_TTS_START, sid, NULL, 0, codec_id, (uint32_t)sr_raw, 0);
@@ -676,7 +703,7 @@ static void vc_handle_text(const uint8_t *payload, size_t len)
     if (strcmp(t, "tts_end") == 0) {
         /* 先请求排空收尾再记账：保证脚本看到的日志顺序是 tts_end → stream end */
         vc_audio_end();
-        const uint32_t frames = s_stats.rx_audio_frames;
+        const uint32_t frames = s_round_audio_frames;
         ESP_LOGI(TAG, "TTS end sid=%u（本轮下行音频 %u 帧）", (unsigned)sid, (unsigned)frames);
         vc_post_tts_end(sid, (uint16_t)frames);
         vc_emit(VC_EVT_TTS_END, sid, NULL, 0, 0, 0, 0);
@@ -697,6 +724,7 @@ static void vc_handle_text(const uint8_t *payload, size_t len)
             (void)vc_decode_str(v, v_end, msg, sizeof(msg), NULL);
         }
         stat_add(&s_stats.rx_cloud_errors, 1);
+        s_cloud_error = true;
         ESP_LOGE(TAG, "云端 error sid=%u code=%d msg=%s（本轮结束，同轮不重试）", (unsigned)sid,
                  (int)code, msg);
         vc_audio_abort("cloud error");
@@ -736,7 +764,12 @@ static void vc_handle_audio(const ws_frame_hdr_t *frame, const uint8_t *payload,
     }
 
     stat_add(&s_stats.rx_audio_frames, 1);
-    const uint32_t count = s_stats.rx_audio_frames;
+    s_round_audio_frames++;
+    /* T3.1：收到有效数据就刷新"响应/数据超时"（见 vc_refresh_deadline） */
+    if (s_state == VC_STATE_WAIT_RESPONSE) {
+        vc_refresh_deadline();
+    }
+    const uint32_t count = s_round_audio_frames;
     if (count == 1 || (count % 25) == 0) {
         ESP_LOGI(TAG, "下行音频帧 #%u len=%u", (unsigned)count, (unsigned)len);
     }
@@ -774,6 +807,40 @@ static const char *vc_finish_name(vc_finish_t why)
     case VC_FIN_LINK_LOST: return "link-lost";
     default: return "unknown";
     }
+}
+
+/*
+ * T3.1：把"一轮的生命周期节点"通知 voice_session（会话状态机）。
+ * 回调在 vc/ws_client 任务上下文执行，只允许置标志/非阻塞调用。
+ */
+static void vc_emit_uplink_end(vc_finish_t why)
+{
+    vc_cb_t cb = s_cb;
+
+    if (cb == NULL) {
+        return;
+    }
+    vc_event_msg_t msg = {
+        .evt = VC_EVT_UPLINK_END,
+        .sid = s_sid,
+        .code = (int32_t)why,
+    };
+    cb(&msg, s_cb_arg);
+}
+
+static void vc_emit_round_end(vc_round_end_t result)
+{
+    vc_cb_t cb = s_cb;
+
+    if (cb == NULL) {
+        return;
+    }
+    vc_event_msg_t msg = {
+        .evt = VC_EVT_ROUND_END,
+        .sid = s_sid,
+        .round_end = result,
+    };
+    cb(&msg, s_cb_arg);
 }
 
 /* 发 JSON 文本（audio_start/audio_end）；失败只记统计，不阻塞 */
@@ -827,7 +894,8 @@ static bool vc_end_uplink(vc_finish_t why)
     s_tts_end_seen = false;
     if (sent_end) {
         s_state = VC_STATE_WAIT_RESPONSE;
-        s_wait_deadline_us = esp_timer_get_time() + (int64_t)CONFIG_VC_RESPONSE_TIMEOUT_MS * 1000;
+        vc_refresh_deadline();
+        vc_emit_uplink_end(why); /* T3.1：LISTENING → THINKING 的触发点 */
     }
     return sent_end;
 }
@@ -840,10 +908,12 @@ static void vc_begin_round(uint16_t sid)
     s_abort = false;
     s_finish_req = false;
     s_tts_end_seen = false;
+    s_cloud_error = false;
     s_audio_attempted = false;
     s_sid = sid;
     s_round_frames = 0;
     s_round_bytes = 0;
+    s_round_audio_frames = 0;
     stat_set(&s_stats.first_frame_us, 0);
     s_state = VC_STATE_IDLE;
 
@@ -975,6 +1045,18 @@ static void vc_abort_round(vc_finish_t why)
     stat_add(&s_stats.rounds_aborted, 1);
     ESP_LOGW(TAG, "round aborted sid=%u（%s，未发 audio_end）", (unsigned)s_sid,
              vc_finish_name(why));
+
+    /* T3.1：告诉会话状态机本轮异常结束（取消/断链/新轮次/收尾失败） */
+    vc_round_end_t result;
+    if (why == VC_FIN_LINK_LOST) {
+        result = VC_ROUND_ABORT_LINK;
+    } else if (why == VC_FIN_ABORT) {
+        result = s_pending_start ? VC_ROUND_ABORT_NEW : VC_ROUND_ABORT_CANCEL;
+    } else {
+        /* VAD/时长/stop 收尾但 audio_end 没发出去 → 起轮/发送失败 */
+        result = VC_ROUND_ABORT_SETUP;
+    }
+    vc_emit_round_end(result);
 }
 
 static void vc_wait_response(void)
@@ -991,7 +1073,7 @@ static void vc_wait_response(void)
             s_state = VC_STATE_IDLE;
             break;
         }
-        const int64_t remain_us = s_wait_deadline_us - esp_timer_get_time();
+        const int64_t remain_us = vc_wait_deadline() - esp_timer_get_time();
         if (remain_us <= 0) {
             s_state = VC_STATE_IDLE;
             break;
@@ -1009,22 +1091,32 @@ static void vc_wait_response(void)
     if (s_tts_end_seen) {
         stat_add(&s_stats.rounds_done, 1);
         ESP_LOGI(TAG, "round done sid=%u", (unsigned)s_sid);
+        vc_emit_round_end(VC_ROUND_DONE);
         return;
     }
 
     /* 没有 tts_end 就结束：在播的 TTS 音频立刻打断（契约 §2.4），再按原因记账/打日志 */
     vc_audio_abort("no tts_end");
     stat_add(&s_stats.rounds_aborted, 1);
+    vc_round_end_t result;
     if (s_pending_start) {
+        result = VC_ROUND_ABORT_NEW;
         ESP_LOGW(TAG, "round aborted sid=%u（new-round）", (unsigned)s_sid);
     } else if (s_abort) {
+        result = VC_ROUND_ABORT_CANCEL;
         ESP_LOGW(TAG, "round aborted sid=%u（cancel）", (unsigned)s_sid);
     } else if (link_lost) {
+        result = VC_ROUND_ABORT_LINK;
         ESP_LOGW(TAG, "round aborted sid=%u（link-lost）", (unsigned)s_sid);
+    } else if (s_cloud_error) {
+        result = VC_ROUND_ABORT_ERROR;
+        ESP_LOGW(TAG, "round aborted sid=%u（cloud-error）", (unsigned)s_sid);
     } else {
+        result = VC_ROUND_ABORT_TIMEOUT;
         ESP_LOGW(TAG, "等待云端响应超时（%d ms），sid=%u 结束", CONFIG_VC_RESPONSE_TIMEOUT_MS,
                  (unsigned)s_sid);
     }
+    vc_emit_round_end(result);
 }
 
 static void vc_task(void *arg)
@@ -1044,7 +1136,9 @@ static void vc_task(void *arg)
 
         vc_begin_round(sid);
         if (s_state != VC_STATE_UPLINK) {
-            continue; /* 未 READY / 编码器失败 / 上行占用：已打日志 */
+            /* 未 READY / 编码器失败 / 上行占用：已打日志，通知会话状态机本轮没起来 */
+            vc_emit_round_end(VC_ROUND_ABORT_SETUP);
+            continue;
         }
 
         const vc_finish_t why = vc_uplink_loop();

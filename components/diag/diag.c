@@ -34,6 +34,7 @@
 #include "sdkconfig.h"
 #include "transport_ws.h"
 #include "voice_cloud.h"
+#include "voice_session.h"
 
 static const char *TAG = "DIAG";
 
@@ -1393,7 +1394,7 @@ static void print_vc_status(void)
            " 云端 error %" PRIu32 "；音频丢弃 %" PRIu32 " 帧 字节 %" PRIu32 "\n",
            st.rx_text, st.rx_audio_frames, st.rx_dropped_sid, st.rx_parse_errors,
            st.rx_cloud_errors, st.rx_audio_dropped, st.rx_audio_dropped_bytes);
-    printf("  说明: 唤醒后由 APP 自动起一轮；手动调试用 vc start [sid] / stop / cancel\n");
+    printf("  说明: 唤醒后由 voice_session 自动起一轮；手动调试用 vc start [sid] / stop / cancel\n");
 }
 
 static int cmd_vc(int argc, char **argv)
@@ -1456,6 +1457,68 @@ static int cmd_vc(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- vs 命令（会话状态机观测，T3.1） ---------------- */
+
+static void print_vs_status(void)
+{
+    vs_stats_t st;
+
+    if (vs_stats_read(&st) != ESP_OK) {
+        printf("读取 voice_session 统计失败\n");
+        return;
+    }
+    printf("voice_session: %s%s（当前 sid=%u，VC=%s）\n", vs_state_name((vs_state_t)st.state),
+           vs_is_busy() ? "  [busy]" : "", (unsigned)vs_current_sid(),
+           vc_state_name(vc_get_state()));
+    printf("  轮次: 开始 %" PRIu32 " / 完成 %" PRIu32 " / 异常 %" PRIu32 " / 中止 %" PRIu32
+           "；打断 %" PRIu32 " 唤醒丢弃 %" PRIu32 "；超时 %" PRIu32 " 云端 error %" PRIu32 "\n",
+           st.rounds_started, st.rounds_completed, st.rounds_errored, st.round_aborts,
+           st.interrupts, st.wakes_dropped, st.timeouts, st.cloud_errors);
+    printf("  迁移: 共 %" PRIu32 " 次；最近 sid=%u，上次状态停留 %" PRIu32 " ms\n",
+           st.transitions, (unsigned)st.last_sid, st.last_state_ms);
+    printf("  说明: 唤醒自动进 LISTENING；手动调试用 vs start / vs interrupt；状态迁移日志看 TAG VS\n");
+}
+
+static int cmd_vs(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: vs status | start | interrupt | reset\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *sub = argv[1];
+    if (strcmp(sub, "status") == 0 || strcmp(sub, "stat") == 0) {
+        print_vs_status();
+        return ESP_OK;
+    }
+
+    if (strcmp(sub, "start") == 0) {
+        esp_err_t err = vs_start();
+        if (err != ESP_OK) {
+            printf("开始会话失败: %s（已有会话进行中或云端未 READY）\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("已请求开始一轮（不播唤醒应答，直接进入 LISTENING）\n");
+        return ESP_OK;
+    }
+
+    if (strcmp(sub, "interrupt") == 0) {
+        esp_err_t err = vs_interrupt();
+        printf("%s\n", err == ESP_OK ? "已打断当前会话（vc cancel + 回 IDLE）" :
+                                      esp_err_to_name(err));
+        return err;
+    }
+
+    if (strcmp(sub, "reset") == 0) {
+        esp_err_t err = vs_stats_reset();
+        printf("vs 统计已清零（保留最近 sid/停留时长）\n");
+        return err;
+    }
+
+    printf("未知子命令: %s（可用: status | start | interrupt | reset）\n", sub);
+    return ESP_ERR_INVALID_ARG;
+}
+
 /* ---------------- evt 命令（事件总线观测，T1.2a） ---------------- */
 
 /*
@@ -1465,9 +1528,10 @@ static int cmd_vc(int argc, char **argv)
 
 static bool evt_has_payload(app_evt_t evt)
 {
-    /* 带 payload 的事件：P1 的网络事件 + T2.5 定的语音事件（见 event_bus.h） */
+    /* 带 payload 的事件：P1 的网络事件 + T2.5 的语音事件 + T3.1 的会话状态事件（见 event_bus.h） */
     return evt == APP_EVT_NET_UP || evt == APP_EVT_NET_DOWN || evt == APP_EVT_ASR_PARTIAL ||
-           evt == APP_EVT_ASR_FINAL || evt == APP_EVT_TTS_START || evt == APP_EVT_TTS_END;
+           evt == APP_EVT_ASR_FINAL || evt == APP_EVT_TTS_START || evt == APP_EVT_TTS_END ||
+           evt == APP_EVT_VOICE_STATE_CHANGED;
 }
 
 static bool evt_parse(const char *text, app_evt_t *out)
@@ -1510,6 +1574,12 @@ static void evt_fill_sample_payload(app_evt_t evt, app_evt_data_t *data)
     } else if (evt == APP_EVT_TTS_END) {
         data->tts_end.sid = 1;
         data->tts_end.frames = 100;
+    } else if (evt == APP_EVT_VOICE_STATE_CHANGED) {
+        data->voice_state.sid = 1;
+        data->voice_state.from = VS_STATE_LISTENING;
+        data->voice_state.to = VS_STATE_THINKING;
+        data->voice_state.reason = VS_REASON_UPLINK_END;
+        data->voice_state.dur_ms = 1200;
     }
 }
 
@@ -1534,6 +1604,13 @@ static void evt_trace_cb(void *arg, app_evt_t evt, const app_evt_data_t *data)
     } else if (evt == APP_EVT_TTS_END && data != NULL) {
         ESP_LOGI(TAG, "evt trace: %s sid=%u frames=%u", app_evt_name(evt),
                  (unsigned)data->tts_end.sid, (unsigned)data->tts_end.frames);
+    } else if (evt == APP_EVT_VOICE_STATE_CHANGED && data != NULL) {
+        ESP_LOGI(TAG, "evt trace: %s sid=%u %s -> %s（原因=%s，停留 %" PRIu32 " ms）",
+                 app_evt_name(evt), (unsigned)data->voice_state.sid,
+                 vs_state_name((vs_state_t)data->voice_state.from),
+                 vs_state_name((vs_state_t)data->voice_state.to),
+                 vs_reason_name((vs_reason_t)data->voice_state.reason),
+                 data->voice_state.dur_ms);
     } else {
         ESP_LOGI(TAG, "evt trace: %s", app_evt_name(evt));
     }
@@ -2001,6 +2078,12 @@ static esp_err_t register_commands(void)
             .help = "语音云：vc status | start [sid] | stop | cancel | stat | reset（T2.5）",
             .hint = "status|start|stop|cancel|stat|reset",
             .func = cmd_vc,
+        },
+        {
+            .command = "vs",
+            .help = "会话状态机：vs status | start | interrupt | reset（T3.1）",
+            .hint = "status|start|interrupt|reset",
+            .func = cmd_vs,
         },
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST
         {

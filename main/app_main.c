@@ -1,8 +1,9 @@
 /*
- * 应用入口：只做模块初始化编排与事件接线，不放业务逻辑。
- * 当前链路（P2/T2.5）：
- *   唤醒"嗨，乐鑫" -> 播放提示音"我在呢" -> 恢复收音 -> 起一轮端云语音会话
- *   （voice_cloud 上行 Opus；未联网/未配置 WS_URL 时自动跳过，本地功能不受影响）
+ * 应用入口：只做模块初始化编排，不放业务逻辑（CONVENTIONS §2）。
+ * 业务链路（T3.1 起）：
+ *   唤醒"嗨，乐鑫"（audio_fe 投 APP_EVT_WAKE_DETECTED）→ voice_session 状态机：
+ *   播应答提示音"我在呢" → 恢复收音 → 起一轮端云会话（voice_cloud 上行 Opus / 下行 TTS）
+ *   → IDLE。未联网/未配置 WS_URL 时本轮降级结束，本地唤醒/提示音不受影响。
  */
 #include "audio_fe.h"
 #include "audio_io.h"
@@ -13,68 +14,19 @@
 #include "esp_log.h"
 #include "event_bus.h"
 #include "net_mgr.h"
-#include "prompt_assets.h"
 #include "transport_ws.h"
 #include "voice_cloud.h"
+#include "voice_session.h"
 
 static const char *TAG = "APP";
 
-static void on_play_done(audio_player_src_t src, bool ok, void *arg)
+/* 播放主槽只做"本地整段 MP3 探针"的日志；提示音/TTS 的生命周期归 voice_session / voice_cloud
+ * 的附加订阅槽（主槽与附加槽都会收到回调，见 audio_player.h）。 */
+static void on_player_done(audio_player_src_t src, bool ok, void *arg)
 {
     (void)arg;
-    (void)ok;
-
-    if (src == AUDIO_PLAYER_SRC_PCM) {
-        /* R2：提示音播放结束（含尾部延时）后恢复收音 */
-        audio_fe_set_feed_enabled(true);
-        ESP_LOGI(TAG, "prompt done, feed resumed");
-
-        /* 提示音播完、收音已恢复，才是"用户开始说话"的起点：发起一轮端云会话。
-         * 云端未 READY 时 vc_start_auto() 返回 INVALID_STATE 并只打 WARN —— 启动顺序
-         * 不能假设 WiFi/握手已经完成（唤醒是本地能力，早于联网）。 */
-        esp_err_t err = vc_start_auto();
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "cloud round skipped: %s", esp_err_to_name(err));
-        }
-    } else if (src == AUDIO_PLAYER_SRC_MP3_FILE) {
-        /* 整段 MP3 探针路径不涉及半双工状态 */
-        ESP_LOGI(TAG, "mp3 file done");
-    }
-    /* AUDIO_PLAYER_SRC_TTS_STREAM：恢复 feed 由 voice_cloud 的附加订阅负责（T2.4-B） */
-}
-
-static void on_afe_event(audio_fe_event_t evt, void *arg)
-{
-    (void)arg;
-
-    switch (evt) {
-    case AUDIO_FE_EVT_WAKE:
-        ESP_LOGI(TAG, "wake detected");
-        if (audio_player_is_busy()) {
-            ESP_LOGW(TAG, "player busy, ignore wake");
-            break;
-        }
-        /* R1：进入播放前暂停收音，避免自激 */
-        audio_fe_set_feed_enabled(false);
-        esp_err_t err = audio_player_play_pcm(prompt_wo_zai_ne_pcm,
-                                              prompt_wo_zai_ne_samples,
-                                              AUDIO_IO_MIC_SAMPLE_RATE);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "play prompt failed: %s", esp_err_to_name(err));
-            audio_fe_set_feed_enabled(true);
-        }
-        break;
-
-    case AUDIO_FE_EVT_VAD_SPEECH_START:
-        ESP_LOGD(TAG, "vad: speech start");
-        break;
-
-    case AUDIO_FE_EVT_VAD_SPEECH_END:
-        ESP_LOGD(TAG, "vad: speech end");
-        break;
-
-    default:
-        break;
+    if (src == AUDIO_PLAYER_SRC_MP3_FILE) {
+        ESP_LOGI(TAG, "mp3 file done（ok=%d）", (int)ok);
     }
 }
 
@@ -86,15 +38,15 @@ void app_main(void)
     /* 配置持久化要早于所有使用方（net_mgr/transport_ws/播放器音量都依赖它） */
     ESP_ERROR_CHECK(cfg_init());
 
-    /* 事件总线要早于任何会投递/订阅事件的模块（P1 起 net_mgr/transport_ws 都依赖它） */
+    /* 事件总线要早于任何会投递/订阅事件的模块（net_mgr/transport_ws/audio_fe 都依赖它） */
     ESP_ERROR_CHECK(app_evt_init());
 
-    ESP_LOGI(TAG, "booting esp-ai (mvp: wake + prompt)");
+    ESP_LOGI(TAG, "booting esp-ai (wake + prompt + cloud session)");
 
     ESP_ERROR_CHECK(board_init());
     ESP_ERROR_CHECK(audio_io_init());
     ESP_ERROR_CHECK(audio_player_init());
-    audio_player_register_done_cb(on_play_done, NULL);
+    audio_player_register_done_cb(on_player_done, NULL);
 
     /* 启动时把 NVS 里的音量灌进播放器：这样 cfg set volume 重启后能听到效果 */
     int volume = 0;
@@ -105,7 +57,8 @@ void app_main(void)
         ESP_LOGW(TAG, "read volume failed, keep player default");
     }
 
-    ESP_ERROR_CHECK(audio_fe_init(on_afe_event, NULL));
+    /* 唤醒/VAD 自 T1.2b 起走 event_bus，业务回调传 NULL（产品路径不注册） */
+    ESP_ERROR_CHECK(audio_fe_init(NULL, NULL));
     const char *wn = audio_fe_wakenet_name();
     ESP_LOGI(TAG, "wake word model: %s", wn ? wn : "unknown");
 
@@ -123,6 +76,9 @@ void app_main(void)
     /* 语音云协议（T2.5）放在 ws 之后：vc_init 要注册 WS 主接收回调；
      * 未 READY 时按轮次跳过，不影响本地唤醒/提示音 */
     ESP_ERROR_CHECK(vc_init());
+
+    /* 会话状态机（T3.1）放在 vc 之后：订阅事件总线 + vc 回调 + 播放完成回调，不建任务 */
+    ESP_ERROR_CHECK(vs_init());
 
     ESP_LOGI(TAG, "ready, say \"Hi Lexin\"");
 }

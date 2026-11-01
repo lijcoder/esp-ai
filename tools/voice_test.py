@@ -43,12 +43,13 @@ INTERACTION_WAVS = ("今天天气如何.wav", "今天吃了什么.wav")
 # 允许的最大系统输出音量（用户定稿：正常 31%、上限 50%，不得突破）
 SYSTEM_VOLUME_MAX = 50
 
-# 唤醒链路的完整日志顺序（ARCHITECTURE §3.3 R1/R2）
+# 唤醒链路的完整日志顺序（ARCHITECTURE §3.3 R1/R2）。T3.1 起唤醒编排归 voice_session
+# （TAG VS），兼容旧固件的 APP 前缀。
 WAKE_CHAIN = (
-    ("wake", re.compile(r"APP: wake detected")),
+    ("wake", re.compile(r"(?:APP|VS): wake detected")),
     ("pause", re.compile(r"AFE: feed paused")),
     ("play", re.compile(r"PLAYER: play \d+ samples")),
-    ("done", re.compile(r"APP: prompt done, feed resumed")),
+    ("done", re.compile(r"(?:APP|VS): prompt done, feed resumed")),
 )
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -416,7 +417,7 @@ def run(args: argparse.Namespace) -> int:
                 print(f"  第 {i + 1} 轮 FAIL  链路: "
                       + " → ".join(f"{n}={'ok' if h else 'miss'}" for (n, _), h in zip(WAKE_CHAIN, chain_hits)))
                 for line in lines:
-                    if "APP:" in line or "AFE:" in line or "PLAYER:" in line:
+                    if "APP:" in line or "VS:" in line or "AFE:" in line or "PLAYER:" in line:
                         print(f"    {line.strip()}")
             dev.pump(0.3)
         res.check(wake_pass >= args.min_wake_pass,
@@ -436,7 +437,7 @@ def run(args: argparse.Namespace) -> int:
             dev.pump(0.2)
             stat = dev.mic_stat()
             lines = [l for _, l in dev.lines_since(mark)]
-            false_wake = [l for l in lines if "APP: wake detected" in l]
+            false_wake = [l for l in lines if re.search(r"(?:APP|VS): wake detected", l)]
             print(f"  {name}: RMS {stat.get('rms')} / 峰值 {stat.get('peak')} / "
                   f"VAD {stat.get('vad')} / 收音 {stat.get('feed')} / "
                   f"误唤醒 {len(false_wake)} / I2S 读失败 {stat.get('mic_read_errors')}")

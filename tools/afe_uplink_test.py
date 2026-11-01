@@ -38,12 +38,13 @@ BAUDRATE = 115200
 SPEECH_WAV = "今天天气如何.wav"
 WAKE_WAV = "lexin.wav"
 
-# 唤醒链路顺序（ARCHITECTURE §3.3 R1/R2）
+# 唤醒链路顺序（ARCHITECTURE §3.3 R1/R2）。T3.1 起唤醒编排归 voice_session（TAG VS），
+# 兼容旧固件的 APP 日志，故两个前缀都接受。
 WAKE_CHAIN = (
-    ("wake", re.compile(r"APP: wake detected")),
+    ("wake", re.compile(r"(?:APP|VS): wake detected")),
     ("pause", re.compile(r"AFE: feed paused")),
     ("play", re.compile(r"PLAYER: play \d+ samples")),
-    ("done", re.compile(r"APP: prompt done, feed resumed")),
+    ("done", re.compile(r"(?:APP|VS): prompt done, feed resumed")),
 )
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -407,7 +408,7 @@ def run(args: argparse.Namespace) -> int:
         mark = len(dev.lines)
         dev.play(wav_wake)
         # 唤醒应答要播完（"我在呢" 0.8s + 300ms 尾音）才有 prompt done，先等链路收尾再断言
-        dev.wait_line(re.compile(r"APP: prompt done, feed resumed"), 6.0, mark)
+        dev.wait_line(re.compile(r"(?:APP|VS): prompt done, feed resumed"), 6.0, mark)
         seen = set()
         for _, line in dev.lines[mark:]:
             for name, pattern in WAKE_CHAIN:

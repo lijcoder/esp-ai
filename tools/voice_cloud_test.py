@@ -56,10 +56,11 @@ SYSTEM_VOLUME_MAX = 50
 
 # 设备侧日志断言（VC 组件与 diag 输出）
 RE_WS_READY = re.compile(r"WS: 握手完成（hello_ack）")
-RE_WAKE = re.compile(r"APP: wake detected")
+# T3.1 起唤醒编排归 voice_session（TAG VS）；兼容旧固件的 APP 前缀
+RE_WAKE = re.compile(r"(?:APP|VS): wake detected")
 RE_FEED_PAUSE = re.compile(r"AFE: feed paused")
 RE_PROMPT_PLAY = re.compile(r"PLAYER: play \d+ samples")
-RE_PROMPT_DONE = re.compile(r"APP: prompt done, feed resumed")
+RE_PROMPT_DONE = re.compile(r"(?:APP|VS): prompt done, feed resumed")
 RE_ROUND_START = re.compile(r"VC: round start sid=(\d+)")
 RE_FIRST_FRAME = re.compile(r"VC: 上行首帧 (\d+) us")
 RE_AUDIO_END = re.compile(
@@ -74,6 +75,11 @@ RE_RESPONSE_TIMEOUT = re.compile(r"VC: 等待云端响应超时")
 RE_EVT_ASR_FINAL = re.compile(r"evt trace: ASR_FINAL")
 RE_EVT_TTS_START = re.compile(r"evt trace: TTS_START")
 RE_EVT_TTS_END = re.compile(r"evt trace: TTS_END")
+RE_EVT_VS_STATE = re.compile(r"evt trace: VOICE_STATE_CHANGED")
+
+# voice_session（T3.1）：状态迁移日志与命令输出
+RE_VS_STATE = re.compile(
+    r"VS: state (\w+) -> (\w+)（sid=(\d+)，停留 (\d+) ms，原因=([a-z-]+)）")
 
 # Mock 侧日志断言
 RE_MOCK_HELLO = re.compile(r"<-- hello device_id=(\S+) ver=(\d+)")
@@ -85,11 +91,13 @@ MOCK_SEQ_GAP = "seq 跳变"
 MOCK_BAD_FRAME = "坏帧"
 
 # console 命令结束标记（esp_console 无统一结束符，用命令最后一行输出当哨兵）
-END_VC_STATUS = re.compile(r"说明: 唤醒后由 APP 自动起一轮")
+END_VC_STATUS = re.compile(r"说明: 唤醒后由 voice_session 自动起一轮")
 END_VC_RESET = re.compile(r"vc 统计已清零")
 END_VC_START = re.compile(r"已请求发起一轮")
 END_VC_STOP = re.compile(r"已请求优雅收尾")
 END_VC_CANCEL = re.compile(r"已请求立即放弃")
+END_VS_STATUS = re.compile(r"说明: 唤醒自动进 LISTENING")
+END_VS_RESET = re.compile(r"vs 统计已清零")
 END_EVT_TRACE_ON = re.compile(r"事件 trace 已开启|事件 trace 已经开启")
 END_SYS_HEAP = re.compile(r"PSRAM.*(最低水位|未初始化)")
 END_SYS_TASKS = re.compile(r"共 \d+ 个任务")
@@ -187,6 +195,33 @@ def vc_status(dev: Device) -> dict:
             stat["dropped_sid"] = int(m.group(3))
             stat["parse_errors"] = int(m.group(4))
             stat["cloud_errors"] = int(m.group(5))
+    return stat
+
+
+def vs_status(dev: Device) -> dict:
+    """解析 `vs status`（T3.1 会话状态机）。"""
+    out = dev.console("vs status", END_VS_STATUS, timeout=3.0)
+    stat: dict = {"raw": out}
+    for line in out:
+        m = re.search(r"voice_session: (\w+)", line)
+        if m:
+            stat["state"] = m.group(1)
+        m = re.search(
+            r"轮次: 开始 (\d+) / 完成 (\d+) / 异常 (\d+) / 中止 (\d+)；打断 (\d+) 唤醒丢弃 (\d+)；"
+            r"超时 (\d+) 云端 error (\d+)", line)
+        if m:
+            stat["rounds_started"] = int(m.group(1))
+            stat["rounds_completed"] = int(m.group(2))
+            stat["rounds_errored"] = int(m.group(3))
+            stat["round_aborts"] = int(m.group(4))
+            stat["interrupts"] = int(m.group(5))
+            stat["wakes_dropped"] = int(m.group(6))
+            stat["timeouts"] = int(m.group(7))
+            stat["cloud_errors"] = int(m.group(8))
+        m = re.search(r"迁移: 共 (\d+) 次；最近 sid=(\d+)", line)
+        if m:
+            stat["transitions"] = int(m.group(1))
+            stat["sid"] = int(m.group(2))
     return stat
 
 
@@ -291,9 +326,13 @@ def run(args: argparse.Namespace) -> int:
 
         # 基线：统计清零 + 打开事件 trace（验证 voice_cloud 真的往 event_bus 投了事件）
         dev.console("vc reset", END_VC_RESET, timeout=2.0)
+        dev.console("vs reset", END_VS_RESET, timeout=2.0)
         dev.console("evt trace on", END_EVT_TRACE_ON, timeout=2.0)
         base = vc_status(dev)
         result.check(base.get("state") == "IDLE", f"初始状态 IDLE（实际 {base.get('state')}）")
+        base_vs = vs_status(dev)
+        result.check(base_vs.get("state") == "IDLE",
+                     f"VS 初始状态 IDLE（实际 {base_vs.get('state')}）")
 
         # ---- 一轮真实语音：唤醒 → 提示音 → 交互语音 → 上行 → 下行 ----
         mark = dev.mark()
@@ -348,6 +387,28 @@ def run(args: argparse.Namespace) -> int:
                      "event_bus 收到 TTS_START")
         result.check(any(RE_EVT_TTS_END.search(l) for l in all_lines),
                      "event_bus 收到 TTS_END")
+
+        # ---- T3.1：会话状态机（voice_session） ----
+        # vc 的 round done 早于 TTS 排空：先等播放完成回调把 SPEAKING 收回 IDLE（R2 之后）
+        wait_line(dev, re.compile(r"VS: state SPEAKING -> IDLE"), 12.0, mark)
+        vs_lines = lines_since(dev, 0)
+        vs_seq = [(m.group(1), m.group(2), int(m.group(3)))
+                  for l in vs_lines for m in [RE_VS_STATE.search(l)] if m]
+        got = [(a, b) for a, b, _ in vs_seq]
+        expect = [("IDLE", "LISTENING"), ("LISTENING", "THINKING"),
+                  ("THINKING", "SPEAKING"), ("SPEAKING", "IDLE")]
+        result.check(got[:4] == expect,
+                     f"VS 状态迁移 IDLE→LISTENING→THINKING→SPEAKING→IDLE（实际 {got[:6]}）")
+        result.check(bool(vs_seq) and all(sid == sid_dev for _, _, sid in vs_seq),
+                     "VS 迁移日志的 sid 与本轮一致")
+        result.check(any(RE_EVT_VS_STATE.search(l) for l in vs_lines),
+                     "event_bus 收到 VOICE_STATE_CHANGED")
+        vst = vs_status(dev)
+        result.check(vst.get("state") == "IDLE", f"VS 轮次结束后 IDLE（实际 {vst.get('state')}）")
+        result.check(vst.get("rounds_started") == 1 and vst.get("rounds_completed") == 1,
+                     f"VS 轮次统计：开始 {vst.get('rounds_started')} / 完成 {vst.get('rounds_completed')}")
+        result.check(vst.get("rounds_errored") == 0 and vst.get("timeouts") == 0,
+                     "VS 无异常/超时轮次")
 
         # ---- 统计自洽 ----
         st = vc_status(dev)

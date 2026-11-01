@@ -68,7 +68,7 @@ RE_MP3_DECODED = re.compile(
     r"dec_avg=(\d+)us dec_max=(\d+)us skipped=(\d+) bad=(\d+)")
 RE_PLAY_START = re.compile(r"PLAYER: play (\d+) samples @(\d+) Hz")
 RE_JOB_DONE = re.compile(r"PLAYER: job done \((\d+) ms\)")
-RE_PROMPT_DONE = re.compile(r"APP: prompt done, feed resumed")
+RE_PROMPT_DONE = re.compile(r"(?:APP|VS): prompt done, feed resumed")
 END_PLAYERSTAT = RE_MP3STAT
 END_LOAD_READY = RE_LOAD_READY
 END_LOAD_CHUNK = RE_LOAD_CHUNK

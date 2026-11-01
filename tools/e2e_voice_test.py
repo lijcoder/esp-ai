@@ -16,7 +16,7 @@ VAD 静音收尾 → mock 下发真实 MP3 → 设备流式播放 → 收音恢�
   2. 起本地 mock（`--tts-mp3 <file> --tts-pace-pct 80`，自动拉起/回收）；
   3. 复位设备 → 等 `WS: 握手完成（hello_ack）` → `afplay tools/lexin.wav` 唤醒
      （系统音量正常 31%、上限 50%，**默认 afplay 增益**，脚本不改音量）；
-  4. 等 `APP: prompt done, feed resumed` → 自动轮次 `VC: round start`（= UPLINK）→
+  4. 等 `(APP|VS): prompt done, feed resumed` → 自动轮次 `VC: round start`（= UPLINK）→
      `afplay tools/今天天气如何.wav` 模拟用户说话；
   5. 等 `audio_end（vad-silence）` → mock asr/llm/tts_start → 真实 MP3 0x02 流 →
      设备 `stream open`（R1 feed paused）→ 流式播放 → `tts_end` → `stream end`（排空）→
@@ -112,10 +112,11 @@ NOISE_BASELINE_PEAK = 800
 
 # ---- 设备侧日志（逐字匹配现有固件输出，只消费、不猜字段） ----
 RE_WS_READY = re.compile(r"WS: 握手完成（hello_ack）")
-RE_WAKE = re.compile(r"APP: wake detected")
+# T3.1 起唤醒编排归 voice_session（TAG VS）；兼容旧固件的 APP 前缀
+RE_WAKE = re.compile(r"(?:APP|VS): wake detected")
 RE_FEED_PAUSE = re.compile(r"AFE: feed paused")
 RE_PROMPT_PLAY = re.compile(r"PLAYER: play \d+ samples")
-RE_PROMPT_DONE = re.compile(r"APP: prompt done, feed resumed")
+RE_PROMPT_DONE = re.compile(r"(?:APP|VS): prompt done, feed resumed")
 RE_CLOUD_SKIP = re.compile(r"cloud round skipped")
 RE_ROUND_START = re.compile(r"VC: round start sid=(\d+)")
 RE_FIRST_FRAME = re.compile(r"VC: 上行首帧 (\d+) us")

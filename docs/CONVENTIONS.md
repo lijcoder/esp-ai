@@ -32,7 +32,8 @@
 - **超时参数必核对单位**：IDF I2S 驱动 `i2s_channel_read/write` 的最后一个参数是**毫秒**，禁止传 `pdMS_TO_TICKS()`；只有 FreeRTOS API（`TickType_t` 参数，如 `fetch_with_delay`）才用 tick。单位错会让读写持续超时、功能静默失效（2026-10-30 唤醒失效即此原因，见 STATUS）。
 - 半双工规则 R1–R5（ARCHITECTURE §3.3）是硬约束，任何改动必须同步架构文档。
 - **半双工门控唯一入口（T3.2）**：暂停/恢复收音只能经 `audio_fe_feed_hold()/audio_fe_feed_release()`（原因位 `PROMPT`/`TTS`/`PROBE`，位图归零才恢复）；禁止直接改 `audio_fe` 内部标志或用 `audio_fe_set_feed_enabled()` 绕开仲裁（该接口仅为探针/旧脚本兼容）。R5 的恢复丢弃窗口用 `audio_fe_feed_discard_ms()` 在 release 之前设置。
-- 打断淡出与 duck 统一在 `audio_player` 的输出级（`audio_player_fade_out_and_stop()` / `audio_player_set_duck()`），播放循环不得自己再做一套淡出；T3.3 的混音/限幅接同一位置。
+- 打断淡出与 duck 统一在 `audio_player` 的输出级（`audio_player_fade_out_and_stop()` / `audio_player_set_duck()`），播放循环不得自己再做一套淡出。
+- **混音/音量/限幅唯一入口（T3.3）**：三通道混音、音量（20ms 插值）、-1dBFS 软限幅、通道包络淡入淡出全部在 `audio_player` 的混音级（`mix_render()`），通道 producer 只产出**原始** 48k 单声道样本；禁止在 producer 里再乘音量/做限幅/做出口淡出（会双算）。通道增益语义：TTS 0dB、PROMPT 在 TTS 活跃时 -6dB、MUSIC 在语音活跃或 `set_duck(true)` 时 -12dB，斜坡 100ms 线性。新功能要"多路同时出声"时，必须注册/复用通道 ring，不要另起播放循环。
 - 播放必须淡入 10ms / 淡出 100ms；混音后软限幅 -1dBFS。
 - 唤醒词/VAD 回调里只投递事件，不做耗时操作。
 - 关键路径打点：唤醒、上行首帧、TTS 首帧、打断、起播。
@@ -43,7 +44,7 @@
 - I2S DMA 缓冲必须内部 RAM：`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`。
 - 内部 RAM 预算（**X3-E 定稿，2026-10-31**）：**静态 DIRAM + 运行期堆峰值 ≤ 440KB**，且**最坏场景（wss/TLS 握手期）`sys heap` 最低水位 ≥ 30KB**；超预算先改设计，不靠砍功能硬压。
   - 口径与实测：`idf.py size` 的 DIRAM 已用 + `sys heap` 的「峰值占用」（internal），两者相加对照 440KB；`sys heap` 的「最低水位」对照 30KB。
-  - 当前值（T3.2 后，2026-11-01）：静态 **197,326 B** + 内部堆峰值 **226,888 B** = **424,214 B**（距 440KB 上限余量 25,594 B），`ws://` 最低水位 **32,859 B**（≥30KB，余 2,859 B）；PSRAM 峰值 **1,556,040 B**（`sys heap` 口径）。**wss 握手期自 T3.1 起未复测**（T3.2 未新增任务/缓冲，静态 +232B，T2.4 时为 32,671~32,719 B，估算仍 >30KB，T5.3 复测入基线）。T3.1 时为 424,830 B / 31,891~32,971 B / PSRAM 1,556,032 B；T2.4 时为 424,478 B / 32,671~32,719 B / PSRAM 1,446,724 B；T2.3 时为 424,506 B / 32,471~32,643 B / PSRAM 2,895,336 B；T2.5 时为 424,658 B / 32,339 B / PSRAM 902,908 B；T2.2 时为 409,918 B / 47,051~52,839 B。
+  - 当前值（T3.3 后，2026-11-01）：静态 **199,046 B** + 内部堆峰值 **226,296 B**（`ws://` 真实语音轮口径）= **425,342 B**（距 440KB 上限余量 25,192 B）；**wss 握手期（公网 echo，idle）静态 + 峰值 = 199,046 + 224,092 = 423,138 B、最低水位 33,711 B**；`ws://` 最低水位 **31,571 B**（≥30KB，余 851 B），**这是当前最紧口径**；PSRAM 峰值 **1,596,388 B**。**下一任务仍不得新增内部 RAM 静态/堆/任务栈**（水位余量不足 1KB）；wss 口径 T5.3 复测入基线。T3.2 时为 424,214 B / ws 32,859 B / PSRAM 1,556,040 B；T3.1 时为 424,830 B / 31,891~32,971 B / PSRAM 1,556,032 B；T2.4 时为 424,478 B / wss 32,671~32,719 B / PSRAM 1,446,724 B；T2.3 时为 424,506 B / wss 32,471~32,643 B / PSRAM 2,895,336 B；T2.5 时为 424,658 B / wss 32,339 B / PSRAM 902,908 B；T2.2 时为 409,918 B / wss 47,051~52,839 B。
   - 两条必须同时满足；**最坏场景下「最低水位 ≥30KB」是更强约束**（堆总量 ~259,843 B → 堆峰值上限约 229,843 B，折合静态+堆 ≤426.8KB）；440KB 上限用于吸收静态 DIRAM 后续增长。**T2.4 后水位余量只剩 ~2KB：后续任务不得再新增内部 RAM 任务栈/静态/堆占用，需要缓冲时放 PSRAM 或复用现有任务。T3.1 即据此把 `voice_session` 改为事件驱动、不新建任务（ARCH §9.3）。**
   - TLS 记录缓冲与握手堆自 X3-F 起在 PSRAM，不计入内部 RAM；旧口径「峰值 ≤310KB」写于 P0（未含 WiFi 栈且只统计堆），已作废。
 - 长时运行场景必须监控堆水位（`diag`），不允许无限增长。
@@ -96,6 +97,7 @@ components/<module>/
 - 云端/WS 问题先跑 mock，别直接上设备：`uv run tools/ws_mock_server.py --self-test`（**13 项**，不需要硬件）确认协议链路，再起 `uv run tools/ws_mock_server.py` 给设备当服务端；字段口径对照 `docs/PROTOCOL.md`（含待确认项）。**mock 已默认对每条连接开 `TCP_NODELAY`**：Nagle + 端侧 delayed ACK 会把均匀 TTS 帧攒批 ~200ms，造成端侧假欠载；真实云端同样必须关 Nagle。
 - 崩溃先看串口 panic 输出，再解析 coredump 分区（`coredump` @0x9a0000/64K，已开 `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`）：
   `idf.py -p <PORT> coredump-info`（寄存器/调用栈/任务列表）、`idf.py -p <PORT> coredump-debug`（gdb）；也可 `-s core.dump` 存盘后 `coredump-info -c core.dump` 离线解析。
+- **三通道混音调试（T3.3 起）**：console `player mix stat` 看 `MIXSTAT`（`vol/vol_q8/vol_target/limiter/limiter_peak/clip/mix_peak/block_max_us/cap_len/cap_pos`）与三行 `MIXCH`（`active/gain_q8/level_ms/peak`；gain_q8 256=0dB、128≈-6dB、64≈-12dB）；`player mix tone <TTS|PROMPT|MUSIC> <freq> <ms> [amp]` 往通道塞正弦探针（可三路叠加，播放器空闲时自动起混音泵，真实播放中拒绝）；`player mix vol <0~100>` 运行时改音量（20ms 斜坡、不落盘）；`player mix cap <n>` + `player mix dump <off> <n>` 抓混音输出（48k 单声道，`cap_pos` 是实际抓到的帧数，dump 只能读 `[0, cap_pos)`），供 PC 侧 FFT/幅度/包络/限幅对拍；`player mix stop` 停探针。自动回归 `uv run tools/mixer_test.py`（78 项断言：三通道幅度比 1:0.5:0.25、音量线性、软限幅不削波、淡入淡出无 pop、10 轮堆稳定；`--skip-heap` 快速冒烟）。**dump 是整段一次 write 输出**（逐行 printf 会被并发日志插字符流导致 PC 侧丢行）。
 - **端到端链路自测（T2.6 起）**：`uv run tools/e2e_voice_test.py` 走真实用户路径（afplay 唤醒 → 提示音 → 自动起轮 → 交互语音 → mock 真实 MP3 流式播放 → R2），10 轮逐轮断言（P2 三条 + 半双工/拾音/堆/PSRAM/任务/无 ERROR）；`--dry-run` 不连设备。与 `voice_cloud_test`（协议/事件、合成帧、`vc start` 手动触发）、`tts_stream_test`（`vc start/stop` + 真实 MP3 播放硬指标、含 abort/stall/late-bin）三方分工。拾音判据带环境噪声兜底（baseline=min(播放前后静音峰)，≥800 重试→WARN），**不要用重试掩盖固件 bug**。
 - **解析 coredump 必须用崩溃那一刻的 ELF**（`build/esp-ai.elf`，含符号与地址布局）：崩溃后先备份该文件再改代码/重建；要交付或现场测试的固件需把 elf 与 commit 一起归档，否则 coredump 无法还原调用栈。
 - **会话状态机调试（T3.1 起）**：`vs status` 看当前状态/sid/轮次与异常计数；`vs start`/`vs interrupt` 手动起轮/打断；迁移日志 `VS: state A -> B（sid=N，停留 M ms，原因=…）`。唤醒链路日志自 T3.1 起由 `VS` 输出（`VS: wake detected` / `VS: prompt done, feed resumed`），测试脚本正则用 `(?:APP|VS)` 兼容新旧固件。错误路径用 mock 验证：`--scenario error`（云端 error → ERROR）、`--think-ms 12000`（THINKING 10s 超时 → ERROR）。

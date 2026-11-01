@@ -66,18 +66,36 @@ INMP441 ──I2S0 RX 16k──> audio_io(32bit→int16) ──> audio_fe 环形
 - 上行取数：`fetch` 输出（16k/单声道/int16）写入 PSRAM 环形缓冲（`AUDIO_FE_UPLINK_RING_MS`，默认 2s），
   消费端按 320 样本精确读取。**AFE fetch 每帧 512 样本（32ms，T2.1 实测）与 Opus 20ms 帧不整除，编码端必须自行重组。**
 
-### 3.2 播放
+### 3.2 播放（T3.3 三通道混音）
 
 ```
-TTS(MP3) ─┐
-提示音(PCM)├─> 三通道 ringbuffer(PSRAM) ─> 解码/重采样48k ─> 混音 ─> 音量 ─> 软限幅 ─> I2S1 TX 48k
-音乐(MP3) ─┘                                                    (软件音量 0~100)
+TTS(MP3 流/整段) ─┐
+提示音(PCM)      ├─> 通道 ring(PSRAM，48k 单声道) ─> 饱和相加 ─> 音量(0~100，20ms 插值)
+音乐(MP3/PCM)    ─┘                                                   │
+                                                                      v
+                                          I2S1 TX 48k 立体声 <─ 软限幅(-1dBFS 渐近) <─ R4 淡出
 ```
 
-- 三个独立通道：`CH_TTS`、`CH_PROMPT`、`CH_MUSIC`，优先级 TTS > PROMPT > MUSIC；
-- 混音为饱和加法（16bit 限幅），音乐在语音播放时 duck 到 -12dB；
-- 淡入 10ms / 淡出 100ms，防止最大音量下切换产生 pop；
-- 软限幅器上限 -1dBFS，避免 3W 功放削波失真。
+- 三个独立通道：`CH_TTS`、`CH_PROMPT`、`CH_MUSIC`，每通道一个 **8192 帧（170ms）PSRAM ring**；
+  生产者（整段 PCM 重采样、探针音调、TTS 解码器）把 48k 单声道样本填进 ring，混音级每 10ms
+  （480 帧）从三通道各取一帧相加。**单播放任务串行完成泵数据、混音、写 I2S，不新增任务**。
+- **优先级语义（T3.3 定稿）**：三路**相加**，不做硬抢占 —— `CH_MUSIC` 在语音（TTS 或提示音）
+  活跃时 duck 到 **-12dB**（q16 增益 16384，100ms 斜坡），`CH_PROMPT` 在 `CH_TTS` 活跃时让位到
+  **-6dB**（32768），`CH_TTS` 恒 0dB。T3.6 的错误提示音即走"提示音叠在 TTS 上、自动 -6dB"这条路；
+  真实音乐源在 P4 接入后，会话结束恢复音乐由 T4.4 负责。
+- **饱和加法**：三通道相加用 int32 累加（最大 ±98301），随后统一做音量/限幅，**不在中间做 16bit 截断**。
+- **淡入淡出**：通道起播 10ms 线性淡入（包络 q16 步进）；源耗尽后（`closed`）剩余 ≤100ms 时对
+  该通道做 100ms 线性淡出，播空即退出。全局 R4 打断淡出仍在输出级（见 §3.3）。
+- **软限幅（-1dBFS）**：上限 `LIMIT_CEIL=29196`（32767×10^(-1/20)），膝点 `LIMIT_KNEE=26276`
+  （0.9×上限）。|x| ≤ 膝点完全透明；超过后按 `y = KNEE + SPAN·over/(over+SPAN)` 有理函数**渐近**
+  压向上限（单调、无硬削波；三路满幅相加的极限输出 ≈ -1.0dBFS）。逐样本除法只在超过膝点时发生；
+  另统计 `clip`（|y| 触到 int16 边界）应恒 0，用于自证"无削波"。
+- **音量**：0~100 线性映射到 q16（100% = 65536），**20ms 线性插值**（每块重算步进，块内逐样本推进）；
+  施加位置在混音之后、限幅之前（先混音再压限，符合"混音 → 音量 → 限幅"顺序）。静音 = 0；
+  `audio_player_set_volume()` 只改目标值，当前值由混音循环斜坡跟进。
+- **T3.3 边界**：作业仍是一次一个（提示音 / 整段 MP3 / TTS 流 / 探针混音泵），但通道本身独立，
+  P4 只需让音乐源任务持续填 `CH_MUSIC` ring 即可得到"音乐继续播 + 语音叠加 + 自动 duck"；
+  会话路径下"提示音与 TTS 并发"要等 T3.6 的实际使用场景，目前由探针验证混音正确性。
 
 ### 3.3 半双工规则（明确约定）
 
@@ -95,22 +113,27 @@ TTS(MP3) ─┐
 > - **R1/R2**：提示音与 TTS 统一经原因位仲裁（`hold_mask` 在 `mic stat` 可观测：提示音期 `0x1`、TTS 期 `0x2`、恢复后 `0x0`）；300ms 尾部延时仍在 `audio_player`（PCM 与流式一致），完成回调 → 各自 `release` 自己那一位。
 > - **R4**：`voice_session() → vs_interrupt()`：`audio_player_fade_out_and_stop(80ms)`（输出级线性淡出，`player stat` 的 `last_stop_ms` 真机实测 64~80ms；80ms 淡出被 10ms 输出块量化，故只设上界 <100ms）→ `vc_interrupt()` 发 `{"t":"interrupt","sid":N}` 并 `vc_cancel()` → `audio_fe_feed_discard_ms(50)` → 回 `IDLE`。播放完成回调以 `ok=false` 上报。淡出期间 `vc_cancel` 的立即 abort 不会截断淡出（`run_stream` 里"有淡出请求时忽略 abort_req"）。按键来源：`APP_EVT_BUTTON`（payload 见 §4.2），`EVT` 驱动在 T3.4 交付；console 用 `vs interrupt` / `evt post BUTTON` 验证。**停声口径**：从按键/命令到输出静音 ≤100ms（80ms 淡出 + 一个 10ms 输出块）。
 > - **R5**：`audio_fe_feed_discard_ms()` 在恢复后把最早 50ms 的麦克风数据喂零并计数（`mic stat` 的 `discard_samples=800`）；只在打断/断链恢复路径使用，正常 TTS 收尾由 R2 的 300ms 覆盖、**不叠加** R5。
-> - **R3**：`audio_player_set_duck(true/false)` 在用户音量之外叠一个 `-12dB`（q8=64）、**100ms 线性斜坡**的增益，port 在输出级（T3.3 混音/限幅接管同一位置）；`player duck on|off` 为探针。**边界与偏差**：音乐源在 P4，且当前播放器是单任务单通道，无法"音乐继续播 + 提示音/TTS 叠加"，因此 T3.2 的唤醒路径是"音乐播放中唤醒**不丢弃** → 麦克风保持开启 → 把音乐淡出（80ms）让出通道 → 提示音 → 会话"；R3 的"duck 后音乐继续播"需要 T3.3 的三通道混音，完整音乐流程（含会话后恢复音乐）归 T4.4。duck 机制本身已用探针在真机验证（`out_peak` 基线 15563 → duck 后 3890 = 0.250 → 恢复 15563）。
+> - **R3**：**T3.3 起 duck 是 `CH_MUSIC` 的通道增益**（`-12dB`，q16=16384，**100ms 线性斜坡**；目标变化时按 100ms 重算步进、块内逐样本推进），不再压整个输出；`player duck on|off` 为探针。真实音乐源在 P4；混音链路本身已支持"音乐 ring 持续供数 + 提示音/TTS 叠加 + 自动 duck"，完整音乐流程（含会话结束恢复音乐）归 T4.4；T3.2 的唤醒路径（音乐播放中唤醒不丢弃 → 淡出抢占）暂时保留，T4.4 接音乐源后再切叠加路径。真机探针：T3.2 的 `out_peak` 15563→3890（0.250）；T3.3 用 `player mix` 三通道复验 1760Hz 峰 8000→2000、440Hz 峰 8000→4000。
 
 ### 3.4 提示音
 
 - 存放在 `assets` 分区（PCM16 / 16k 单声道），启动时加载索引；
 - 播放时重采样到 48k，走 `CH_PROMPT`；
 - 唤醒应答"我在呢"、错误提示、按键音为三组固定资源；
-- 提示音播放中若 TTS 到达，挂起提示音，TTS 优先。
+- 提示音播放中若 TTS 到达：**T3.3 定稿为叠加让位**——提示音不中断，`CH_PROMPT` 在 `CH_TTS`
+  活跃时 duck 到 -6dB（q16=32768，100ms 斜坡），混音后一起输出；不再"挂起提示音、硬切 TTS"。
+  会话路径下两者真正并发由 T3.6 的错误提示场景使用。
 
 ### 3.5 音量与限幅
 
 - 音量 0~100，**默认 100**，存 NVS（`config_store`）；
   > 2026-10-31 用户听感定稿：T2.4 实播云端 TTS（测试素材峰值仅 -13.7 dBFS，比提示音低 ~6dB）时，软件音量 60 偏小、100 合适；提示音峰值 -7.8 dBFS，100 不削波。真实云端 TTS 电平通常更高，若后续觉得过响可再调 `CFG_VOLUME_DEFAULT`。
-- 软件音量：`sample * vol / 100`，静音即 0；
-- 限幅：混音后超过 -1dBFS 时按比例压回（软限幅，无削波）；
-- 音量变化时 20ms 线性插值，避免突变。
+- 软件音量：`mixed * vol_q16 / 65536`（q16，100% = 65536），静音即 0；
+- **T3.3 实现**：音量在**混音之后、限幅之前**施加；变化时 **20ms 线性插值**（`VOL_RAMP_FRAMES=960`@48k），
+  避免阶跃；`player mix vol` 探针可运行时改（不落盘），真机抓取验证 100/50/0 的幅度比 1:0.5:0。
+- 限幅：混音后超过 -1dBFS（膝点 -1.92dBFS）时按有理函数渐近压回，**无硬削波**；参数见 §3.2。
+  `player stat`/`player mix stat` 的 `limiter`（触发样本数）、`limiter_peak`（限幅前峰值）与
+  `clip`（硬削波数，恒 0）是真机自证字段。
 
 ### 3.6 上行编码（确定）
 
@@ -138,7 +161,7 @@ TTS(MP3) ─┐
   - **边收边解**：只把「凑满整帧」的数据交给 minimp3（其在数据不足分支会重置解码器、丢比特池）；跨帧连续线性重采样（游标 + 上一块末样本 carry），帧边界不重复淡入淡出、无缝隙；欠载时补静音继续走 I2S 时钟，每次连续欠载计 1 次 `underruns` 并限频 WARN。
   - **收尾**：`tts_end` 后先解完 ring 内数据，切 100ms 收尾环线性淡出 → 既有静音冲刷/关 TX → 300ms 尾部延时 → 完成回调（`src=TTS_STREAM`）；abort（cancel/error/断链/新轮次/响应超时）立即关 TX、丢弃 ring、回调 `ok=false`。
   - **云端要求（T2.4 实测新增）**：服务端必须关闭 Nagle（`TCP_NODELAY`）。Nagle + 端侧 delayed ACK 会把均匀 TTS 帧攒批 ~200ms 再交付，任何预缓冲都会被打穿（mock 已默认开启，真实云端同样必须）。
-  - **整段路径**保留给本地/探针（`audio_player_play_mp3`）；PCM 预分配上限从 1.5MB 下调到 **512KB**（`mp3_test.py` 48/48 仍过）。
+  - **整段路径**保留给本地/探针（`audio_player_play_mp3`），**T3.3 起走 `CH_MUSIC`**（音乐通道，`player duck` 可验证 R3 duck；`mp3_test.py` 48/48 仍过）；PCM 预分配上限从 1.5MB 下调到 **512KB**。流式 TTS 走 `CH_TTS`，提示音走 `CH_PROMPT`。
 
 ---
 
@@ -171,7 +194,7 @@ TTS(MP3) ─┐
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发；入站回调支持主回调 + 附加订阅（T2.5，业务与 console 观测并存） | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_subscribe()`, `ws_unsubscribe()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
 | `audio_fe` | L2 音频引擎 | AFE 封装：**半双工门控仲裁（T3.2：原因位图 `PROMPT/TTS/PROBE` + 恢复丢弃窗口 R5）**、唤醒/VAD 事件（T1.2b 起投 `APP_EVT_WAKE_DETECTED`/`APP_EVT_VAD_*` 到 event_bus，回调仅调试兼容）、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_feed_hold()`, `audio_fe_feed_release()`, `audio_fe_feed_discard_ms()`, `audio_fe_feed_stats_read()`, `audio_fe_feed_enabled()`, `audio_fe_set_feed_enabled()`（旧接口/探针兼容）, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
-| `audio_player` | L2 音频引擎 | 播放引擎：PCM/整段 MP3/**流式 MP3（T2.4）** + 重采样到 48k + 软件音量 + 淡入淡出；**T3.2：输出级打断淡出（R4）与 duck 增益（R3）、输出峰值/停声耗时观测**；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；多通道/HTTP 随 P3–P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_fade_out_and_stop()`, `audio_player_set_duck()`, `audio_player_get_duck()`, `audio_player_current_src()`, `audio_player_set_volume()`, `audio_player_stats_read()` |
+| `audio_player` | L2 音频引擎 | 播放引擎：**三通道混音（T3.3：`CH_TTS`/`CH_PROMPT`/`CH_MUSIC`，PSRAM ring → 饱和相加 → 音量 20ms 插值 → -1dBFS 软限幅 → I2S）** + 重采样到 48k + 淡入淡出；提示音/整段 MP3/TTS 流式分别接入通道；**T3.2：输出级打断淡出（R4）与输出峰值/停声耗时观测；T3.3：duck 改为 `CH_MUSIC` 通道增益**；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；音乐源/HTTP 随 P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_fade_out_and_stop()`, `audio_player_set_duck()`, `audio_player_get_duck()`, `audio_player_current_src()`, `audio_player_set_volume()`, `audio_player_stats_read()`, `audio_player_mix_stats_read()/reset()`, `audio_player_mix_tone()/stop()/capture()/capture_status()/capture_read()` |
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms，定点实现 + VBR，状态/伪栈在 PSRAM，不建任务） | `enc_open()`, `enc_encode(pcm, samples, out, cap, &out_len)`, `enc_flush()`, `enc_reset()`, `enc_close()`, `enc_stats_read()` |
 | `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发、**下行 0x02 接入 `audio_player` 流式播放 + R1/R2（T2.4；T3.2 起经 `audio_fe` 原因位仲裁）**；**不含会话状态机**（归 T3.1 `voice_session`）；T3.1 起回调增加 `VC_EVT_UPLINK_END`/`VC_EVT_ROUND_END` 供状态机驱动，`sid` 由会话机传入；T3.2 起 `vc_interrupt()` 负责 R4 的 `interrupt` 报文 | `vc_init()`, `vc_start(sid)`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_interrupt()`（T3.2：先发 `interrupt` 报文再 cancel）, `vc_is_busy()`, `vc_register_cb()`, `vc_stats_read()` |
 | `music_cloud` | L3 能力 | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
@@ -470,6 +493,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 > **T2.5 实测（2026-10-31，见 STATUS §5）**：加入 `voice_cloud`（`vc` 任务 8KB）后，静态 DIRAM **196,670 B**（+208 B）；`ws://` 内部堆峰值 223,620 B / 最低水位 38,451 B；**wss 握手期（公网 `wss://`）峰值 227,988 B、最低水位 32,339 B、最大块 31,744 B** → 静态 + 堆峰值 = **424,658 B ≤ 440KB（余 25.9KB）**，wss 最低水位高于 30KB 线 2.3KB（预计 ~31KB，实测 32.3KB，符合预期但余量不大）。PSRAM 峰值 902,908 B；`vc` 任务栈 8KB，编码/上行轮次中的历史最低剩余 3,212 B（IDLE 时 7,436 B）。**T2.3/T2.4 加 MP3 解码任务栈与解码缓冲后需再按本口径复核。**
 > **T2.3 实测（2026-10-31，见 STATUS §5）**：加入 minimp3（解码状态/临时区/PCM 缓冲全 PSRAM）后，静态 DIRAM **196,782 B（+112 B）**、`player` 任务栈仍 6KB（MP3 解码后余 3,672 B，补丁把 16.3KB 临时区从栈移到 PSRAM）；`ws://` 内部堆最低水位 36,535 B；**wss 握手期（公网 `wss://echo.websocket.org/.ws`，2 次）峰值 227,552~227,724 B、最低水位 32,471~32,643 B** → 静态 + 堆峰值 = **424,506 B ≤ 440KB（余 26,054 B）**，wss 最低水位高于 30KB 线 2.5~2.6KB。**PSRAM 峰值抬到 2,895,336 B**：MP3 PCM 预分配 1.5MB + 解码状态 27,532 B + `player load` 上传探针 512KB（仅开发期）；常驻（不含上传探针）2,395,008 B。T2.4 改流式后可下调 PCM 预分配。
 > **T2.4 实测（2026-10-31，见 STATUS §5）**：加入流式播放（ring 64KB + stage 6.9KB + 收尾环 9.6KB + ring 读暂存 2KB 全 PSRAM）后，静态 DIRAM **196,998 B（+216 B，全为状态/计数，无新缓冲）**、`player` 栈仍 6KB（流式播放中余 3,544 B）；**wss 握手期（公网 echo，2 次）内部堆峰值 227,432~227,480 B、最低水位 32,671~32,719 B** → 静态 + 堆峰值 = **424,478 B ≤ 440KB（余 26,082 B）**，wss 最低水位高于 30KB 线 **1.95~2.05KB**；**PSRAM 峰值降到 1,446,724 B**（PCM 上限 1.5MB→512KB，常驻不含开发期上传探针）；无新增任务。**注意**：水位余量已不足 2KB，后续任务不得再增加内部 RAM 静态/堆占用。
+> **T3.3 实测（2026-11-01，见 STATUS §5）**：加入三通道混音（3×8192 帧 ring、TTS 泵中转、探针抓取与混音统计）后，静态 DIRAM **199,046 B（+1,720 B）**、**无新增任务**（混音泵/解码/I2S 仍在 `player` 任务内串行，`player` 栈 6KB 不变）；**wss 握手期（公网 `wss://echo.websocket.org/.ws`，idle）内部堆峰值 224,092 B、最低水位 33,711 B** → 静态 + 堆峰值 = **423,138 B ≤ 440KB（余 26.1KB）**，水位高于 30KB 线 2,991 B；`ws://` + 真实语音轮（voice_cloud_test）峰值 226,296 B、最低水位 **31,571 B**（≥30KB，余 851 B，是当前最紧口径）→ 静态+峰值 **425,342 B**。PSRAM 峰值 **1,596,388 B**（三通道 ring 3×16KB + TTS 中转 960 B + 探针抓取 32KB 首次使用时分配；收尾环 9.6KB 随 T3.3 移除）；任务数 17 不变。**余量提醒**：`ws://` 水位只剩 851 B，下一任务仍不得新增内部 RAM 静态/堆/任务栈；wss 口径 T5.3 24h 压测再复测。
 > **T3.1 实测（2026-11-01，见 STATUS §5）**：加入会话状态机 `voice_session` 后，静态 DIRAM **197,094 B（+96 B，状态/统计变量）**、**无新增任务/任务栈**（状态机事件驱动，见 §9.3）；`ws://` 内部堆峰值 **227,736 B**、最低水位 **31,891~32,971 B**（`tts_stream`/`voice_cloud`/e2e 三脚本口径）→ 静态 + 堆峰值 = **424,830 B ≤ 440KB（余 25,888 B）**，`ws://` 最低水位仍 ≥ 30KB。**wss 握手期未复测**：本次没有新增任务/缓冲，wss 路径代码未变，按 T2.4 的 32,671~32,719 B 减去 ~100B 估算仍在 30KB 以上，T5.3 24h 压测时复测入基线。
 
 ### 9.3 任务与核心（确定）
@@ -478,7 +502,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 |---|---|---|---|---|
 | `afe_feed` | 1 | 8 | 4KB | I2S 读 + AFE feed（实时性最高） |
 | `afe_fetch` | 1 | 6 | 4KB | 唤醒/VAD/上行音频输出 |
-| `player` | 1 | 5 | 6KB | MP3 解码（minimp3，状态/临时区在 PSRAM）+ **流式解码/欠载补静音（T2.4）** + 重采样 + 混音 + I2S 写 |
+| `player` | 1 | 5 | 6KB | MP3 解码（minimp3，状态/临时区在 PSRAM）+ **流式解码/欠载补静音（T2.4）** + **三通道混音/音量 20ms 插值/-1dBFS 软限幅/通道 duck 与淡入淡出（T3.3）** + 重采样 + I2S 写（不新增任务，混音泵与解码在同一任务内串行） |
 | `evt` | 0 | 5 | 4KB | 事件分发（`event_bus` 自建 esp_event 循环，T1.2a 起） |
 | `ws` | 0 | 5 | 6KB | WS 状态机/退避/心跳/发送队列（TLS 收发在库任务 `ws_client`） |
 | `vc` | 0 | 4 | 8KB | 上行 Opus 编码 + 发送、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、**下行 0x02 → `audio_player` 流式播放 + R1/R2（T2.4）**（编码在本任务内串行，伪栈在 PSRAM，见 §3.6） |
@@ -523,7 +547,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `ws send <json>` / `ws sendbin [len]` / `ws rxlog on\|off` | WebSocket 双向联调探针（T1.6）：原样发送文本/上行二进制帧、打印下行帧（T2.5 起 rxlog 走附加订阅，与 voice_cloud 并存） |
 | `vc status` / `vc start [sid]` / `vc stop` / `vc cancel` / `vc stat` / `vc reset` | 语音云观测与手动起轮（T2.5/T2.4）：链路状态/sid、轮次与上行帧统计、首帧耗时、下行事件与 `sid` 丢弃计数、**下行音频丢弃帧/字节（窗口外/收尾后/播放器不可用）**；手动起一轮、优雅收尾（补尾帧 + audio_end）、立即放弃（同时打断在播 TTS） |
 | `vs status` / `vs start` / `vs interrupt` / `vs reset` | 会话状态机观测（T3.1）：当前状态/sid 与 VC 状态、轮次（开始/完成/异常/中止）、打断/唤醒丢弃/超时/云端 error 计数、迁移次数与上次状态停留；`vs start` 手动开始一轮（不播应答提示音）、`vs interrupt` 打断当前会话（`vc cancel` + 回 IDLE） |
-| `player stat` / `player reset` / `player mp3` / `player pcm <off> <n>` / `player load begin\|chunk\|<base64>\|end` / `player stream [chunk] [gap_ms]` / `player stream abort` | 播放探针（T2.3/T2.4，`CONFIG_DIAG_ENABLE_PLAYER_TEST` 仅开发期）：base64 分块上传素材到 PSRAM；`player mp3` 整段解码播放；`player stream` 把上传素材按 chunk 喂流式路径（`gap_ms` 制造欠载）、`player stream abort` 打断；`player stat` 追加流式统计行（含 `first_sound_us`/`underrun`/`dur_ms`）；`player pcm` 取回整段解码 PCM 对拍 |
+| `player stat` / `player reset` / `player mp3` / `player pcm <off> <n>` / `player load begin\|chunk\|<base64>\|end` / `player stream [chunk] [gap_ms]` / `player stream abort` / **`player mix stat\|reset\|vol\|tone\|stop\|cap\|dump`** | 播放探针（T2.3/T2.4/T3.3，`CONFIG_DIAG_ENABLE_PLAYER_TEST` 仅开发期）：base64 分块上传素材到 PSRAM；`player mp3` 整段解码播放；`player stream` 把上传素材按 chunk 喂流式路径（`gap_ms` 制造欠载）、`player stream abort` 打断；`player stat` 追加流式统计行（含 `first_sound_us`/`underrun`/`dur_ms`）；`player pcm` 取回整段解码 PCM 对拍；**`player mix` 是三通道混音探针：`tone <CH> <freq> <ms> [amp]` 往通道塞正弦音调（可叠加）、`stat` 看 `MIXSTAT/MIXCH`（音量/限幅/峰值/通道 gain/水位/抓取状态）、`vol` 运行时改音量、`cap <n>` + `dump <off> <n>` 把混音输出（48k 单声道）抓回 PC 做 FFT/包络断言、`stop` 停探针**（tools/mixer_test.py 的验收通道） |
 | `net ping <host>` | 网络连通性 |
 | `mic stat` | 麦克风 RMS/峰值、VAD 状态 |
 | `enc test [ms] [tone\|uplink]` / `enc stat` / `enc dump on\|off` / `enc reset` | 上行 Opus 编码观测（T2.2）：tone=1kHz 正弦、uplink=真实链路（自动排空 ring 积压）；输出帧数/字节/码率/单帧耗时/内存增量；dump 最多 50 帧 hex 供 PC 侧独立解码 |

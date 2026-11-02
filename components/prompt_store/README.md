@@ -24,7 +24,7 @@ pack 里，启动时校验后 **`esp_partition_mmap` 零拷贝映射**，通过 
 
 - 头部 24B（magic `ESPAPK01`、version=1、count、total_len、header CRC32、reserved）；
 - 条目 20B × count（id、offset、length、sample_rate=16000、PCM CRC32）；
-- PCM 从 `align4(24+count*20)` 开始（count=5 → 128），每条 4 字节对齐，16k/16bit/单声道；
+- PCM 从 `align4(24+count*20+4)` 开始（预留 4B 对齐余量；count=5 → 128），每条 4 字节对齐，16k/16bit/单声道；
 - 标准 CRC-32/ISO-HDLC（与 Python `zlib.crc32` 一致）。
 
 ## 降级语义

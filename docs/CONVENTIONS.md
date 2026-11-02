@@ -35,6 +35,7 @@
 - **半双工门控唯一入口（T3.2）**：暂停/恢复收音只能经 `audio_fe_feed_hold()/audio_fe_feed_release()`（原因位 `PROMPT`/`TTS`/`PROBE`，位图归零才恢复）；禁止直接改 `audio_fe` 内部标志或用 `audio_fe_set_feed_enabled()` 绕开仲裁（该接口仅为探针/旧脚本兼容）。R5 的恢复丢弃窗口用 `audio_fe_feed_discard_ms()` 在 release 之前设置。
 - 打断淡出与 duck 统一在 `audio_player` 的输出级（`audio_player_fade_out_and_stop()` / `audio_player_set_duck()`），播放循环不得自己再做一套淡出。
 - **混音/音量/限幅唯一入口（T3.3）**：三通道混音、音量（20ms 插值）、-1dBFS 软限幅、通道包络淡入淡出全部在 `audio_player` 的混音级（`mix_render()`），通道 producer 只产出**原始** 48k 单声道样本；禁止在 producer 里再乘音量/做限幅/做出口淡出（会双算）。通道增益语义：TTS 0dB、PROMPT 在 TTS 活跃时 -6dB、MUSIC 在语音活跃或 `set_duck(true)` 时 -12dB，斜坡 100ms 线性。新功能要"多路同时出声"时，必须注册/复用通道 ring，不要另起播放循环。
+- **提示音资源唯一入口（T3.5）**：提示音一律从 `assets` 分区以 **pack** 形式提供（`tools/prompts_src/*.wav` → `tools/audio_pack.py`），固件只经 `prompt_assets_get()` 取；**禁止再把 PCM 以 C 数组/字面量编进 app**（T3.6 前的临时方案已删除），也禁止在业务组件里直接读 `assets` 分区。更新提示音走 `audio_pack.py --flash`，不改固件/不进代码评审。
 - **异常反馈唯一入口（T3.6）**：异常→用户的反馈统一经 `feedback` 组件（`fb_notify(kind, code, sid)`）：它先投 `APP_EVT_FEEDBACK` 语义事件，再驱动当前语音通道。**禁止其它模块自己调 `audio_player_play_pcm()` 播错误提示音**；以后加屏幕/灯光等展示方式就订阅 `APP_EVT_FEEDBACK`（新组件），不要改 `feedback`/`voice_session`，也不要绕开它另做一套反馈。提示音 R1 门控统一用 `AUDIO_FE_HOLD_PROMPT`。
 - 播放必须淡入 10ms / 淡出 100ms；混音后软限幅 -1dBFS。
 - 唤醒词/VAD 回调里只投递事件，不做耗时操作。
@@ -46,7 +47,7 @@
 - I2S DMA 缓冲必须内部 RAM：`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`。
 - 内部 RAM 预算（**X3-E 定稿，2026-10-31**）：**静态 DIRAM + 运行期堆峰值 ≤ 440KB**，且**最坏场景（wss/TLS 握手期）`sys heap` 最低水位 ≥ 30KB**；超预算先改设计，不靠砍功能硬压。
   - 口径与实测：`idf.py size` 的 DIRAM 已用 + `sys heap` 的「峰值占用」（internal），两者相加对照 440KB；`sys heap` 的「最低水位」对照 30KB。
-  - 当前值（**T3.6 后，2026-11-02**）：静态 **199,286 B** + 内部堆峰值 **224,924 B**（`ws://` 真实语音轮口径）= **424,210 B**（距 440KB 上限余约 26KB）；`ws://` 最低水位 **32,679 B**（≥30KB，余 2,679 B）；共 4 条提示音 PCM 在 flash rodata（~177KB，不计 RAM）；无新增任务。**wss 握手期未复测**（估算 ~32.2KB），T5.3 复测。以下为历史值：T3.4 时静态 **199,094 B** + 内部堆峰值 **224,812 B**（`ws://` 真实语音轮口径）= **423,906 B**（距 440KB 上限余量 26,628 B）；`ws://` 最低水位 **32,983~33,131 B**（≥30KB）；**wss 握手期（公网 echo，idle）静态 + 峰值 = 199,094 + 224,604 = 423,698 B、最低水位 33,271 B**（T3.3 为 423,138 B / 33,711 B，本次 -440B 水位来自 FOLLOW_UP 状态与 esp_timer，仍 ≥30KB）；PSRAM 峰值见 T3.3（1,596,388 B，T3.4 未新增缓冲）。**T3.4（dev_ctrl 按键/LED/静音）静态 DIRAM 199,370 B（+276 B）、不建任务**（两个 esp_timer + 一次 GPIO 读；LED 用周期精确 bit-bang 而非 RMT——RMT 驱动的 IRAM 占用 ~2.2KB + 运行时 symbol 缓冲会击穿水位，实测未引入）；后续仍需节约内部 RAM。T3.3 时为 425,342 B / ws 31,571 B / PSRAM 1,596,388 B；T3.2 时为 424,214 B / ws 32,859 B / PSRAM 1,556,040 B；T3.1 时为 424,830 B / 31,891~32,971 B / PSRAM 1,556,032 B；T2.4 时为 424,478 B / wss 32,671~32,719 B / PSRAM 1,446,724 B；T2.3 时为 424,506 B / wss 32,471~32,643 B / PSRAM 2,895,336 B；T2.5 时为 424,658 B / wss 32,339 B / PSRAM 902,908 B；T2.2 时为 409,918 B / wss 47,051~52,839 B。
+  - 当前值（**T3.5 后，2026-11-02**）：静态 **199,766 B** + 内部堆峰值 **225,120 B**（`ws://` 真实语音轮口径）= **424,886 B**（距 440KB 上限余约 15.4KB）；`ws://` 最低水位 **31,987 B**（≥30KB，余 1,267 B，最紧口径）；提示音 PCM 在 `assets` 分区、**不占 RAM**（mmap 只占 MMU 页）；bin 1,941,792 B、PSRAM 峰值 1,596,380 B；无新增任务。**wss 握手期未复测**（估算 ~31.6KB），T5.3 复测。以下为历史值：T3.6 时静态 **199,286 B** + 内部堆峰值 **224,924 B**（`ws://` 真实语音轮口径）= **424,210 B**（距 440KB 上限余约 26KB）；`ws://` 最低水位 **32,679 B**（≥30KB，余 2,679 B）；共 4 条提示音 PCM 在 flash rodata（~177KB，不计 RAM）；无新增任务。**wss 握手期未复测**（估算 ~32.2KB），T5.3 复测。以下为历史值：T3.4 时静态 **199,094 B** + 内部堆峰值 **224,812 B**（`ws://` 真实语音轮口径）= **423,906 B**（距 440KB 上限余量 26,628 B）；`ws://` 最低水位 **32,983~33,131 B**（≥30KB）；**wss 握手期（公网 echo，idle）静态 + 峰值 = 199,094 + 224,604 = 423,698 B、最低水位 33,271 B**（T3.3 为 423,138 B / 33,711 B，本次 -440B 水位来自 FOLLOW_UP 状态与 esp_timer，仍 ≥30KB）；PSRAM 峰值见 T3.3（1,596,388 B，T3.4 未新增缓冲）。**T3.4（dev_ctrl 按键/LED/静音）静态 DIRAM 199,370 B（+276 B）、不建任务**（两个 esp_timer + 一次 GPIO 读；LED 用周期精确 bit-bang 而非 RMT——RMT 驱动的 IRAM 占用 ~2.2KB + 运行时 symbol 缓冲会击穿水位，实测未引入）；后续仍需节约内部 RAM。T3.3 时为 425,342 B / ws 31,571 B / PSRAM 1,596,388 B；T3.2 时为 424,214 B / ws 32,859 B / PSRAM 1,556,040 B；T3.1 时为 424,830 B / 31,891~32,971 B / PSRAM 1,556,032 B；T2.4 时为 424,478 B / wss 32,671~32,719 B / PSRAM 1,446,724 B；T2.3 时为 424,506 B / wss 32,471~32,643 B / PSRAM 2,895,336 B；T2.5 时为 424,658 B / wss 32,339 B / PSRAM 902,908 B；T2.2 时为 409,918 B / wss 47,051~52,839 B。
   - 两条必须同时满足；**最坏场景下「最低水位 ≥30KB」是更强约束**（堆总量 ~259,843 B → 堆峰值上限约 229,843 B，折合静态+堆 ≤426.8KB）；440KB 上限用于吸收静态 DIRAM 后续增长。**T2.4 后水位余量只剩 ~2KB：后续任务不得再新增内部 RAM 任务栈/静态/堆占用，需要缓冲时放 PSRAM 或复用现有任务。T3.1 即据此把 `voice_session` 改为事件驱动、不新建任务（ARCH §9.3）。**
   - TLS 记录缓冲与握手堆自 X3-F 起在 PSRAM，不计入内部 RAM；旧口径「峰值 ≤310KB」写于 P0（未含 WiFi 栈且只统计堆），已作废。
 - 长时运行场景必须监控堆水位（`diag`），不允许无限增长。
@@ -55,7 +56,7 @@
 
 - 命名：函数/变量 `snake_case`，宏/常量 `UPPER_CASE`，文件与模块同名。
 - 对外接口统一返回 `esp_err_t`，错误码定义在组件头文件。
-- 日志 TAG 固定：`BOARD/AUDIO_IO/AFE/PLAYER/ENC/NET/WS/VC/VS/MC/MS/DEV/FB/DIAG/CFG/EVT/APP`（`APP` 属 `main/` 启动编排，`EVT` 属 `event_bus` 基础服务，`FB` 属 `feedback` 异常反馈，T3.6）；status 迁移 INFO、异常 WARN、失败 ERROR。
+- 日志 TAG 固定：`BOARD/AUDIO_IO/AFE/PLAYER/ENC/NET/WS/VC/VS/MC/MS/DEV/FB/PROMPT/DIAG/CFG/EVT/APP`（`APP` 属 `main/` 启动编排，`EVT` 属 `event_bus` 基础服务，`FB` 属 `feedback` 异常反馈 T3.6，`PROMPT` 属 `prompt_store` 提示音资源 T3.5）；status 迁移 INFO、异常 WARN、失败 ERROR。
 - 注释写"为什么"而非"做了什么"，中文注释。
 - 组件目录模板：
 
@@ -108,6 +109,7 @@ components/<module>/
 - **连续对话调试（T3.7 起）**：默认开启续听窗口（`CONFIG_VS_FOLLOWUP_ENABLE=y`，5s / 最多 5 轮 / 人声确认 250ms）；`vs status` 看「续听」统计与窗口剩余；`vs followup on|off` 运行期开关（不持久化，单轮回归/嘈杂环境用 off）。真机用例 `uv run tools/voice_cloud_test.py --followup --followup-rounds 2`（窗口内 `afplay` 语音即可起下一轮，无需唤醒）；`e2e_voice_test` 每轮会先 `vs followup off` 保持单轮语义。已知限制：环境持续人声可能误触发续听轮（确认窗口+轮数上限兜底）。
 - **按键/静音调试（T3.4 起）**：`dev status` 看静音状态/当前音量/短按与长按计数/事件投递失败；`dev mute [on|off]` 等价长按静音（音量 0，恢复时回原值，不落 NVS）。自动回归 `uv run tools/dev_ctrl_test.py`（21 项不含打断 / 33 项含打断：短按起轮、长按静音往返、播放中按键打断 R4 停声 <100ms、续听窗口内短按退出、堆稳定；`--skip-interrupt` 不需要 mock）。**按键不用手按**：DevKit 的 USB 自动下载电路把 DTR 接到 GPIO0、RTS 接到 EN，脚本保持 `rts=False` 只翻转 `dtr` 即可模拟 BOOT 按键，走的是真实 GPIO 扫描路径；脚本**独占串口**，不要与 `idf.py monitor` 同时开（会抢 DTR）。
 - **异常反馈调试（T3.6 起）**：`fb status` 看活动反馈/通道统计/四类计数；`fb reset` 清统计；`fb test <net|cloud|timeout|tts>` 直接播一条提示音（不起会话，回板人工听感验收用）。自动回归 `uv run tools/error_prompt_test.py`（**场景 A~J、289 项断言**：离线唤醒 / 中途断网 / 云端 error 1 / 云端 3001 / THINKING 超时 / 设备侧 TTS 失败（`--tts-bad-codec`）/ 打断不误播 / 正常轮不误播 / SPEAKING 中报错先停 TTS 再播 / 10 轮稳定；`--self-test` 51 项离线、`--dry-run`、`--scenarios A-C`；脚本独占串口）。设备侧日志契约：`VS: 错误反馈（类别=…，code=…，sid=…）→ 提示音（R1）`、`VS: 错误反馈完成（类别=…，ok=…，时长=… ms）→ IDLE`、`FB: 反馈 kind=… → 播放提示音（…）`、`VS: 会话进入 ERROR（…）`。**注意**：离线唤醒（ws 未 READY）走"不播我在呢、直接播网络未连接"的 T3.6 新链路，脚本已用双分支兼容；单轮/健康检查时 `VS: 会话进入 ERROR（…）` 是预期日志，不算错误（panic/assert 仍 FAIL）。
+- **提示音资源调试（T3.5 起）**：`prompt info` 看 assets pack 状态（mode=flash-mmap/psram-fallback/none、pack 版本/条目/字节数/加载耗时/映射地址、5 条提示音的采样点/时长/PC 地址）；pack 缺失/损坏时 `prompt_store_init()` 报 ERROR 且业务降级（唤醒跳过"我在呢"直接起轮、错误反馈只日志），`prompt info` 显示失败原因。更新提示音：改 `tools/prompts_src/*.wav`（或 `uv run tools/prompt_gen.py` 重生成）→ `uv run tools/audio_pack.py` 生成 `build/assets.bin` → `uv run tools/audio_pack.py --flash <PORT>` → 重启生效（**app 固件不用重编**）；`uv run tools/error_prompt_test.py` 回归四类提示音。pack 格式与校验口径见 `components/prompt_store/README.md`、ARCH §3.4。
 - **板载 LED 已于 2026-11-02 移除**（板载 WS2812 解码不可靠、满白电流触发 BOD，见 PENDING PD-003）：不要在没有硬件结论前重新引入 LED 驱动；`dev_ctrl` 现在只把 GPIO48 拉低保持。
 - **mock 回声测试（T3.1 起，不要固定文案）**：`uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc tools/ws_mock_server.py --asr sensevoice --tts-piper` —— 设备说的话先 ASR 识别，再把**识别文本**用 Piper 合成 24kHz MP3 下发，设备复读；同时验证 ASR 正确性与 TTS/播放链路。`--tts-piper` 与 `--tts-mp3` 互斥、必须配 `--asr`；合成失败只 WARN 回退合成帧。
 
@@ -119,5 +121,6 @@ components/<module>/
 - 禁止绕过 `voice_session` 直接改会话状态。
 - 禁止绕过 `audio_fe_feed_hold/release` 直接改半双工门控（含新增第三路 R1/R2 时各自造开关）。
 - 禁止绕开 `feedback` 另播错误提示音 / 另做一套异常反馈（新通道订阅 `APP_EVT_FEEDBACK`）。
+- 禁止把提示音 PCM 编进 app（必须走 `assets` 分区 pack + `prompt_assets_get()`，见 §3）。
 - 禁止引入未评估的第三方组件（先评估内存/许可证并记入文档）。
 - 禁止在未更新架构文档的情况下改变分层、协议或分区布局。

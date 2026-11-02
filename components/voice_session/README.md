@@ -128,7 +128,7 @@ T3.6 起四类异常（网络未连接 / 云端 error / THINKING 超时 / TTS �
 
 ## 后续
 
-- **T3.5**：提示音资源/提示音表迁 `assets` 分区（`prompt_assets_get()` 接口不变，上层零改动），随后删除 `components/assets`。
+- ✅ **T3.5**：提示音迁 `assets` 分区（`prompt_store` + `esp_partition_mmap` 零拷贝；`prompt_assets_get()` 接口不变，本组件仅补"提示音缺失时跳过应答直接起轮"降级路径）。
 - **T3.7 调优**：真实环境噪声下误触发续听轮的概率与阈值（T5.2 唤醒/误触发基线时一起评估）；
   可考虑按麦克风峰值门控或自适应窗口（当前只有 250ms 人声确认 + 轮数上限兜底）。
 - ✅ T3.6：四类异常反馈（`feedback` 组件 + 提示音，语音只是当前通道；屏幕/灯光订阅 `APP_EVT_FEEDBACK`）；

@@ -122,21 +122,27 @@ TTS(MP3 流/整段) ─┐
 
 > **T3.7 连续对话**：`FOLLOW_UP` 窗口建立在 TTS 的 R2（feed 已恢复）之后；窗口内起轮不再 hold PROMPT（不播提示音），直接进入上行；窗口内按键/断网按 R4/R5 退出。窗口的"人声确认"只依赖 VAD 事件，不改变 R1–R5 语义。
 
-### 3.4 提示音
+### 3.4 提示音（T3.5 迁 assets 分区）
 
-- 资源：`assets` 分区（PCM16 / 16k 单声道），启动时加载索引；**当前实现为临时方案**
-  `components/assets`（C 数组编进 flash rodata），T3.5 迁分区后删除该组件（接口不变：
-  `prompt_assets_get(prompt_id_t)`，上层只认提示音 ID，不直接引用数组）；
+- 资源：`assets` 分区（2M @0x7a0000）内的**自定义只读 pack**（T3.5 方案 D，用户 2026-11-02 拍板）：
+  - 格式：24B 头（magic `ESPAPK01` / version 1 / count / total_len / 头部 CRC32）+ 20B×count 条目
+    （id / offset / length / sample_rate=16000 / PCM CRC32）+ PCM 区（16k/16bit/单声道，4 字节对齐）；
+  - 生成：`tools/audio_pack.py`（源 WAV 在 `tools/prompts_src/`，**单独烧 assets 分区即可替换提示音**，
+    app 固件不用重编、不用重烧）；
+  - 加载：`components/prompt_store`（L1）启动校验 pack → **`esp_partition_mmap` 只读映射**（零拷贝，
+    PCM 仍在 flash，与 T3.6 的 rodata 行为一致）；映射失败回退「分块读入 PSRAM + 逐条 CRC 校验」；
+    pack 缺失/损坏不致命（`prompt_assets_get()` 返回 NULL，唤醒跳过应答提示音直接起轮、错误反馈只日志）；
+- 上层接口不变：`prompt_assets_get(prompt_id_t)` / `prompt_assets_name()`（T3.6 冻结，迁移零改动）；
+- 资源组（5 条）：`PROMPT_WAKE_OK`（我在呢）、`PROMPT_NET_OFFLINE`、`PROMPT_CLOUD_ERROR`、
+  `PROMPT_TIMEOUT`、`PROMPT_TTS_FAIL`；均 16k/16bit/mono、峰值对齐 -7.82 dBFS、首尾淡入淡出防 pop；
 - 播放：重采样到 48k，走 `CH_PROMPT`（`audio_player_play_pcm()`）；
-- 资源组（T3.6 扩展为 5 条）：`PROMPT_WAKE_OK`（我在呢）、`PROMPT_NET_OFFLINE`、
-  `PROMPT_CLOUD_ERROR`、`PROMPT_TIMEOUT`、`PROMPT_TTS_FAIL`；均 16k/16bit/mono、
-  峰值对齐「我在呢」的 -7.82 dBFS、首尾淡入淡出防 pop；
 - **错误提示音的播放归 `feedback` 组件**（T3.6，见 §8.6）：语音只是**当前唯一反馈通道**，
-  语义事件 `APP_EVT_FEEDBACK` 对外发布，未来屏幕/灯光等通道订阅事件即可，不需要改
-  `feedback`/`voice_session`；R1 门控统一用 `AUDIO_FE_HOLD_PROMPT`（与唤醒应答共用原因位）；
-- 提示音播放中若 TTS 到达：**T3.3 定稿为叠加让位**——提示音不中断，`CH_PROMPT` 在 `CH_TTS`
-  活跃时 duck 到 -6dB（q16=32768，100ms 斜坡），混音后一起输出。T3.6 的异常路径通常先停 TTS
-  再播提示音，因此该让位主要覆盖边界竞态。
+  语义事件 `APP_EVT_FEEDBACK` 对外发布，未来屏幕/灯光等通道订阅事件即可；
+- 提示音播放中若 TTS 到达：T3.3 定稿的 `CH_PROMPT` -6dB 让位仍保留（异常路径通常先停 TTS 再播）。
+
+> **为什么不用 SPIFFS**（ROADMAP 原措辞）：SPIFFS mount 占内部堆，而本项目 wss 水位余量只有 ~2.6KB
+> （CONVENTIONS §4）；自定义 pack 的校验/映射几乎零 RAM，且"单独烧分区替换"目标同样满足。
+> 已按用户 2026-11-02 拍板改为此方案（决策见 PRODUCT_IDEAS §6）。
 
 ### 3.5 音量与限幅
 
@@ -217,7 +223,7 @@ TTS(MP3 流/整段) ─┐
 | `diag` | L3 能力 | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
 | `voice_session` | L4 业务编排 | 会话状态机（IDLE/LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR）、每轮 `sid` 分配、超时/错误策略（THINKING 超时与云端 error → ERROR，同轮不重试）、唤醒编排（T1.2b：订阅 event_bus，播应答提示音并做 R1/R2）、**T3.2：R4 完整打断（淡出→interrupt 报文→R5 丢弃→IDLE）、R3 音乐中唤醒放行、按键事件消费（短按打断/IDLE 起轮）**、**T3.7：连续对话 FOLLOW_UP 续听窗口（窗口内免唤醒起轮、人声确认、轮数上限、窗口内唤醒重开、运行期开关）**、**T3.6：四类异常（网络未连接/云端 error/THINKING 超时/TTS 失败）→ ERROR + `feedback` 播报，提示音完成回调驱动 `ERROR → IDLE`，`CONFIG_VS_ERROR_HOLD_MS` 只作兜底看门狗；唤醒时云端未 READY 直接给"网络未连接"反馈（不先播"我在呢"）；会话中途断网也出声**；**不建任务**（事件驱动，见 §9.3） | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_is_busy()`, `vs_get_state()`, `vs_state_name()`, `vs_reason_name()`, `vs_current_sid()`, `vs_set_followup_enabled()`, `vs_followup_enabled()`, `vs_stats_read()`, `vs_stats_reset()` |
 | `music_session` | L4 业务编排 | 音乐播放控制：播放/暂停/继续/停止/切歌；与语音抢占 | `ms_init()`, `ms_play()`, `ms_pause()`, `ms_resume()`, `ms_stop()` |
-| `assets`（临时） | 资源（不分层） | 提示音资源表（T3.6：5 条 PCM + `prompt_assets_get()`；P3 T3.5 迁到 `assets` 分区后删除该组件，接口不变） | `prompt_assets_get()`, `prompt_assets_name()` |
+| `prompt_store` | L1 基础资源 | **提示音资源存储（T3.5）**：`assets` 分区自定义只读 pack（5 条 16k PCM）→ 启动校验 → `esp_partition_mmap` 零拷贝映射（失败回退 PSRAM + CRC 校验）；pack 缺失/损坏时降级（get 返回 NULL）；**不建任务** | `prompt_store_init()`, `prompt_store_ready()`, `prompt_store_info()`, `prompt_assets_get()`, `prompt_assets_name()` |
 
 ### 4.2 事件总线（确定）
 
@@ -286,7 +292,7 @@ esp-ai/
 │   ├── audio_io/
 │   ├── audio_fe/
 │   ├── audio_player/               # decoder_mp3.c / resample.c / mixer.c / source_http.c / source_file.c
-│   ├── assets/                     # 临时：内置提示音 PCM（P3 迁到 assets 分区后删除）
+│   ├── prompt_store/               # T3.5：提示音 pack（assets 分区）加载/映射（L1）
 │   ├── codec_enc/
 │   ├── config_store/
 │   ├── net_mgr/
@@ -544,7 +550,7 @@ THINKING 超时（10s）───┘
 | ota_0 | app | ota_0 | 0x20000 | 3M | 当前运行固件 |
 | ota_1 | app | ota_1 | 0x320000 | 3M | 预留 OTA 槽位（当前版本不用） |
 | model | data | spiffs | 0x620000 | 1536K | srmodels（WakeNet + VAD） |
-| assets | data | spiffs | 0x7a0000 | 2M | 提示音、默认配置 |
+| assets | data | spiffs(内容非 SPIFFS) | 0x7a0000 | 2M | **提示音自定义只读 pack（T3.5）**：5 条 16k PCM，`tools/audio_pack.py` 生成/烧录；单独烧该分区即可替换提示音 |
 | coredump | data | coredump | 0x9a0000 | 64K | 崩溃现场（已启用落盘：`CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`，`idf.py coredump` 解析） |
 | storage | data | fat | 0x9b0000 | 6400K | 本地音乐/缓存/日志 |
 
@@ -574,6 +580,8 @@ THINKING 超时（10s）───┘
 
 > **T3.6 实测（2026-11-02，见 STATUS §5）**：新增 `components/feedback`（异常反馈路由，**不建任务/不定时器**）与 `assets` 提示音表后，静态 DIRAM **199,286 B（+144 B vs T3.4 收尾，全为状态/统计/资源表）**；`ws://` 真实语音轮（`voice_cloud_test`）内部堆峰值 **224,924 B**、**最低水位 32,679 B（≥30KB，余 2,679 B）** → 静态 + 峰值 = **424,210 B ≤ 440KB（余约 26KB）**；PSRAM 峰值 **1,596,348 B**（未新增缓冲；提示音 PCM 走 flash rodata 共 ~177KB，**不进 RAM**）；无新增任务；`vs_err` 看门狗复用一次性 `esp_timer`（`CONFIG_VS_ERROR_HOLD_MS=3000`）。
 > **Flash 增量**：bin **2,118,464 B（+163,160 B vs T3.4 收尾）**——4 条中文提示音 PCM 占 ~177KB rodata（app 分区 3M，余量仍 ~1MB）；T3.5 迁 `assets` 分区后这部分从 app 移除。**wss 握手期水位 T3.6 未复测**（无新增任务、静态 +144 B、多一个一次 esp_timer，按 T3.7 的 33,271 B 估算 ~32.2KB），归 T5.3。
+
+> **T3.5 实测（2026-11-02，见 STATUS §5）**：提示音迁 `assets` 分区（自定义只读 pack + `esp_partition_mmap` 零拷贝）后，app bin **1,941,792 B（−176,704 B vs T3.6 的 2,118,496 B）**、Flash Data 516,940→337,596 B（−179,344 B，PCM 不再编进 app）；静态 DIRAM **199,766 B（+480 B：`prompt_store` 状态/表 + `diag prompt info`）**、无新增任务；提示音 PCM 常驻 `assets` 分区、**不占 RAM**（mmap 只占 MMU 页）；pack 缺失/损坏时降级不崩溃。**wss 水位未复测**，T5.3 归口。
 
 ### 9.3 任务与核心（确定）
 
@@ -628,6 +636,7 @@ THINKING 超时（10s）───┘
 | `vc status` / `vc start [sid]` / `vc stop` / `vc cancel` / `vc stat` / `vc reset` | 语音云观测与手动起轮（T2.5/T2.4）：链路状态/sid、轮次与上行帧统计、首帧耗时、下行事件与 `sid` 丢弃计数、**下行音频丢弃帧/字节（窗口外/收尾后/播放器不可用）**；手动起一轮、优雅收尾（补尾帧 + audio_end）、立即放弃（同时打断在播 TTS） |
 | `vs status` / `vs start` / `vs interrupt` / `vs reset` / `vs followup on\|off` | 会话状态机观测（T3.1/T3.7）：当前状态/sid 与 VC 状态、轮次（开始/完成/异常/中止）、打断/唤醒丢弃/超时/云端 error 计数、迁移次数与上次状态停留、**续听（续听轮/命中/超时退出/上限退出、窗口剩余）**、**错误反馈（T3.6：四类计数、提示音完成/失败、最近 kind/code/时长）**；`vs start` 手动开始一轮（不播应答提示音）、`vs interrupt` 打断当前会话（`vc cancel` + 回 IDLE）、`vs followup on\|off` 运行期开关续听窗口（不持久化） |
 | `fb status` / `fb reset` / `fb test <net\|cloud\|timeout\|tts>` | 异常反馈观测/试听（T3.6）：当前活动反馈、通道统计（总播放/完成/失败/延迟/丢弃/中止）、四类计数与最近时长；`fb test` 直接触发一条提示音（不起会话，回板人工验收音色/响度用） |
+| `prompt info` | 提示音资源观测（T3.5）：assets pack 是否就绪、模式（flash-mmap / psram-fallback / none）、pack 版本/条目数/字节数/加载耗时/映射地址，以及 5 条提示音的采样点/时长/PC 地址；失败时显示降级原因 |
 | `dev status` / `dev mute [on\|off]` / `dev reset` | 物理交互观测（T3.4）：静音状态与当前音量、按键短/长按计数与事件投递失败；`dev mute` 等价长按（静音=音量 0、恢复原音量，不落 NVS）；`dev reset` 清零统计。**LED 状态指示已于 2026-11-02 移除**（见 PENDING PD-003） |
 | `player stat` / `player reset` / `player mp3` / `player pcm <off> <n>` / `player load begin\|chunk\|<base64>\|end` / `player stream [chunk] [gap_ms]` / `player stream abort` / **`player mix stat\|reset\|vol\|tone\|stop\|cap\|dump`** | 播放探针（T2.3/T2.4/T3.3，`CONFIG_DIAG_ENABLE_PLAYER_TEST` 仅开发期）：base64 分块上传素材到 PSRAM；`player mp3` 整段解码播放；`player stream` 把上传素材按 chunk 喂流式路径（`gap_ms` 制造欠载）、`player stream abort` 打断；`player stat` 追加流式统计行（含 `first_sound_us`/`underrun`/`dur_ms`）；`player pcm` 取回整段解码 PCM 对拍；**`player mix` 是三通道混音探针：`tone <CH> <freq> <ms> [amp]` 往通道塞正弦音调（可叠加）、`stat` 看 `MIXSTAT/MIXCH`（音量/限幅/峰值/通道 gain/水位/抓取状态）、`vol` 运行时改音量、`cap <n>` + `dump <off> <n>` 把混音输出（48k 单声道）抓回 PC 做 FFT/包络断言、`stop` 停探针**（tools/mixer_test.py 的验收通道） |
 | `net ping <host>` | 网络连通性 |

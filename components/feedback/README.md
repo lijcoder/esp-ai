@@ -48,7 +48,7 @@ TTS 流播放期间 `audio_player_play_pcm()` 会返回 `ESP_ERR_INVALID_STATE`�
 ## 内存与实时约束（CONVENTIONS §3/§4）
 
 - 不建任务、不定时器、不在音频任务内 malloc；静态只增加一个小状态结构 + 统计；
-- 提示音 PCM 在 flash rodata（`assets` 组件），通道 ring 复用 `audio_player` 的三通道混音；
+- 提示音 PCM 在 flash 映射区（`assets` 分区 pack，T3.5），通道 ring 复用 `audio_player` 的三通道混音；
 - `fb_notify()` 只做非阻塞调用；完成回调在 `player` 任务上下文，禁止阻塞。
 
 ## 配置与调试

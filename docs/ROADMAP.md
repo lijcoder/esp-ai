@@ -135,7 +135,7 @@
 
 > 参考：ARCHITECTURE §3.3–3.5、§7、§9.3
 >
-> **P3 进度（2026-11-02）**：T3.1（会话状态机）/T3.2（半双工 R1–R5）/T3.3（三通道混音、音量 20ms 插值、-1dBFS 软限幅、通道 duck/淡入淡出）/T3.7（连续对话免唤醒 follow-up）/T3.4（dev_ctrl 按键扫描+去抖、长按静音，不建任务；LED 状态灯后因硬件解码问题移除）/T3.6（错误提示：`feedback` 异常反馈组件 + 四类提示音 + `APP_EVT_FEEDBACK` 可扩展事件，真机 `error_prompt_test` 289 项）已完成，数据见 [STATUS.md](STATUS.md) §5；**P3 只剩 T3.5（提示音资源迁 `assets` 分区，不阻塞主链路）**，其后进入 P4。
+> **P3 完成（2026-11-02）**：T3.1（会话状态机）/T3.2（半双工 R1–R5）/T3.3（三通道混音、音量 20ms 插值、-1dBFS 软限幅、通道 duck/淡入淡出）/T3.7（连续对话免唤醒 follow-up）/T3.4（dev_ctrl 按键扫描+去抖、长按静音，不建任务；LED 状态灯后因硬件解码问题移除）/T3.6（错误提示：`feedback` 异常反馈组件 + 四类提示音 + `APP_EVT_FEEDBACK` 可扩展事件，真机 `error_prompt_test` 289 项）/T3.5（提示音迁 `assets` 分区：自定义只读 pack + `esp_partition_mmap`，可单独烧分区替换；app −176.7KB）全部完成，数据见 [STATUS.md](STATUS.md) §5；**P3 收口，下一阶段 P4 音乐**。
 
 | 编号 | 任务 | 产出 |
 |---|---|---|
@@ -143,11 +143,11 @@
 | T3.2 | 半双工规则 R1–R5 实现与真机验证 | 播放不误唤醒、打断可恢复 |
 | T3.3 | 三通道混音、音量 0~100、软限幅 -1dBFS、淡入淡出 | 播放质量达标 |
 | T3.4 | `dev_ctrl`：短按打断/开始对话、长按静音（**LED 状态模式 2026-11-02 移除**，板载 WS2812 硬件不可靠，见 PENDING PD-003） | 物理交互可用 |
-| T3.5 | 提示音资源制作 + `tools/audio_pack.py` 打包进 `assets` 分区（SPIFFS 镜像）；把临时 `components/assets` 的 C 数组改成"启动时从分区加载索引"，完成后**删除该组件** | 提示音可单独烧 `assets` 分区替换（不重编固件）；app 固件体积下降 |
+| T3.5 | **提示音迁 assets 分区（2026-11-02 完成，方案 D）**：自定义只读 pack（`tools/audio_pack.py` 由 `tools/prompts_src/*.wav` 生成）+ `components/prompt_store`（启动校验 → `esp_partition_mmap` 零拷贝，失败回退 PSRAM）+ 删除 `components/assets`；接口 `prompt_assets_get()` 不变；**单独烧 assets 分区即可替换提示音（app 不动）**；pack 缺失/损坏降级不崩溃。**决策**：不用 SPIFFS（mount 占内部堆，水位余量仅 ~2.6KB），见 ARCH §3.4/PRODUCT_IDEAS §6 | 提示音可单独烧 `assets` 分区替换（不重编固件）；app 固件体积下降（−176.7KB） |
 | T3.6 | **错误提示（2026-11-02 完成）**：新增 `feedback` 异常反馈组件（L3，不建任务）——四类异常（网络未连接 / 云端 error / THINKING 超时 / TTS 失败）→ `ERROR` + 对应中文提示音，播完由完成回调回 `IDLE`（`CONFIG_VS_ERROR_HOLD_MS=3000` 仅兜底看门狗）；语音只是**当前唯一通道**，`APP_EVT_FEEDBACK` 语义事件供未来屏幕/灯光订阅（不改 `feedback`/`voice_session`）；唤醒时云端未 READY 直接给"网络未连接"反馈；会话中途断网也出声；设备侧 TTS 无法播放（`VC_EVT_TTS_FAIL`）也归"语音播放失败" | 异常有明确反馈（语音 + 日志 + 可断言状态） |
 | T3.7 | **连续对话（免唤醒 follow-up）**：`FOLLOW_UP` 续听窗口（默认 5s / 最多 5 轮续听 / 人声确认 250ms）、窗口内直接说话免唤醒且不播提示音；静音超时/轮数上限/按键/断网退出；窗口内唤醒 = 重开一轮；`vs followup on\|off` 运行期开关 | 免唤醒连续多轮对话 |
 
-**验收**：按键打断 < 100ms；连续 10 轮对话内部堆稳定（无单调下降）；**四类异常各自有提示音 + 日志（T3.6 验收：`error_prompt_test` 场景 A~J 289 项）**。~~LED 状态与实际状态一致~~（LED 已于 2026-11-02 移除，见 PENDING PD-003）。
+**验收**：按键打断 < 100ms；连续 10 轮对话内部堆稳定（无单调下降）；**四类异常各自有提示音 + 日志（T3.6 验收：`error_prompt_test` 场景 A~J 289 项）**；**提示音可单独烧 `assets` 分区替换（T3.5 验收：app 不变，替换后重启生效）**。~~LED 状态与实际状态一致~~（LED 已于 2026-11-02 移除，见 PENDING PD-003）。
 
 ### P4 音乐（D20–D26）
 

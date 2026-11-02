@@ -1,12 +1,12 @@
-menu "Dev Ctrl（按键/LED/静音，T3.4）"
+menu "Dev Ctrl（按键/静音，T3.4）"
 
     config DEV_ENABLE
-        bool "启用按键/LED 控制（dev_ctrl）"
+        bool "启用按键/静音控制（dev_ctrl）"
         default y
         help
             ARCHITECTURE §4.1：GPIO0 按键扫描（短按投 APP_EVT_BUTTON 由 voice_session 消费）、
-            长按静音切换、WS2812 LED 状态指示。关闭后组件全部接口为空实现（链接不报错），
-            按键/LED/静音能力同时消失；量产不建议关闭（物理交互是半双工打断的兜底手段）。
+            长按静音切换。关闭后组件全部接口为空实现（链接不报错），
+            物理交互能力同时消失；量产不建议关闭（按键是半双工打断的兜底手段）。
 
     config DEV_BUTTON_DEBOUNCE_MS
         int "按键去抖时间（毫秒）"
@@ -25,28 +25,5 @@ menu "Dev Ctrl（按键/LED/静音，T3.4）"
         help
             按住超过该时长触发长按（静音切换），释放时不再报短按。
             常见语音助手取 500ms~1s，600ms 兼顾误触与响应速度。
-
-    config DEV_LED_ENABLE
-        bool "启用 WS2812 LED 状态指示"
-        default n
-        depends on DEV_ENABLE
-        help
-            **当前默认关闭（2026-11-02 真机问题）**：板载 WS2812 在 GPIO48 上被正常驱动，
-            但实测数据解码不可靠 —— 发送任何颜色（含全黑帧）灯都恒定显示满白，
-            偶发一次蓝色闪；满白电流（约 60mA）叠加 WiFi 启动峰值会让 5V 掉到 BOD 阈值，
-            导致设备反复复位（`E BOD: Brownout detector was triggered`）。
-            详见 docs/PENDING.md PD-003。解决前不要默认打开，否则板子会启动即复位。
-
-            关闭后：GPIO48 完全不碰（灯保持上电锁存状态）、静音切换**仍然可用**
-            （静音只改 audio_player 音量，与 LED 解耦）；`dev led` 系列命令返回不支持。
-
-    config DEV_LED_BRIGHTNESS
-        int "LED 亮度（0-255）"
-        range 1 255
-        default 24
-        depends on DEV_LED_ENABLE
-        help
-            WS2812 满亮度非常刺眼，室内取小值（24/255 ≈ 10%）；
-            闪烁与常亮都用该亮度渲染。
 
 endmenu

@@ -1,21 +1,18 @@
 /*
- * dev_ctrl —— 按键扫描 / LED 状态指示 / 静音切换（L3 能力，T3.4）。
+ * dev_ctrl —— 按键扫描 / 长按静音（L3 能力，T3.4）的唯一对外头文件。
  *
- * 职责边界（ARCHITECTURE §4.1/§4.2/§7）：
- *   - GPIO0（板载 BOOT 键）短按/长按扫描与去抖，投递 APP_EVT_BUTTON（payload T3.2 定稿）；
- *     短按事件由 voice_session 消费（会话中 = R4 打断、IDLE = 起一轮）；
- *   - 长按 = 静音切换（audio_player 音量 0 / 恢复原音量）+ LED 指示，本组件直接处理；
- *   - LED（WS2812，GPIO48）按会话状态显示：订阅 APP_EVT_VOICE_STATE_CHANGED 映射颜色模式；
+ * 职责边界（ARCHITECTURE §4.1/§4.2/§7/§8.2）：
+ *   - GPIO0 按键扫描（10ms 采样 + 30ms 去抖 + 600ms 长按），投递 APP_EVT_BUTTON；
+ *     短按由 voice_session 消费（会话中 = R4 打断、IDLE = 起轮、FOLLOW_UP 窗口内 = 退出续听）；
+ *   - 长按 = 静音切换（音量 0 / 恢复原值），本组件直接执行。
  *
- * 线程模型：**不新建任务**（内部 RAM 水位余量极小，CONVENTIONS §4）。
- *   - 按键扫描：10ms 周期 esp_timer（esp_timer 任务上下文，只做 GPIO 读 + 整数状态机）；
- *   - LED 闪烁：25ms 周期 esp_timer，静态色时回调直接返回；
- *   - 事件订阅回调在 `evt` 任务上下文，只做内存赋值 + LED 帧发送（RMT 硬件自治，非阻塞）。
+ * **LED 状态指示已移除**（2026-11-02 用户决定）：板载 WS2812（GPIO48）数据解码不可靠，
+ * 任何帧都显示满白，满白电流叠加 WiFi 启动峰值会触发 BOD 复位；详见 docs/PENDING.md PD-003。
+ * 本组件现在只把该引脚拉低保持（防止上电噪声锁存亮色），不再驱动任何帧。
  */
 #pragma once
 
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -24,33 +21,19 @@
 extern "C" {
 #endif
 
-/* LED 显示模式（AUTO = 跟随会话状态；其余为 console 探针强制指定） */
-typedef enum {
-    DEV_LED_AUTO = 0,     /* 跟随 APP_EVT_VOICE_STATE_CHANGED */
-    DEV_LED_IDLE,         /* 绿色常亮（暗） */
-    DEV_LED_LISTENING,    /* 青色常亮 */
-    DEV_LED_THINKING,     /* 黄色 2Hz 闪烁 */
-    DEV_LED_SPEAKING,     /* 蓝色常亮 */
-    DEV_LED_FOLLOW_UP,    /* 绿色 2Hz 闪烁（续听窗口） */
-    DEV_LED_ERROR,        /* 红色 4Hz 闪烁 */
-    DEV_LED_MUTE,         /* 白色常亮（静音覆盖，优先级最高） */
-    DEV_LED_MODE_COUNT,
-} dev_led_mode_t;
-
-/* 按键/LED 观测统计（`dev status` 用，累计值） */
+/* 按键/静音观测统计（`dev status` 用，累计值） */
 typedef struct {
-    uint32_t short_presses;  /* 短按次数（已投递） */
-    uint32_t long_presses;   /* 长按次数（已处理静音切换） */
-    uint32_t posts_dropped;  /* 事件队列满导致的投递失败次数 */
-    uint32_t led_frames;     /* LED 已发送帧数（WS2812 事务数） */
+    uint32_t short_presses; /* 短按次数（已投递） */
+    uint32_t long_presses;  /* 长按次数（已处理静音切换） */
+    uint32_t posts_dropped; /* 事件队列满导致的投递失败次数 */
 } dev_stats_t;
 
 /* 按键动作回调（附加观测用；与 APP_EVT_BUTTON 并存，回调在 esp_timer 任务上下文） */
 typedef void (*dev_button_cb_t)(void *arg, uint8_t action);
 
 /**
- * @brief 初始化按键扫描与 LED（须在 board_init / audio_player_init / vs_init 之后：
- *        依赖 GPIO 已配置、音量已恢复、订阅状态事件时不漏初始迁移）。
+ * @brief 初始化按键扫描（须在 board_init / audio_player_init 之后）。
+ *        LED 引脚在此被拉低并保持（LED 功能已移除）。
  */
 esp_err_t dev_init(void);
 
@@ -62,45 +45,6 @@ bool dev_is_muted(void);
 
 /** 静音切换（长按与 console `dev mute` 共用入口）：mute=true 音量→0，false 恢复原音量 */
 esp_err_t dev_set_mute(bool mute);
-
-/** 设置 LED 模式（DEV_LED_AUTO 恢复跟随会话状态；console `dev led` 探针用） */
-esp_err_t dev_led_set_mode(dev_led_mode_t mode);
-
-/** 当前 LED 模式 */
-dev_led_mode_t dev_led_get_mode(void);
-
-/** 运行期亮度（0~255），覆盖 Kconfig 默认值（不持久化，T3.4 调试/观感校准用） */
-esp_err_t dev_led_set_brightness(uint8_t brightness);
-
-/** 当前运行期亮度 */
-uint8_t dev_led_get_brightness(void);
-
-/** 直接发一帧原始 RGB（不做亮度缩放、不改模式；`dev led rgb` 调试用） */
-esp_err_t dev_led_raw_rgb(uint8_t r, uint8_t g, uint8_t b);
-
-/** 切换 WS2812 时序预设（0..dev_led_preset_count()-1；`dev led timing` 调试用） */
-esp_err_t dev_led_set_preset(int preset);
-
-/** 时序预设总数 */
-unsigned dev_led_preset_count(void);
-
-/** 当前时序预设号 */
-int dev_led_get_timing_preset(void);
-
-/** 时序预设名（打印用；越界返回 "?"） */
-const char *dev_led_preset_name(int preset);
-
-/** 打印自检信息（时序预设/实测循环开销/整帧 cycle）；返回实测开销 cycle 数 */
-unsigned dev_led_selfcheck(void);
-
-/** 依次把 bit0 高电平从 500ns 缩到 100ns 并各发一帧全黑（约 10s，看灯何时变黑） */
-void dev_led_sweep_t0h(void);
-
-/** 发任意字节序列（MSB 先发）：试 RGB(3 字节) / RGBW(4 字节) 等变体 */
-esp_err_t dev_led_send_bytes(const uint8_t *data, size_t n);
-
-/** 实测四段脉宽（ns） */
-esp_err_t dev_led_measure_segments(uint16_t *t0h, uint16_t *t0l, uint16_t *t1h, uint16_t *t1l);
 
 /** 读取统计（out 为空返回 ESP_ERR_INVALID_ARG） */
 esp_err_t dev_stats_read(dev_stats_t *out);

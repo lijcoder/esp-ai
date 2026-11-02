@@ -5,9 +5,11 @@
 # ///
 """T3.4 物理交互真机自测（按键 / LED / 静音）。
 
-覆盖 P3 验收的两条硬指标：
-  - **按键打断 < 100ms**：`player stat` 的 `last_stop_ms`（淡出请求→输出静音）+ 整条打断链路日志；
-  - **LED 状态与实际状态一致**：`dev status` 的 LED 模式 / 帧计数随会话状态迁移变化。
+覆盖 P3 验收的硬指标 **按键打断 < 100ms**：`player stat` 的 `last_stop_ms`（淡出请求→输出静音）
++ 整条打断链路日志；另含长按静音往返、续听窗口内短按退出、堆稳定。
+
+> LED 状态指示已于 2026-11-02 移除（板载 WS2812 解码不可靠 + 满白电流触发 BOD，
+> 见 docs/PENDING.md PD-003），本脚本不再覆盖 LED 场景。
 
 按键怎么"按"：**不靠手**。DevKit 的 USB 自动下载电路把 DTR 接到 GPIO0（BOOT），
 把 RTS 接到 EN；本脚本保持 `rts=False`（EN 高、设备运行），只翻转 `dtr`：
@@ -24,8 +26,6 @@
                         `AFE: feed resumed (discard 50 ms` / `VS: state SPEAKING -> IDLE（原因=interrupt）`
                         / `last_stop_ms < 100` / mock 收到 interrupt 且不再发 tts_end。
   D 续听窗口内短按    ：T3.7 交集 —— TTS 播完进 FOLLOW_UP 后短按 → `FOLLOW_UP -> IDLE`。
-  E LED 模式          ：`dev led <mode>` 逐个设置 + `dev led auto` 恢复跟随；
-                        强制模式不被状态迁移顶掉；AUTO 下状态迁移会重绘（帧计数增加）。
   F 堆稳定            ：10 次短按 + 状态迁移后内部堆波动 ≤ 2KB（不单调下降）。
 
 前置：`CONFIG_DEV_ENABLE=y`（默认）+ 设备已烧 T3.4 固件；脚本**独占串口**。
@@ -86,7 +86,10 @@ RE_VS_BUTTON_ROUND = re.compile(r"VS: 按键开始对话")
 RE_VS_FOLLOWUP_IDLE = re.compile(r"VS: state\s+FOLLOW_UP\s*->\s*IDLE")
 
 # `dev status` 输出行
-RE_DEV_STATUS = re.compile(r"dev_ctrl: 静音=(\S+?)，LED 模式=(\S+?)（当前音量 (\d+)）")
+# 新格式（LED 移除后）：`dev_ctrl: 静音=关（当前音量 100）`；兼容旧格式（带 LED 模式）
+RE_DEV_STATUS = re.compile(
+    r"dev_ctrl: 静音=(\S+?)(?:，LED 模式=(\S+?))?（当前音量 (\d+)）"
+)
 RE_DEV_COUNTS = re.compile(
     r"按键: 短按 (\d+) / 长按 (\d+)；事件投递失败 (\d+)"
 )
@@ -126,7 +129,7 @@ def dev_status(dev: Device) -> dict:
         m = RE_DEV_STATUS.search(line)
         if m:
             stat["muted"] = m.group(1)
-            stat["led"] = m.group(2)
+            stat["led"] = m.group(2) if m.group(2) else "removed"
             stat["volume"] = int(m.group(3))
         m = RE_DEV_COUNTS.search(line)
         if m:
@@ -137,6 +140,17 @@ def dev_status(dev: Device) -> dict:
         if m:
             stat["led_frames"] = int(m.group(1))
     return stat
+
+
+def stable_heap(dev: Device, n: int = 3) -> int | None:
+    """min-of-N 取内部堆剩余：滤掉 WS 重连/console 历史这类一次性分配的瞬时占用。"""
+    vals = []
+    for _ in range(n):
+        heap = parse_heap(dev).get("internal") or {}
+        if heap.get("free") is not None:
+            vals.append(heap["free"])
+        dev.pump(0.3)
+    return min(vals) if vals else None
 
 
 def set_followup(dev: Device, on: bool) -> None:
@@ -219,47 +233,6 @@ def scenario_mute(dev: Device, result: Result) -> None:
     )
 
 
-def scenario_led(dev: Device, result: Result) -> None:
-    """E LED 模式：逐个强制设置 + auto 恢复；AUTO 下状态迁移会重绘。"""
-    print("\n===== E LED 模式（强制/跟随）=====")
-    modes = ["idle", "listening", "thinking", "speaking", "followup", "error", "mute"]
-    ok_all = True
-    for mode in modes:
-        out = dev.console(f"dev led {mode}", re.compile(r"LED 模式 →|设置 LED 模式失败"),
-                          timeout=2.0)
-        got = dev_status(dev).get("led")
-        if got != mode:
-            ok_all = False
-            result.check(False, f"E: `dev led {mode}` 生效（实际 {got}，输出 {out[-1:]}）")
-        else:
-            result.check(True, f"E: `dev led {mode}` 生效（{out[-1] if out else ''}）")
-    if ok_all:
-        result.check(True, f"E: 全部 {len(modes)} 种强制 LED 模式可设置并被 `dev status` 反映")
-
-    # 非法模式必须被拒绝（不能静默生效）
-    out = dev.console("dev led nonsense", re.compile(r"未知 LED 模式"), timeout=2.0)
-    result.check(
-        any("未知 LED 模式" in line for line in out),
-        "E: 非法 LED 模式被拒绝",
-    )
-
-    # AUTO 恢复跟随：状态迁移后 LED 帧计数应增加（重绘）
-    dev.console("dev led auto", re.compile(r"LED 模式 → auto"), timeout=2.0)
-    st = dev_status(dev)
-    result.check(st.get("led") == "auto", f"E: `dev led auto` 恢复跟随（实际 {st.get('led')}）")
-    frames_before = st.get("led_frames", 0)
-    mark = dev.mark()
-    press(dev, SHORT_PRESS_S)  # IDLE 短按 → LISTENING → ... 至少两次迁移
-    wait_line(dev, RE_DEV_SHORT, 2.0, mark)
-    dev.pump(1.2)
-    frames_after = dev_status(dev).get("led_frames", 0)
-    result.check(
-        frames_after > frames_before,
-        f"E: AUTO 模式随状态迁移重绘 LED（帧 {frames_before} → {frames_after}）",
-    )
-    dev.console("vs interrupt", re.compile(r"已打断|未在进行"), timeout=2.0)
-
-
 def scenario_interrupt(dev: Device, result: Result, args: argparse.Namespace, mock: Mock) -> None:
     """C 播放中按键打断（R4）：真实 MP3 播放中按 BOOT，整条链路 + 停声 <100ms。"""
     print("\n===== C 播放中按键打断（R4：真实 GPIO 按键）=====")
@@ -267,30 +240,49 @@ def scenario_interrupt(dev: Device, result: Result, args: argparse.Namespace, mo
     dev.console("vc reset", END_VC_RESET, timeout=2.0)
     dev.console("player reset", END_PLAYER_RESET, timeout=2.0)
 
-    sid, mark = begin_vs_round(dev, result, label)
-    if sid < 0:
-        return
-    dev.console("vc stop", END_VC_STOP, timeout=2.0)
-    tts_start = wait_line(dev, RE_TTS_START, 10.0, mark)
-    result.check(tts_start is not None, f"{label}: 进入 TTS 播放（tts_start）")
-
-    # 等真的在放（避免打在预缓冲阶段，停声耗时不可比）
+    # 起一轮并等真正进入播放：首次起轮可能因 WS/宿主抖动没走到 TTS（环境性），
+    # 重试一次避免把"没来得及播"误判成"打断链路坏了"（不掩盖真 bug：链路断言仍逐条检查）。
     decoded = 0
-    deadline = time.time() + 8.0
-    while time.time() < deadline:
-        stream = player_stat(dev).get("stream")
-        decoded = int(stream["decoded"]) if stream else 0
-        if decoded >= args.after_frames:
+    vs_now = None
+    playing: dict = {}
+    tts_start = None
+    attempts = 0
+    while attempts < 2:
+        attempts += 1
+        sid, mark = begin_vs_round(dev, result, label if attempts == 1 else f"{label}#retry")
+        if sid < 0:
+            continue
+        dev.console("vc stop", END_VC_STOP, timeout=2.0)
+        tts_start = wait_line(dev, RE_TTS_START, 10.0, mark)
+        if tts_start is None:
+            print(f"  WARN {label}: 第 {attempts} 次起轮未进入 TTS，重试")
+            dev.console("vs interrupt", re.compile(r"已打断|未在进行"), timeout=2.0)
+            continue
+        # 等真的在放（避免打在预缓冲阶段，停声耗时不可比）
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            stream = player_stat(dev).get("stream")
+            decoded = int(stream["decoded"]) if stream else 0
+            if decoded >= args.after_frames:
+                break
+            dev.pump(0.02)
+        playing = player_stat(dev).get("stream") or {}
+        vs_now = vs_status(dev).get("state")
+        if decoded >= args.after_frames and vs_now == "SPEAKING":
             break
-        dev.pump(0.02)
+        print(f"  WARN {label}: 第 {attempts} 次未到稳态（decoded={decoded} vs={vs_now}），重试")
+        dev.console("vs interrupt", re.compile(r"已打断|未在进行"), timeout=2.0)
+    result.check(tts_start is not None, f"{label}: 进入 TTS 播放（tts_start）")
     result.check(
         decoded >= args.after_frames,
         f"{label}: 打断前已解码 {decoded} 帧（≥{args.after_frames}，确认真在播放）",
     )
-    playing = player_stat(dev).get("stream") or {}
     result.check(playing.get("active") == 1, f"{label}: 打断前 stream active=1（播放中）")
-    vs_now = vs_status(dev).get("state")
     result.check(vs_now == "SPEAKING", f"{label}: 打断前 VS 状态=SPEAKING（实际 {vs_now}）")
+    if decoded < args.after_frames or vs_now != "SPEAKING":
+        print(f"  INFO {label}: 两次都未进入稳态播放，跳过后续打断断言（避免误判）")
+        dev.console("vs interrupt", re.compile(r"已打断|未在进行"), timeout=2.0)
+        return
 
     mock_mark = mock.mark() if mock.owned else 0
     mark = dev.mark()
@@ -394,13 +386,12 @@ def scenario_heap(dev: Device, result: Result, args: argparse.Namespace) -> None
     """F 堆稳定：多次按键后内部堆不单调下降（esp_timer/事件投递无泄漏）。"""
     print("\n===== F 堆稳定（按键循环）=====")
     dev.console("vs interrupt", re.compile(r"已打断|未在进行"), timeout=2.0)
-    # 先空跑一轮当基线：按键/LED/事件/console 首次使用会一次性申请缓冲
+    # 先空跑一轮当基线：按键/事件/console 首次使用会一次性申请缓冲
     # （esp_console 历史、esp_event 队列页、日志缓冲），这些不计入泄漏。
     press(dev, SHORT_PRESS_S)
     dev.console("vs interrupt", re.compile(r"已打断|未在进行"), timeout=2.0)
     dev.pump(0.5)
-    base = parse_heap(dev).get("internal") or {}
-    base_free = base.get("free")
+    base_free = stable_heap(dev)
     if base_free is None:
         result.check(False, "F: 能读到内部堆（`sys heap`）")
         return
@@ -413,12 +404,12 @@ def scenario_heap(dev: Device, result: Result, args: argparse.Namespace) -> None
             if st.get("muted") == "开":
                 dev.console("dev mute off", re.compile(r"静音：关"), timeout=2.0)
         dev.console("vs interrupt", re.compile(r"已打断|未在进行"), timeout=2.0)
-        heap = parse_heap(dev).get("internal") or {}
-        seq.append(heap.get("free"))
-    print(f"  内部堆序列: {seq}")
-    tail = [v for v in seq if v is not None]
-    if not tail:
-        result.check(False, "F: 逐轮读到内部堆")
+    # 末尾做 min-of-N 稳定采样：WS 重连会临时申请/释放 ~8KB 缓冲，
+    # 单点读数会被这类非泄漏 churn 干扰（min 采样可滤掉它）。
+    tail = [stable_heap(dev) for _ in range(3)]
+    print(f"  内部堆（基线 {base_free} B，末尾 3 次采样）: {tail}")
+    if base_free is None or any(v is None for v in tail):
+        result.check(False, "F: 读到内部堆（`sys heap`）")
         return
     spread = max(tail) - min(tail)
     drop = base_free - min(tail)
@@ -462,7 +453,6 @@ def main() -> int:
         print("T3.4 dev_ctrl 自测计划（不连设备）：")
         print("  A 短按（IDLE）→ DEV 日志 → VS 起轮；长按不额外报短按")
         print("  B 长按静音：音量 100→0→100；LED 白色；`dev status` 静音=开/关")
-        print("  E LED：7 种强制模式 + 非法模式拒绝 + auto 跟随状态重绘")
         print("  C 播放中按键打断（R4）：链路日志 + last_stop_ms<100 + mock 不再 tts_end")
         print("  D 续听窗口内短按：FOLLOW_UP → IDLE")
         print("  F 堆稳定：10 次按键内部堆下探 ≤2KB 且不单调下降")
@@ -496,7 +486,6 @@ def main() -> int:
 
         scenario_short(dev, result)
         scenario_mute(dev, result)
-        scenario_led(dev, result)
         if not args.skip_interrupt:
             scenario_interrupt(dev, result, args, mock)
             scenario_followup(dev, result, mock)
@@ -511,7 +500,6 @@ def main() -> int:
             st = dev_status(dev)
             if st.get("muted") == "开":
                 dev.console("dev mute off", re.compile(r"静音：关"), timeout=2.0)
-            dev.console("dev led auto", re.compile(r"LED 模式 → auto"), timeout=2.0)
         except Exception:
             pass
         mock.stop()

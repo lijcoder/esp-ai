@@ -192,7 +192,7 @@ TTS(MP3 流/整段) ─┐
 
 | 模块 | 层级 | 确定职责 | 对外接口 |
 |---|---|---|---|
-| `board` | L0 板级/驱动 | 引脚定义、按键、初始化顺序（LED 待 `dev_ctrl` 任务接入） | `board_init()`, `board_button_pressed()` |
+| `board` | L0 板级/驱动 | 引脚定义、按键、初始化顺序（板载 LED 引脚保留定义但**功能已移除**，见 PENDING PD-003） | `board_init()`, `board_button_pressed()` |
 | `audio_io` | L0 板级/驱动 | I2S0 RX（16k 采集）/ I2S1 TX（48k 播放）HAL | `audio_io_init()`, `audio_io_read_mic()`, `audio_io_write_spk()`, `audio_io_spk_enable()` |
 | `config_store` | L1 基础服务 | NVS 读写（音量、设备状态）+ 独占 `nvs_flash_init`；编译期常量（WiFi/WS/设备参数）走 Kconfig | `cfg_init()`, `cfg_get_int()`, `cfg_get_int_or()`, `cfg_set_int()`, `cfg_get_str()`, `cfg_set_str()`, `cfg_get_volume()`, `cfg_set_volume()`, `cfg_erase_key()` |
 | `net_mgr` | L1 基础服务 | WiFi STA 连接、退避重连、SNTP 对时、网络事件（无独立任务：事件回调 + 一次性定时器） | `net_init()`, `net_is_up()`, `net_wait_ready(ms)`, `net_is_time_synced()`, `net_get_info()`, `net_reconnect()` |
@@ -203,7 +203,7 @@ TTS(MP3 流/整段) ─┐
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms，定点实现 + VBR，状态/伪栈在 PSRAM，不建任务） | `enc_open()`, `enc_encode(pcm, samples, out, cap, &out_len)`, `enc_flush()`, `enc_reset()`, `enc_close()`, `enc_stats_read()` |
 | `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发、**下行 0x02 接入 `audio_player` 流式播放 + R1/R2（T2.4；T3.2 起经 `audio_fe` 原因位仲裁）**；**不含会话状态机**（归 T3.1 `voice_session`）；T3.1 起回调增加 `VC_EVT_UPLINK_END`/`VC_EVT_ROUND_END` 供状态机驱动，`sid` 由会话机传入；T3.2 起 `vc_interrupt()` 负责 R4 的 `interrupt` 报文 | `vc_init()`, `vc_start(sid)`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_interrupt()`（T3.2：先发 `interrupt` 报文再 cancel）, `vc_is_busy()`, `vc_register_cb()`, `vc_stats_read()` |
 | `music_cloud` | L3 能力 | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
-| `dev_ctrl` | L3 能力 | 按键事件（GPIO0 扫描/去抖 → `APP_EVT_BUTTON`）、LED 状态模式（WS2812 周期精确 bit-bang，无 RMT 依赖）、静音切换（长按，音量 0/恢复原值）；**T3.4 不建任务**（两个 esp_timer） | `dev_init()`, `dev_register_cb()`, `dev_is_muted()`, `dev_set_mute()`, `dev_led_set_mode()`, `dev_led_get_mode()`, `dev_stats_read()/reset()` |
+| `dev_ctrl` | L3 能力 | 按键事件（GPIO0 扫描/去抖 → `APP_EVT_BUTTON`）、静音切换（长按，音量 0/恢复原值）；**T3.4 不建任务**（一个 10ms esp_timer）；**LED 状态指示已于 2026-11-02 移除**（板载 WS2812 解码不可靠→满白→BOD，见 PENDING PD-003），仅把 GPIO48 拉低保持 | `dev_init()`, `dev_register_cb()`, `dev_is_muted()`, `dev_set_mute()`, `dev_stats_read()/reset()` |
 | `diag` | L3 能力 | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
 | `voice_session` | L4 业务编排 | 会话状态机（IDLE/LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR）、每轮 `sid` 分配、超时/错误策略（THINKING 超时与云端 error → ERROR，同轮不重试）、唤醒编排（T1.2b：订阅 event_bus，播应答提示音并做 R1/R2）、**T3.2：R4 完整打断（淡出→interrupt 报文→R5 丢弃→IDLE）、R3 音乐中唤醒放行、按键事件消费（短按打断/IDLE 起轮）**、**T3.7：连续对话 FOLLOW_UP 续听窗口（窗口内免唤醒起轮、人声确认、轮数上限、窗口内唤醒重开、运行期开关）**；**不建任务**（事件驱动，见 §9.3） | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_is_busy()`, `vs_get_state()`, `vs_state_name()`, `vs_reason_name()`, `vs_current_sid()`, `vs_set_followup_enabled()`, `vs_followup_enabled()`, `vs_stats_read()`, `vs_stats_reset()` |
 | `music_session` | L4 业务编排 | 音乐播放控制：播放/暂停/继续/停止/切歌；与语音抢占 | `ms_init()`, `ms_play()`, `ms_pause()`, `ms_resume()`, `ms_stop()` |
@@ -401,7 +401,7 @@ esp-ai/
 2. 状态迁移统一经 `voice_session`，其它模块不得直接改状态；
 3. 所有迁移打 INFO 日志（`voice` tag），包含 `sid` 与停留时长；
 4. `ERROR` 状态不自动重试，由用户再次唤醒触发新一轮；
-5. **按键（T3.2/T3.4）**：任意活跃状态短按 = R4 打断 → `IDLE`（`FOLLOW_UP` 窗口内短按 = 退出续听回 `IDLE`）；`IDLE` 短按 = `vs_start()` 直接进 `LISTENING`（不播应答提示音）；长按 = 静音切换（由 `dev_ctrl` 自己处理，`voice_session` 忽略）。按键来源自 T3.4 起是真实 GPIO0（`dev_ctrl` 的 10ms 扫描 + 30ms 去抖），console `evt post BUTTON` 保留为注入探针。
+5. **按键（T3.2/T3.4）**：任意活跃状态短按 = R4 打断 → `IDLE`（`FOLLOW_UP` 窗口内短按 = 退出续听回 `IDLE`）；`IDLE` 短按 = `vs_start()` 直接进 `LISTENING`（不播应答提示音）；长按 = 静音切换（由 `dev_ctrl` 自己处理，`voice_session` 忽略；静音无 LED 指示，见 PENDING PD-003）。按键来源自 T3.4 起是真实 GPIO0（`dev_ctrl` 的 10ms 扫描 + 30ms 去抖），console `evt post BUTTON` 保留为注入探针。
 6. **连续对话（T3.7）**：`FOLLOW_UP` 续听窗口默认 5s、最多 5 轮续听、人声确认 250ms；窗口内直接说话免唤醒且不播提示音；窗口内唤醒词 = 重开一轮；静音超时/轮数上限/按键/断网退出；Kconfig `VS_FOLLOWUP_*` + 运行期 `vs followup on|off`。
 
 > **T3.1 实现状态（2026-11-01）**：
@@ -523,7 +523,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 > **T3.1 实测（2026-11-01，见 STATUS §5）**：加入会话状态机 `voice_session` 后，静态 DIRAM **197,094 B（+96 B，状态/统计变量）**、**无新增任务/任务栈**（状态机事件驱动，见 §9.3）；`ws://` 内部堆峰值 **227,736 B**、最低水位 **31,891~32,971 B**（`tts_stream`/`voice_cloud`/e2e 三脚本口径）→ 静态 + 堆峰值 = **424,830 B ≤ 440KB（余 25,888 B）**，`ws://` 最低水位仍 ≥ 30KB。**wss 握手期未复测**：本次没有新增任务/缓冲，wss 路径代码未变，按 T2.4 的 32,671~32,719 B 减去 ~100B 估算仍在 30KB 以上，T5.3 24h 压测时复测入基线。
 > **T3.7 实测（2026-11-01，见 STATUS §5）**：加入连续对话（FOLLOW_UP 状态 + 一个一次性 `esp_timer` `vs_fup` + 确认/统计字段）后，静态 DIRAM **199,094 B（+48 B vs T3.3，无新任务）**；`ws://` + 真实语音轮（`voice_cloud_test`）内部堆最低水位 **32,983 B（≥30KB）**、峰值占用约 226.5KB → 静态+峰值约 **425.6KB ≤440KB**；新增 esp_timer 约百余字节内部堆（含在峰值内）。**wss 握手期（公网 echo，idle）内部堆峰值 224,604 B、最低水位 33,271 B（≥30KB）** → 静态 + 峰值 = 423,698 B ≤440KB；PSRAM 峰值 1,486,944 B。
 
-> **T3.4 实测（2026-11-01，见 STATUS §5）**：加入 `dev_ctrl`（按键扫描/LED/静音）后，静态 DIRAM **199,370 B（+276 B vs T3.7，无新任务）**；`ws://` + 真实语音轮（`voice_cloud_test`）内部堆峰值 225,688 B、**最低水位 32,579 B（≥30KB，余 2,579 B）** → 静态 + 峰值 = **425,058 B ≤440KB（余 25.5KB）**；PSRAM 峰值 1,596,456 B；任务数 17（连上 WS 时，`ws_client` 在连；断链时显示 16，与 T3.7 一致）。**关键取舍**：LED 驱动**没有用 `esp_driver_rmt`** —— 实测 RMT 会把 ~2.2KB 塞进 IRAM 且运行时还要分配通道/symbol 缓冲（合计 ~3.4KB 内部池），会把水位压到 30KB 线以下（本任务先按 RMT 实现并实测确认后才改的 bit-bang）；现方案静态只花 276 B。**wss 握手期未复测**（代码路径未变，按 T3.7 的 33,271 B 减 ~0.4KB 估算仍有 ~32.9KB），T5.3 复测。
+> **T3.4 实测（2026-11-01，见 STATUS §5）**：加入 `dev_ctrl`（按键扫描/LED/静音）后，静态 DIRAM **199,370 B（+276 B vs T3.7，无新任务）**；`ws://` + 真实语音轮（`voice_cloud_test`）内部堆峰值 225,688 B、**最低水位 32,579 B（≥30KB，余 2,579 B）** → 静态 + 峰值 = **425,058 B ≤440KB（余 25.5KB）**；PSRAM 峰值 1,596,456 B；任务数 17（连上 WS 时，`ws_client` 在连；断链时显示 16，与 T3.7 一致）。**关键取舍**：LED 驱动**没有用 `esp_driver_rmt`** —— 实测 RMT 会把 ~2.2KB 塞进 IRAM 且运行时还要分配通道/symbol 缓冲（合计 ~3.4KB 内部池），会把水位压到 30KB 线以下（本任务先按 RMT 实现并实测确认后才改的 bit-bang）；现方案静态只花 276 B。**2026-11-02 该 LED 驱动已整体移除**（硬件解码不可靠，见 PENDING PD-003），静态 RAM 进一步下降，`dev_ctrl` 只保留按键+静音。**wss 握手期未复测**（代码路径未变，按 T3.7 的 33,271 B 减 ~0.4KB 估算仍有 ~32.9KB），T5.3 复测。
 
 ### 9.3 任务与核心（确定）
 
@@ -543,7 +543,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 > 上表是**应用任务**；IDF 库任务（`sys_evt`、`wifi`、`esp_timer`、`Tmr Svc`、`IDLE`、`ipc`）不在此表。
 > `transport_ws` 的 `esp_websocket_client` 另建一个库任务 `ws_client`（核 0 / 优先级 5 / 6KB，T1.4 起），收包回调在它上面执行。
 > `voice_session`（T3.1）**不建任务**：状态机事件驱动，handler 分别跑在 `evt`、`ws_client`、`player` 完成回调与 console/timer 上下文。原计划的 4KB 任务会击穿内部 RAM 水位（T2.4 实测 wss 握手期最低只剩 32.7KB，CONVENTIONS §4 要求 ≥30KB），故不采用；状态迁移是纯内存操作，不需要独立任务上下文。
-> `dev_ctrl`（T3.4）**不建任务**：上表原计划的 `dev`（3KB）改为两个 `esp_timer` —— 按键扫描 10ms 周期、LED 闪烁 25ms 周期（静态色时回调一次比较后立即返回）。内部 RAM 水位余量不足 1KB（见 §9.2），`dev` 任务栈 3KB 会直接击穿「wss 握手期 ≥30KB」；扫描/闪烁都是整数状态机 + 一次非阻塞 GPIO 写，放在 timer 任务上下文足够。
+> `dev_ctrl`（T3.4）**不建任务**：上表原计划的 `dev`（3KB）改为一个 10ms `esp_timer` 做按键扫描（LED 闪烁定时器随 LED 功能于 2026-11-02 一并移除）。内部 RAM 水位余量不足 1KB（见 §9.2），`dev` 任务栈 3KB 会直接击穿「wss 握手期 ≥30KB」；扫描/闪烁都是整数状态机 + 一次非阻塞 GPIO 写，放在 timer 任务上下文足够。
 > `net_mgr` 的 WiFi/IP 事件处理器运行在 `sys_evt` 任务上，其栈由 `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096` 提供（P1 T1.3 实测默认 2304 B 时只剩 380 B，已加栈）。
 
 ---
@@ -576,7 +576,7 @@ music_session ──mc_request──> 服务端 ──music_track{url}──> pl
 | `ws send <json>` / `ws sendbin [len]` / `ws rxlog on\|off` | WebSocket 双向联调探针（T1.6）：原样发送文本/上行二进制帧、打印下行帧（T2.5 起 rxlog 走附加订阅，与 voice_cloud 并存） |
 | `vc status` / `vc start [sid]` / `vc stop` / `vc cancel` / `vc stat` / `vc reset` | 语音云观测与手动起轮（T2.5/T2.4）：链路状态/sid、轮次与上行帧统计、首帧耗时、下行事件与 `sid` 丢弃计数、**下行音频丢弃帧/字节（窗口外/收尾后/播放器不可用）**；手动起一轮、优雅收尾（补尾帧 + audio_end）、立即放弃（同时打断在播 TTS） |
 | `vs status` / `vs start` / `vs interrupt` / `vs reset` / `vs followup on\|off` | 会话状态机观测（T3.1/T3.7）：当前状态/sid 与 VC 状态、轮次（开始/完成/异常/中止）、打断/唤醒丢弃/超时/云端 error 计数、迁移次数与上次状态停留、**续听（续听轮/命中/超时退出/上限退出、窗口剩余）**；`vs start` 手动开始一轮（不播应答提示音）、`vs interrupt` 打断当前会话（`vc cancel` + 回 IDLE）、`vs followup on\|off` 运行期开关续听窗口（不持久化） |
-| `dev status` / `dev mute [on\|off]` / `dev led <auto\|idle\|listening\|thinking\|speaking\|followup\|error\|mute>` / `dev reset` | 物理交互观测（T3.4）：静音状态与当前音量、LED 模式、按键短/长按计数与事件投递失败、LED 已发送帧数；`dev mute` 等价长按（静音=音量 0、恢复原音量，不落 NVS）；`dev led <mode>` 强制 LED 模式（`auto` 恢复跟随会话状态，非法模式被拒绝）；`dev reset` 清零统计 |
+| `dev status` / `dev mute [on\|off]` / `dev reset` | 物理交互观测（T3.4）：静音状态与当前音量、按键短/长按计数与事件投递失败；`dev mute` 等价长按（静音=音量 0、恢复原音量，不落 NVS）；`dev reset` 清零统计。**LED 状态指示已于 2026-11-02 移除**（见 PENDING PD-003） |
 | `player stat` / `player reset` / `player mp3` / `player pcm <off> <n>` / `player load begin\|chunk\|<base64>\|end` / `player stream [chunk] [gap_ms]` / `player stream abort` / **`player mix stat\|reset\|vol\|tone\|stop\|cap\|dump`** | 播放探针（T2.3/T2.4/T3.3，`CONFIG_DIAG_ENABLE_PLAYER_TEST` 仅开发期）：base64 分块上传素材到 PSRAM；`player mp3` 整段解码播放；`player stream` 把上传素材按 chunk 喂流式路径（`gap_ms` 制造欠载）、`player stream abort` 打断；`player stat` 追加流式统计行（含 `first_sound_us`/`underrun`/`dur_ms`）；`player pcm` 取回整段解码 PCM 对拍；**`player mix` 是三通道混音探针：`tone <CH> <freq> <ms> [amp]` 往通道塞正弦音调（可叠加）、`stat` 看 `MIXSTAT/MIXCH`（音量/限幅/峰值/通道 gain/水位/抓取状态）、`vol` 运行时改音量、`cap <n>` + `dump <off> <n>` 把混音输出（48k 单声道）抓回 PC 做 FFT/包络断言、`stop` 停探针**（tools/mixer_test.py 的验收通道） |
 | `net ping <host>` | 网络连通性 |
 | `mic stat` | 麦克风 RMS/峰值、VAD 状态 |

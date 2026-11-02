@@ -1560,28 +1560,7 @@ static int cmd_vs(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
-/* ---------------- dev 命令（按键/LED/静音观测，T3.4） ---------------- */
-
-static const char *const k_led_mode_names[DEV_LED_MODE_COUNT] = {
-    [DEV_LED_AUTO] = "auto",     [DEV_LED_IDLE] = "idle",   [DEV_LED_LISTENING] = "listening",
-    [DEV_LED_THINKING] = "thinking", [DEV_LED_SPEAKING] = "speaking",
-    [DEV_LED_FOLLOW_UP] = "followup", [DEV_LED_ERROR] = "error", [DEV_LED_MUTE] = "mute",
-};
-
-static bool dev_parse_led_mode(const char *text, dev_led_mode_t *out)
-{
-    for (int i = 0; i < DEV_LED_MODE_COUNT; i++) {
-        if (k_led_mode_names[i] != NULL && strcmp(text, k_led_mode_names[i]) == 0) {
-            *out = (dev_led_mode_t)i;
-            return true;
-        }
-    }
-    if (strcmp(text, "follow-up") == 0 || strcmp(text, "follow_up") == 0) {
-        *out = DEV_LED_FOLLOW_UP;
-        return true;
-    }
-    return false;
-}
+/* ---------------- dev 命令（按键/静音观测，T3.4） ---------------- */
 
 static void print_dev_status(void)
 {
@@ -1591,35 +1570,26 @@ static void print_dev_status(void)
         printf("读取 dev_ctrl 统计失败\n");
         return;
     }
-    printf("dev_ctrl: 静音=%s，LED 模式=%s（当前音量 %u）\n", dev_is_muted() ? "开" : "关",
-           k_led_mode_names[dev_led_get_mode()] ? k_led_mode_names[dev_led_get_mode()] : "?",
+    printf("dev_ctrl: 静音=%s（当前音量 %u）\n", dev_is_muted() ? "开" : "关",
            (unsigned)audio_player_get_volume());
     printf("  按键: 短按 %" PRIu32 " / 长按 %" PRIu32 "；事件投递失败 %" PRIu32 "\n",
            st.short_presses, st.long_presses, st.posts_dropped);
-    printf("  LED: 已发送 %" PRIu32 " 帧\n", st.led_frames);
 #if CONFIG_DEV_ENABLE
-    printf("  按键参数: 去抖 %d ms / 长按 %d ms（GPIO0）\n",
-           CONFIG_DEV_BUTTON_DEBOUNCE_MS, CONFIG_DEV_BUTTON_LONG_PRESS_MS);
-#if CONFIG_DEV_LED_ENABLE
-    printf("  LED 参数: 亮度 %u/255（Kconfig 默认 %d，dev bright 可改）/ 时序预设 %d: %s"
-           "（GPIO48）\n",
-           (unsigned)dev_led_get_brightness(), CONFIG_DEV_LED_BRIGHTNESS,
-           dev_led_get_timing_preset(), dev_led_preset_name(dev_led_get_timing_preset()));
-#else
-    printf("  LED: CONFIG_DEV_LED_ENABLE=n（编译期裁剪）\n");
-#endif
+    printf("  参数: 去抖 %d ms / 长按 %d ms（GPIO%d 按键）\n",
+           CONFIG_DEV_BUTTON_DEBOUNCE_MS, CONFIG_DEV_BUTTON_LONG_PRESS_MS, 0);
 #else
     printf("  CONFIG_DEV_ENABLE=n（功能编译期裁剪）\n");
 #endif
-    printf("  说明: 短按投 APP_EVT_BUTTON 由 vs 消费（会话中=打断、IDLE=起轮）；"
-           "长按=静音切换；`evt post BUTTON` 仍可模拟短按\n");
+    printf("  LED: 已移除（板载 WS2812 解码不可靠+满白电流触发 BOD，见 PENDING PD-003；"
+           "GPIO48 保持低电平）\n");
+    printf("  说明: 短按投 APP_EVT_BUTTON 由 vs 消费（会话中=打断、IDLE=起轮）；长按=静音切换；"
+           "`evt post BUTTON` 仍可模拟短按\n");
 }
 
 static int cmd_dev(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("用法: dev status | mute [on|off] | led <auto|idle|listening|thinking|speaking|"
-               "followup|error|mute> | reset\n");
+        printf("用法: dev status | mute [on|off] | reset\n");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1651,163 +1621,13 @@ static int cmd_dev(int argc, char **argv)
         return ESP_OK;
     }
 
-    if (strcmp(sub, "led") == 0) {
-        if (argc < 3) {
-            printf("用法: dev led <auto|idle|listening|thinking|speaking|followup|error|mute>\n"
-                   "      dev led rgb <r> <g> <b>      原始 RGB（不做亮度缩放，T3.4 调试）\n"
-                   "      dev led timing [<n>]          查看/切换 WS2812 时序预设\n"
-                   "      dev led selfcheck             打印时序自检（循环开销/帧耗时）\n"
-                   "      dev led sweep                 T0H 扫描（看灯何时从白变黑）\n"
-                   "      dev led measure               实测四段脉宽 ns\n"
-                   "      dev led raw <b0> [b1..]       发任意字节帧（试 RGBW 变体）\n");
-            return ESP_ERR_INVALID_ARG;
-        }
-        if (strcmp(argv[2], "rgb") == 0) {
-            if (argc < 6) {
-                printf("用法: dev led rgb <r 0-255> <g 0-255> <b 0-255>\n");
-                return ESP_ERR_INVALID_ARG;
-            }
-            const int r = atoi(argv[3]), g = atoi(argv[4]), b = atoi(argv[5]);
-            if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
-                printf("RGB 取值必须 0~255\n");
-                return ESP_ERR_INVALID_ARG;
-            }
-            esp_err_t err = dev_led_raw_rgb((uint8_t)r, (uint8_t)g, (uint8_t)b);
-            if (err != ESP_OK) {
-                printf("发原始 RGB 失败: %s\n", esp_err_to_name(err));
-                return err;
-            }
-            printf("已发原始 RGB(%d,%d,%d)（不缩放、不改模式；下一个状态迁移会覆盖）\n",
-                   r, g, b);
-            return ESP_OK;
-        }
-        if (strcmp(argv[2], "timing") == 0) {
-            if (argc < 4) {
-                const int cur = dev_led_get_timing_preset();
-                printf("当前时序预设: %d / %u；可用预设：\n", cur, dev_led_preset_count());
-                for (unsigned i = 0; i < dev_led_preset_count(); i++) {
-                    printf("  %u: %s%s\n", i, dev_led_preset_name(i),
-                           (int)i == cur ? "  ← 当前" : "");
-                }
-                printf("用法: dev led timing <n>（切换后用 dev led rgb 1 0 0 看是否变红）\n");
-                return ESP_OK;
-            }
-            const int n = atoi(argv[3]);
-            esp_err_t err = dev_led_set_preset(n);
-            if (err != ESP_OK) {
-                printf("切换时序预设失败: %s（0~%u）\n", esp_err_to_name(err),
-                       dev_led_preset_count() - 1);
-                return err;
-            }
-            printf("已切换到时序预设 %d: %s（已按当前模式重绘）\n", n, dev_led_preset_name(n));
-            return ESP_OK;
-        }
-        if (strcmp(argv[2], "raw") == 0) {
-            /* dev led raw 00 18 00        → 3 字节（G R B）
-             * dev led raw 00 18 00 00     → 4 字节（G R B W，试 RGBW 芯片） */
-            if (argc < 4 || argc > 12) {
-                printf("用法: dev led raw <b0> <b1> ...（每个 0~255 或 0xHH，最多 8 字节）\n");
-                return ESP_ERR_INVALID_ARG;
-            }
-            uint8_t data[8];
-            const int n = argc - 3;
-            for (int i = 0; i < n; i++) {
-                const char *tok = argv[3 + i];
-                char *end = NULL;
-                long v = strtol(tok, &end, 0);
-                if (end == tok || *end != '\0' || v < 0 || v > 255) {
-                    printf("非法字节: %s\n", tok);
-                    return ESP_ERR_INVALID_ARG;
-                }
-                data[i] = (uint8_t)v;
-            }
-            esp_err_t err = dev_led_send_bytes(data, (size_t)n);
-            if (err != ESP_OK) {
-                printf("发帧失败: %s\n", esp_err_to_name(err));
-                return err;
-            }
-            printf("已发 %d 字节帧（MSB 先发）：", n);
-            for (int i = 0; i < n; i++) {
-                printf(" %02x", data[i]);
-            }
-            printf("\n");
-            return ESP_OK;
-        }
-        if (strcmp(argv[2], "measure") == 0) {
-            uint16_t t0h = 0, t0l = 0, t1h = 0, t1l = 0;
-            esp_err_t err = dev_led_measure_segments(&t0h, &t0l, &t1h, &t1l);
-            if (err != ESP_OK) {
-                printf("测量失败: %s\n", esp_err_to_name(err));
-                return err;
-            }
-            printf("实测脉宽: T0H=%uns T0L=%uns T1H=%uns T1L=%uns"
-                   "（预设 %d: %s）\n", t0h, t0l, t1h, t1l,
-                   dev_led_get_timing_preset(),
-                   dev_led_preset_name(dev_led_get_timing_preset()));
-            printf("判断: T0H 应 < ~500ns（解 0）、T1H 应 > ~600ns（解 1）；"
-                   "若两者接近则灯无法区分\n");
-            return ESP_OK;
-        }
-        if (strcmp(argv[2], "sweep") == 0) {
-            printf("开始 T0H 扫描（每步 1.2s，共 9 步，每步发一帧全黑）…\n");
-            printf("请盯着灯：哪一步从白变黑 → 记下屏幕上的 T0H 值告诉我\n");
-            dev_led_sweep_t0h();
-            printf("扫描结束（已恢复原时序并按当前模式重绘）\n");
-            return ESP_OK;
-        }
-        if (strcmp(argv[2], "selfcheck") == 0 || strcmp(argv[2], "check") == 0) {
-            printf("WS2812 时序自检（1.25us*24bit 理论 7200 cycle）…\n");
-            dev_led_selfcheck();
-            printf("（详细数值见 `DEV: selfcheck:` 日志行）\n");
-            return ESP_OK;
-        }
-        dev_led_mode_t mode;
-        if (!dev_parse_led_mode(argv[2], &mode)) {
-            printf("未知 LED 模式: %s（也可用 rgb|timing|selfcheck）\n", argv[2]);
-            return ESP_ERR_INVALID_ARG;
-        }
-        esp_err_t err = dev_led_set_mode(mode);
-        if (err != ESP_OK) {
-            printf("设置 LED 模式失败: %s\n", esp_err_to_name(err));
-            return err;
-        }
-        printf("LED 模式 → %s%s\n", k_led_mode_names[mode],
-               mode == DEV_LED_AUTO ? "（跟随会话状态）" : "（强制，dev led auto 恢复）");
-        return ESP_OK;
-    }
-
-    if (strcmp(sub, "bright") == 0) {
-        if (argc < 3) {
-#if CONFIG_DEV_LED_ENABLE
-            printf("当前亮度 %u / 255（Kconfig 默认 %d）。用法: dev bright <0-255>\n",
-                   (unsigned)dev_led_get_brightness(), CONFIG_DEV_LED_BRIGHTNESS);
-#else
-            printf("CONFIG_DEV_LED_ENABLE=n，亮度不可用\n");
-#endif
-            return ESP_OK;
-        }
-        const int v = atoi(argv[2]);
-        if (v < 0 || v > 255) {
-            printf("亮度取值必须 0~255\n");
-            return ESP_ERR_INVALID_ARG;
-        }
-        esp_err_t err = dev_led_set_brightness((uint8_t)v);
-        if (err != ESP_OK) {
-            printf("设置亮度失败: %s（CONFIG_DEV_LED_ENABLE=n 时不可用）\n",
-                   esp_err_to_name(err));
-            return err;
-        }
-        printf("LED 亮度 → %d / 255（运行期，不落 NVS）\n", v);
-        return ESP_OK;
-    }
-
     if (strcmp(sub, "reset") == 0) {
         esp_err_t err = dev_stats_reset();
         printf("dev 统计已清零\n");
         return err;
     }
 
-    printf("未知子命令: %s（可用: status | mute [on|off] | led <mode> | reset）\n", sub);
+    printf("未知子命令: %s（可用: status | mute [on|off] | reset；LED 已移除）\n", sub);
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -2548,9 +2368,8 @@ static esp_err_t register_commands(void)
         },
         {
             .command = "dev",
-            .help = "按键/LED/静音：dev status | mute [on|off] | bright [0-255] | "
-                    "led <mode|rgb r g b|timing [n]|selfcheck> | reset（T3.4）",
-            .hint = "status|mute|bright|led|reset",
+            .help = "按键/静音：dev status | mute [on|off] | reset（T3.4；LED 已移除）",
+            .hint = "status|mute|reset",
             .func = cmd_dev,
         },
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST

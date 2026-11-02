@@ -636,10 +636,13 @@ audio_player.h` 的 `audio_player_mix_*` 接口注释、`audio_player.c` 的 `mi
   FFT 幅度与幅度比、音量线性、E 的 duck 幅度/RMS、淡入/淡出/斜率/软限幅/堆判定，含正负例）和
   `--dry-run`（打印执行计划 + 同一套自检）。真机基线（每场景实测值）待 Lead 烧录 T3.3 固件后回填本节。
 
-## dev_ctrl_test.py —— 按键/LED/静音真机自测（T3.4）
+## dev_ctrl_test.py —— 按键/静音真机自测（T3.4）
 
-**作用**：验证 P3 的两条物理交互验收 —— **按键打断 < 100ms** 与 **LED 状态与实际状态一致**，
-外加长按静音往返、续听窗口内短按退出、堆稳定。
+**作用**：验证 P3 的物理交互验收 —— **按键打断 < 100ms**，外加长按静音往返、
+续听窗口内短按退出、堆稳定。
+
+> **LED 状态指示已于 2026-11-02 移除**（板载 WS2812 解码不可靠、满白电流触发 BOD，
+> 见 [PENDING.md](../docs/PENDING.md) PD-003），脚本不再覆盖 LED 场景。
 
 **按键怎么"按"（不需要手）**：DevKit 的 USB 自动下载电路把 **DTR 接到 GPIO0（BOOT）**、**RTS 接到 EN**。
 脚本保持 `rts=False`（EN 高、设备运行），只翻转 `dtr`：`dtr=True` = 按住 BOOT（GPIO0 拉低）、
@@ -661,13 +664,14 @@ uv run tools/dev_ctrl_test.py --no-reset --log /tmp/dev.log
 | B 长按静音 | 音量 100→0（`PLAYER: volume=0`）→ 再长按 0→100 恢复；`dev status` 静音=开/关；**长按只触发一次、松开不再报短按** |
 | C 播放中打断（R4） | mock 真实 MP3 播放中按 BOOT：`VS: 打断当前会话` / `PLAYER: fade out` / `VC: interrupt sent sid=` / `AFE: feed resumed` / `VS: state SPEAKING -> IDLE（原因=interrupt）`；**`last_stop_ms < 100`**；mock 收到 `interrupt` 且**不再发 `tts_end`**；打断后能正常起新一轮 |
 | D 续听窗口内短按（T3.7 交集） | TTS 播完进 `FOLLOW_UP` → 短按 → `VS: state FOLLOW_UP -> IDLE` |
-| E LED 模式 | 7 种强制模式（idle/listening/thinking/speaking/followup/error/mute）逐个生效并被 `dev status` 反映；非法模式被拒绝；`dev led auto` 恢复跟随，状态迁移时 LED 帧计数增加 |
 | F 堆稳定 | 10 次按键循环后内部堆波动/下探 ≤2KB 且不单调下降（预热一轮排除一次性缓冲） |
 
 ### 实测基线（2026-11-01，T3.4 固件）
 
-**53/53 PASS**。关键数据：`last_stop_ms=80~86`（P3 验收 <100ms，80ms 淡出 + 一个 10ms 输出块）；
-内部堆循环波动 32 B、相对预热基线下探 12 B；短按 10 / 长按 7；全程无 DEV/PLAYER/VS 相关 ERROR。
+**51/51 PASS**（`--skip-interrupt` 为 21/21）。关键数据：`last_stop_ms=80~86`
+（P3 验收 <100ms，80ms 淡出 + 一个 10ms 输出块）；内部堆循环波动 0~32 B；
+短按/长按计数正确；全程无 DEV/PLAYER/VS 相关 ERROR。
+F 场景用 **min-of-3 `sys heap` 采样**，避免 WS 重连临时申请 ~8KB 造成的非泄漏抖动被误判。
 
 ### 参数 / 依赖 / 限制
 

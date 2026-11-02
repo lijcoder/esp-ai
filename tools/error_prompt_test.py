@@ -40,6 +40,11 @@ SPEAKING 中报错）→ 断言设备日志（`VS:`/`FB:`/`PLAYER:`）与 `fb st
     uv run tools/error_prompt_test.py --scenarios C,D,J --log /tmp/error_prompt.log
     uv run tools/error_prompt_test.py --self-test            # 离线自检解析/判定（≥20 项，不连设备）
     uv run tools/error_prompt_test.py --dry-run              # 只检查素材/音量/串口/场景计划（不开串口）
+
+每个 mock 场景开始前有**网络稳定门禁**（`--settle-timeout`，默认 15s）：`wifi status`=UP 且
+`ws status`=READY 连续 2 次（间隔 ≥1s）且 `vs status`=IDLE 才放行——场景 B 的 `wifi reconnect`
+是异步的，等提示音完成 ≠ 网络恢复；J 另有 1 轮预热（Opus 编码器 120KB PSRAM 首用常驻），
+堆水位按"本场景增量"判定（`sys heap` 的全局最低水位会被前序 A/B churn 拉低，不据此判 J）。
 """
 
 from __future__ import annotations
@@ -133,6 +138,15 @@ RE_VC_BAD_CODEC = re.compile(r"VC: tts_start codec=(\w+) 非 ?mp3")
 RE_VC_TIMEOUT = re.compile(r"VC: 等待云端响应超时（(\d+) ms），sid=(\d+) 结束")
 RE_VS_NET_DOWN = re.compile(r"VS: 网络断开（reason=\d+，重试 \d+ ms）→ 结束当前会话")
 RE_WS_READY = re.compile(r"WS: 握手完成（hello_ack）")
+# 网络稳定门禁（T3.6 板测第二轮补充）：场景 B 的 wifi reconnect 是异步的，
+# 等提示音完成 ≠ 网络恢复；进入下一场景前必须等「WiFi UP + WS READY 连续 2 次 + VS IDLE」。
+RE_NET_UP = re.compile(r"NET: 已联网")
+RE_WS_STATE_LINE = re.compile(r"WebSocket 状态: (\w+)")
+RE_WIFI_STATE_LINE = re.compile(r"WiFi 状态: (\w+)")
+END_WS_STATUS = re.compile(r"说明: 每 20s 发 ping")
+SETTLE_INTERVAL_S = 1.0  # 两次 ws READY 采样的最小间隔（契约 §5.2 板测修复要求 ≥1s）
+HEAP_FLOOR_BYTES = 30 * 1024
+PSRAM_DELTA_LIMIT_BYTES = 64 * 1024
 
 # ---------------------------------------------------------------- 健康检查
 RE_ANY_E = re.compile(r"^\s*E \(\d+\)")
@@ -409,6 +423,45 @@ def unexpected_errors(lines: list[str], allow_feedback: bool = True) -> list[str
     return out
 
 
+def parse_ws_state(lines: list[str]) -> str | None:
+    """从 `ws status` 输出解析 WebSocket 状态（IDLE/WAIT_NET/CONNECTING/CONNECTED/READY/BACKOFF）。"""
+    for line in lines:
+        m = RE_WS_STATE_LINE.search(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def parse_wifi_state(lines: list[str]) -> str | None:
+    """从 `wifi status` 输出解析 WiFi 状态（IDLE/CONNECTING/UP）。"""
+    for line in lines:
+        m = RE_WIFI_STATE_LINE.search(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def settle_ok(ws: str | None, wifi: str | None, vs_state: str | None) -> bool:
+    """单次网络稳定判定：WS READY + WiFi UP + 状态机 IDLE（连续两次 READY 由 Runner 保证）。"""
+    return ws == "READY" and wifi == "UP" and vs_state == "IDLE"
+
+
+def heap_watermark_ok(before_min: int, after_min: int, floor: int = HEAP_FLOOR_BYTES) -> bool:
+    """场景 J 的堆水位口径（T3.6 板测第二轮）：只判本场景增量，不用开机以来全局最低值。
+
+    `sys heap` 的「最低水位」是开机以来 watermark（只降不升），A（无 mock 重试）/B（wifi 重连）
+    的 churn 会把全局最低压到 30KB 以下；J 只要求：
+      ① 本场景结束水位 ≥ min(J 前水位, 30KB)（不因历史低位误报）；
+      ② 本场景内无新增下降（after ≥ before）。
+    """
+    return after_min >= before_min and after_min >= min(before_min, floor)
+
+
+def psram_stable_ok(delta: int, limit: int = PSRAM_DELTA_LIMIT_BYTES) -> bool:
+    """J 预热后的 PSRAM 稳定性：free 波动下探不超过 limit（首轮编码器常驻已排除）。"""
+    return delta >= -limit
+
+
 def timeout_duration_ok(seconds: float) -> bool:
     """场景 E：audio_end → 错误提示音开始的耗时应在 9.5~13.0s（10s 超时 + 反馈启动）。"""
     return 9.5 <= seconds <= 13.0
@@ -644,6 +697,45 @@ class Runner:
             self.dev.pump(0.3)
         return False
 
+    def ws_state(self) -> str | None:
+        out = console_until(self.dev, "ws status",
+                            lambda text: "说明: 每 20s 发 ping" in text, timeout=2.0)
+        return parse_ws_state(out)
+
+    def wifi_state(self) -> str | None:
+        out = console_until(
+            self.dev, "wifi status",
+            lambda text: "WiFi 状态:" in text and ("重连:" in text or "未配置" in text),
+            timeout=2.0)
+        return parse_wifi_state(out)
+
+    def wait_net_settled(self, label: str, timeout: float) -> bool:
+        """网络稳定门禁（契约 §5.2 板测修复）：WiFi UP + WS READY 连续 2 次（≥1s）+ VS IDLE。
+
+        为什么单看一次 READY 不够：场景 B 的 `wifi reconnect` 异步完成，设备可能先短暂
+        READY、随后 DHCP/WS 再抖一次（NET_DOWN → WS 停止/重连），下一场景抢跑会被 link-lost
+        打断成 net-offline。连续 1s 稳定 + 状态机 IDLE 才放行。
+        """
+        deadline = time.time() + timeout
+        ready_since: float | None = None
+        while time.time() < deadline:
+            ws = self.ws_state()
+            if ws == "READY":
+                wifi = self.wifi_state()
+                vs = self.vs_status().get("state")
+                if settle_ok(ws, wifi, vs):
+                    now = time.time()
+                    if ready_since is not None and now - ready_since >= SETTLE_INTERVAL_S:
+                        return True
+                    if ready_since is None:
+                        ready_since = now
+                else:
+                    ready_since = None
+            else:
+                ready_since = None
+            self.dev.pump(0.2)
+        return False
+
     def wait_idle(self, timeout: float = 6.0) -> bool:
         end = time.time() + timeout
         while time.time() < end:
@@ -663,7 +755,9 @@ class Runner:
         if self.args.no_mock:
             self.result.warn(f"[{label}] --no-mock：复用外部 mock（期望配置: {describe_spec(spec)}），"
                              "mock 侧断言跳过")
-            return True
+            settled = self.wait_net_settled(label, self.args.settle_timeout)
+            self.result.check(settled, f"[{label}] 网络稳定门禁（wifi UP + ws READY×2 + VS IDLE）")
+            return settled
         if self.mock.spec != spec or self.mock.proc is None:
             if self.mock.owned or self.mock.proc is not None:
                 self.mock.stop()
@@ -671,8 +765,15 @@ class Runner:
             self.mock.start(spec, label)
             ok = self.wait_ws_ready(label, self.args.mock_timeout)
             self.result.check(ok, f"[{label}] mock 就绪（{describe_spec(spec)}）且设备 WS READY")
-            return ok
-        return True
+            if not ok:
+                return False
+            settled = self.wait_net_settled(label, self.args.settle_timeout)
+            self.result.check(settled, f"[{label}] 网络稳定门禁（wifi UP + ws READY×2 + VS IDLE，"
+                                      "防上一场景异步重连/重启抖动）")
+            return settled
+        settled = self.wait_net_settled(label, self.args.settle_timeout)
+        self.result.check(settled, f"[{label}] 网络稳定门禁（wifi UP + ws READY×2 + VS IDLE）")
+        return settled
 
     def start_round(self, label: str) -> tuple[int, int]:
         mark = self.dev.mark()
@@ -918,8 +1019,11 @@ class Runner:
                 vc_state = m.group(1)
         r.check(vc_state == "IDLE", f"[{name}] 无残留轮次（vc status={vc_state}）")
         self.assert_health(name, lines, allow_feedback=True)
-        # 恢复联网，供后续场景重启 mock 后重连
-        self.wait_ws_ready(name, self.args.mock_timeout)
+        # wifi reconnect 是异步的：必须等 NET: 已联网 + 网络稳定（B 的尾巴会污染 C 的 THINKING）
+        netup = self.wait_line(RE_NET_UP, self.args.settle_timeout + 5.0, mark)
+        r.check(netup is not None, f"[{name}] wifi reconnect 后恢复联网（NET: 已联网）")
+        settled = self.wait_net_settled(name, self.args.settle_timeout)
+        r.check(settled, f"[{name}] 网络稳定门禁（wifi UP + ws READY×2 + VS IDLE）后再进下一场景")
 
     # ---- C/D：云端 error（通用 / TTS 错误码） ----
 
@@ -1140,6 +1244,22 @@ class Runner:
 
     # ---- J：稳定性（连续 N 轮云端 error） ----
 
+    def _error_round_once(self, label: str) -> bool:
+        """跑一轮 cloud-error 反馈并等回 IDLE（场景 J 复用同一 mock 配置）。"""
+        sid, mark = self.start_round(label)
+        if sid < 0:
+            return False
+        if not self.end_utterance(label):
+            return False
+        if self.wait_error_feedback_start(label, 15.0, mark) is None:
+            return False
+        if not self.wait_feedback_done_idle(label, "cloud-error", mark):
+            return False
+        if not self.wait_idle():
+            self.result.check(False, f"[{label}] 反馈后回 IDLE")
+            return False
+        return True
+
     def run_j(self) -> None:
         name = "J"
         self.section(name)
@@ -1147,31 +1267,30 @@ class Runner:
         rounds = self.args.stability_rounds
         if not self.ensure_mock(name) or not self.ensure_idle(name):
             return
+
+        # 预热 1 轮（不计入 N，也不计入 fb/vs 计数基线）：Opus 编码器 thread-safe 伪栈
+        # （120KB PSRAM）首次使用后常驻（T2.2 既有口径），预热后再取基线，避免把"首用常驻"
+        # 误判成 J 的 PSRAM 泄漏；同时让首轮编码/网络缓冲一次性分配落在基线之前。
+        j_mark = self.dev.mark()
+        warm_ok = self._error_round_once(f"{name}#warmup")
+        r.check(warm_ok, f"[{name}] 预热轮完成（编码器首用缓冲常驻后再取基线）")
+        if not warm_ok:
+            return
+
         before_fb = self.fb_status()
         before_vs = self.vs_status()
         heap_before = sys_heap(self.dev)
         if "internal" in heap_before:
-            print(f"  堆基线: 内部 free={heap_before['internal']['free']} B / "
-                  f"最低水位={heap_before['internal']['min_free']} B / "
+            print(f"  堆基线（预热后）: 内部 free={heap_before['internal']['free']} B / "
+                  f"min_free={heap_before['internal']['min_free']} B / "
                   f"PSRAM free={heap_before.get('psram', {}).get('free')} B")
         ok_rounds = 0
-        all_lines: list[str] = []
         for i in range(1, rounds + 1):
-            sid, mark = self.start_round(f"{name}#{i}")
-            if sid < 0:
-                break
-            if not self.end_utterance(f"{name}#{i}"):
-                break
-            if self.wait_error_feedback_start(f"{name}#{i}", 15.0, mark) is None:
-                break
-            if not self.wait_feedback_done_idle(f"{name}#{i}", "cloud-error", mark):
-                break
-            if not self.wait_idle():
-                r.check(False, f"[{name}#{i}] 反馈后回 IDLE")
+            if not self._error_round_once(f"{name}#{i}"):
                 break
             ok_rounds += 1
-            all_lines.extend(self.lines_since(mark))
             print(f"  第 {i}/{rounds} 轮 PASS（cloud-error → IDLE）")
+        all_lines = self.lines_since(j_mark)  # 预热 + 正式轮全窗口（健康检查用）
         r.check(ok_rounds == rounds, f"[{name}] 连续 {rounds} 轮错误反馈均完成（实际 {ok_rounds}）")
 
         after_fb = self.fb_status()
@@ -1185,22 +1304,36 @@ class Runner:
         r.check(d_cloud == rounds, f"[{name}] vs status 错误反馈云端 +{rounds}（实际 +{d_cloud}）")
         d_errored = (after_vs.get("rounds_errored") or 0) - (before_vs.get("rounds_errored") or 0)
         r.check(d_errored == rounds, f"[{name}] vs status 异常轮次 +{rounds}（实际 +{d_errored}）")
+
+        # 堆口径（T3.6 板测第二轮）：只看本场景增量，不用开机以来全局最低水位误判 J
         if "internal" in heap_before and "internal" in heap_after:
             before_int = heap_before["internal"]
             after_int = heap_after["internal"]
-            print(f"  堆收尾: 内部 free={after_int['free']} B（基线 {before_int['free']}）/"
-                  f"最低水位 {after_int['min_free']} B")
-            r.check(after_int["min_free"] >= 30 * 1024,
-                    f"[{name}] 内部堆最低水位 {after_int['min_free']} B ≥ 30KB")
+            before_min = before_int["min_free"]
+            after_min = after_int["min_free"]
+            floor = min(before_min, HEAP_FLOOR_BYTES)
+            print(f"  内部堆水位: J 前 min_free={before_min} B（开机以来全局最低）/ J 后 {after_min} B / "
+                  f"判定下限 min(J 前,30KB)={floor} B")
+            if before_min < HEAP_FLOOR_BYTES:
+                r.warn(f"[{name}] J 前全局最低水位 {before_min} B < 30KB 是前序场景 churn（如 A 无 mock "
+                       "重试/B wifi 重连）留下的历史值；J 只判本场景增量，不据此判 FAIL")
+            r.check(heap_watermark_ok(before_min, after_min),
+                    f"[{name}] 本场景水位 {after_min} B ≥ min(J 前 {before_min}, 30KB) 且无新增下降")
             free_delta = after_int["free"] - before_int["free"]
             r.check(free_delta >= -16 * 1024,
                     f"[{name}] 内部堆 free 波动 {free_delta:+d} B ≥ -16KB")
+        else:
+            r.warn(f"[{name}] 未解析到内部堆水位（跳过堆增量断言）")
         if "psram" in heap_before and "psram" in heap_after:
             psram_delta = heap_after["psram"]["free"] - heap_before["psram"]["free"]
-            print(f"  PSRAM free 收尾={heap_after['psram']['free']} B（基线 "
-                  f"{heap_before['psram']['free']}，波动 {psram_delta:+d} B）")
-            r.check(psram_delta >= -64 * 1024,
-                    f"[{name}] PSRAM free 波动 {psram_delta:+d} B ≥ -64KB")
+            print(f"  PSRAM free: J 前={heap_before['psram']['free']} B / J 后="
+                  f"{heap_after['psram']['free']} B（波动 {psram_delta:+d} B；预热后口径 -64KB）")
+            r.check(psram_stable_ok(psram_delta),
+                    f"[{name}] 预热后 PSRAM free 波动 {psram_delta:+d} B ≥ -64KB"
+                    "（首轮编码器 120KB 常驻已排除）")
+        else:
+            r.warn(f"[{name}] 未解析到 PSRAM 堆水位（跳过 PSRAM 增量断言）")
+
         self.assert_health(name, all_lines, allow_feedback=True)
         r.check(not any(RE_FB_WATCHDOG.search(line) for line in all_lines),
                 f"[{name}] 无看门狗超时（正常完成不靠兜底）")
@@ -1582,6 +1715,32 @@ def run_self_test() -> bool:
                 ["E (301) PLAYER: assert failed: buf != NULL"], allow_feedback=True)),
         "S45 LoadProhibited / assert failed 仍 FAIL")
 
+    # ---- 网络稳定门禁 / J 堆水位口径（T3.6 板测第二轮修复） ----
+    ws_lines = ["WebSocket 状态: READY（已请求在线）",
+                "  说明: 每 20s 发 ping、10s 未收 pong 判离线；掉线按 1/2/5/10/30s 退避"]
+    r.check(parse_ws_state(ws_lines) == "READY"
+            and parse_ws_state(["WebSocket 状态: BACKOFF（已请求在线）"]) == "BACKOFF"
+            and parse_ws_state(["I (1) WS: 握手完成（hello_ack）"]) is None,
+            "S46 解析 ws status 状态（READY/BACKOFF/负例）")
+    r.check(parse_wifi_state(["WiFi 状态: UP", "  SSID: x", "  IP: 1.2.3.4，RSSI: -50 dBm"]) == "UP"
+            and parse_wifi_state(["WiFi 状态: CONNECTING", "  IP: （未联网）"]) == "CONNECTING",
+            "S47 解析 wifi status 状态（UP/CONNECTING）")
+    r.check(settle_ok("READY", "UP", "IDLE")
+            and not settle_ok("READY", "UP", "LISTENING")
+            and not settle_ok("READY", "CONNECTING", "IDLE")
+            and not settle_ok("BACKOFF", "UP", "IDLE")
+            and not settle_ok(None, "UP", "IDLE"),
+            "S48 网络稳定判定（ws READY + wifi UP + VS IDLE；任一不满足不放行）")
+    r.check(RE_NET_UP.search("I (123) NET: 已联网：ip=192.168.1.11，开始等待 SNTP 对时") is not None,
+            "S49 识别 B 场景恢复联网日志 `NET: 已联网`")
+    r.check(heap_watermark_ok(26627, 26627) and heap_watermark_ok(35143, 35143)
+            and heap_watermark_ok(35143, 35200) and not heap_watermark_ok(26627, 26000)
+            and not heap_watermark_ok(35143, 34900),
+            "S50 J 堆水位口径：≥min(J 前,30KB) 且无新增下降（历史低位不误判）")
+    r.check(psram_stable_ok(-20000) and psram_stable_ok(-65536)
+            and not psram_stable_ok(-65537) and not psram_stable_ok(-120836),
+            "S51 J 预热后 PSRAM 口径：-64KB 内 PASS（首轮 120KB 常驻已排除）")
+
     ok = result.summary()
     print("\nERROR_PROMPT_TEST: SELF-TEST " + ("PASS" if ok else "FAIL")
           + f"（{len(result.rows)} 项）")
@@ -1613,6 +1772,9 @@ def main() -> int:
                         help="复位后等启动就绪的超时（秒）")
     parser.add_argument("--mock-timeout", type=float, default=MOCK_TIMEOUT_DEFAULT,
                         help="mock 重启后等设备 WS READY 的超时（秒）")
+    parser.add_argument("--settle-timeout", type=float, default=15.0,
+                        help="每个场景开始前的网络稳定门禁超时（WiFi UP + ws READY 连续 2 次≥1s "
+                             "+ VS IDLE；场景 B 的 wifi reconnect 是异步的，必须等稳定再进下一场景）")
     parser.add_argument("--log", default="", help="把完整串口日志写到该文件")
     parser.add_argument("--dry-run", action="store_true",
                         help="只检查素材/音量/串口/场景计划（不打开串口、不连设备）")
@@ -1628,6 +1790,8 @@ def main() -> int:
         raise SystemExit(f"--stability-rounds 必须 >= 1（当前 {args.stability_rounds}）")
     if args.wake_attempts < 1:
         raise SystemExit(f"--wake-attempts 必须 >= 1（当前 {args.wake_attempts}）")
+    if args.settle_timeout < 1.0:
+        raise SystemExit(f"--settle-timeout 必须 >= 1s（当前 {args.settle_timeout}）")
     try:
         parse_scenarios(args.scenarios)
     except SystemExit as exc:

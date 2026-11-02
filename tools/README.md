@@ -14,6 +14,9 @@
 | `tts_stream_test.py` | 下行 TTS **流式播放**真机自测（T2.4 / T3.2 R3–R5）：真实 MP3 经 WS 0x02 下发 → 首帧延迟/欠载/解码对拍/abort/排空/10 轮堆稳定；可选 R4 按键打断、R5 无丢弃、R3 ducking、提示音 R1 原因位 | `uv run tools/tts_stream_test.py`，见下文 |
 | `e2e_voice_test.py` | **端到端语音**真机自测（T2.6）：唤醒 → 上行 Opus → 真实 MP3 下行流式播放 → R2，10 轮稳定性 + P2 验收断言 | `uv run tools/e2e_voice_test.py`，见下文 |
 | `error_prompt_test.py` | **T3.6 错误提示**真机自测：mock 注入云端错误码/时机/坏 codec → 离线唤醒/中途断网/ERROR 反馈/超时/TTS 失败/打断/稳定性，断言 `VS:`/`FB:` 日志与 `fb status`/`vs status`/`mic stat` | `uv run tools/error_prompt_test.py`，见下文 |
+| `audio_pack.py` | **T3.5 提示音资源打包**：`tools/prompts_src/*.wav` → `assets` 分区自定义只读 pack（构建 / `--check` / `--dump` / `--flash`），**只烧分区即可替换提示音、app 不动** | `uv run tools/audio_pack.py`，见下文 |
+| `prompt_gen.py` | **T3.5 提示音源生成**：可复现生成 4 条错误提示音源 WAV（`say`/`afconvert`，仅 macOS）；`--check` 复用 audio_pack 口径；**不再写 C 数组** | `uv run tools/prompt_gen.py`，见下文 |
+| `prompts_src/` | T3.5 提示音**唯一源**：5 条 16 kHz/16 bit/mono 源 WAV + `manifest.json`（PCM sha256/样本数），提交 git | 见「提示音资源」 |
 | `record_wav.py` | 串口采集 WAV，用于唤醒/AEC 实测（**T5.2 计划，尚未实现**） | — |
 
 ## 语音测试素材 —— lexin.wav + 两个交互语音
@@ -872,6 +875,135 @@ uv run tools/error_prompt_test.py --dry-run          # 只检查素材/音量/�
 **与其它脚本的分工**：`voice_test.py` 只验唤醒/拾音（T3.6 起兼容有/无 mock 两条唤醒链）；
 `voice_cloud_test.py`/`tts_stream_test.py` 验协议与流式播放（不应出现错误反馈）；`e2e_voice_test.py`
 验正常端到端；本脚本专测**异常路径的反馈**（谁触发、播哪条、是否收尾、是否误播、资源是否泄漏）。
+
+## 提示音资源（T3.5）—— `prompts_src/` 源 WAV + `audio_pack.py` 打包/烧录
+
+**作用**：T3.5 起 5 条提示音（唤醒「我在呢」+ 4 条错误提示，T3.6 定稿文案）**不再编进 app**，
+而是放在 `assets` 分区（2 M @ `0x7a0000`）里的**自定义只读 pack**：固件启动校验后用
+`esp_partition_mmap()` 零拷贝映射，播放指针指向 flash 映射区（与原 rodata 行为一致），
+app 体积下降约 176 KB，**替换提示音只需重烧 assets 分区、app 固件不用重编/重烧**。
+方案 D（自定义 pack + mmap，不用 SPIFFS）由用户 2026-11-02 拍板；契约冻结在
+`build/t35_contract.md` §2，固件侧结构见 `components/prompt_store/include/prompt_pack.h`，
+设计说明见 [ARCHITECTURE.md](../docs/ARCHITECTURE.md) §3.4 / §9.1。
+
+### 源文件（唯一源，提交 git）
+
+`tools/prompts_src/`：**16 kHz / 16 bit / 单声道 PCM WAV**（44 B 标准 RIFF 头）+ `manifest.json`。
+`wake.wav` 由 T3.6 的 `components/assets/prompt_wo_zai_ne.c` PCM **逐字节**转换而来（迁移基准），
+是**冻结资源**（不从 `say` 重新生成）；4 条错误提示音由 `prompt_gen.py` 生成，且已实测重新生成
+逐字节一致。5 条已与 `build/t36_prompts/*.wav` 试听 WAV 对拍一致。
+
+| 文件 | id | 内容/文案 | 样本数 | 时长 | 峰值 | PCM sha256（LE int16，不含 WAV 头） |
+|---|---|---|---|---|---|---|
+| `wake.wav` | 0 | 我在呢（冻结） | 12,800 | 800.0 ms | 13311 | `40b268d815386eb3cd4c1c53d125b95d95df205e36547f06d41e5ff01addd6f5` |
+| `net-offline.wav` | 1 | 网络未连接 | 17,201 | 1075.1 ms | 13311 | `9efa0dc8ff102a318a5e6064a852c8e82a2d2682f1ad19eb48cbdb92b10bb79d` |
+| `cloud-error.wav` | 2 | 服务出了点问题 | 23,487 | 1467.9 ms | 13311 | `2360cea527bda367bf4087c953d4b0a15a4810fea2ea16f16996ab28190f65e5` |
+| `timeout.wav` | 3 | 响应超时 | 17,325 | 1082.8 ms | 13311 | `de6425c6051f49add87411ce876c225ab46a8711e90088aad46f261142e6faed` |
+| `tts-fail.wav` | 4 | 语音播放失败 | 19,769 | 1235.6 ms | 13311 | `913c7f85819ea9d0ebb69631ed1a20327a066f8e457475ad66ad36c587700aa2` |
+
+`manifest.json`（id 升序；`samples`/`pcm_sha256` 是迁移时记录的**尺寸/内容基准**——旧的
+`prompt_pcm_sizes.h` 删除后由它替代，`--check` 用它抓「源被意外改动」；只有 tools 读它，固件不读）：
+
+```json
+{
+  "version": 1,
+  "sample_rate": 16000,
+  "prompts": [
+    { "id": 0, "name": "wake", "file": "wake.wav", "samples": 12800, "pcm_sha256": "40b268d8…" },
+    { "id": 1, "name": "net-offline", "file": "net-offline.wav", "samples": 17201, "pcm_sha256": "9efa0dc8…" }
+  ]
+}
+```
+
+### pack 格式摘要（小端，冻结）
+
+```
+pack_hdr (24 B):  magic[8]="ESPAPK01" | version u16=1 | count u16=5 | total_len u32
+                  | header_crc32 u32 | reserved u32=0
+pack_entry (20 B × count):
+                  id u8 | reserved[3] | offset u32（4 字节对齐） | length u32（=样本数×2）
+                  | sample_rate u32=16000 | crc32 u32
+PCM 数据区：从 128 B 开始（头部区 24+5×20=124 B 再对齐到 128），每条 4 字节对齐，
+            尾部补 0 到 4 字节；total_len = 整个 pack 字节数（4 字节对齐）。
+CRC32：标准 CRC-32/ISO-HDLC（= zlib.crc32；初值 0xFFFFFFFF、末尾异或 0xFFFFFFFF）；
+       header_crc32 计算时本字段按 0 计。
+```
+
+**当前基线（2026-11-02，本工具产出）**：`build/assets.bin` 共 **181,300 B**（177.05 KB，assets 分区
+2,048 KB 的 8.6%），`header_crc32=0x57808EAE`，pack sha256
+`810c56c689e729dd16a711095ac4dfe40e735e06d0f16b4f60d596a855d5ba59`；条目
+offset = `128 / 25728 / 60132 / 107108 / 141760`，length = `25600 / 34402 / 46974 / 34650 / 39538`，
+crc32 = `0xB340AA4C / 0x650EC26D / 0x2DB36EE5 / 0x18E0A41D / 0x1C6A9D4C`。
+该 pack 已用固件真实校验源码（`components/prompt_store/prompt_pack.c` 编译到 host）验证 **PASS**。
+
+### 校验口径（`--check`，不写文件、不需要硬件）
+
+- **WAV 格式**严格 16 kHz / 16 bit / 单声道 / 未压缩 PCM（`wave` 解析，格式不符直接 FAIL）；
+- **样本数**与 `manifest.json` 声明一致（迁移基准 12800 / 17201 / 23487 / 17325 / 19769）；
+- **时长**：wake 750~850 ms；错误提示 600~2000 ms；
+- **峰值** 12000~14500（T3.6 实际统一 13311 = -7.82 dBFS，「我在呢」与错误提示等响）；
+- **首/尾 20 ms 内 |x| < 200**（防 pop）；**|mean| < 100**（无直流偏置）；
+- **ID 完整性**：id 必须恰好 `0..4` 各一次、按 id 升序、name 与契约一致、文件存在且不重复；
+- **容量/分区守卫**：pack 总长 ≤ assets 分区 2 MB；`partitions.csv` 的 assets 行必须是
+  `0x7a0000 / 2M`（不一致直接拒绝构建/烧录，防止写坏别的分区）；
+- 构建后再用 `--dump` 复算 `header_crc32` 与每条 PCM `crc32`（见下）。
+
+### 构建 / 解析 / 烧录
+
+```bash
+uv run tools/audio_pack.py                        # 校验源 → 构建 build/assets.bin，打印每条 id/样本数/时长/峰值/crc32 与 pack 布局
+uv run tools/audio_pack.py --check                # 只校验源 WAV/manifest，不写文件
+uv run tools/audio_pack.py --dump build/assets.bin        # 解析 pack：头部/条目/位置 + header_crc32/PCM crc32 校验
+uv run tools/audio_pack.py --out /tmp/assets.bin  # 自定义输出路径（同源可重复构建：输出 sha256 一致）
+uv run tools/audio_pack.py --src-dir DIR --manifest DIR/manifest.json   # 自定义源目录/manifest
+```
+
+**烧录（只写 assets 分区，app / bootloader / 分区表都不动）**：
+
+```bash
+uv run tools/audio_pack.py --flash /dev/cu.usbmodem5CF90746951
+# 等价于：esptool --chip esp32s3 -p <port> write_flash 0x7a0000 build/assets.bin
+```
+
+- `--flash` 会**先构建再烧**（保证烧的 pack 与源一致），只实现/调用 esptool，**不复位设备**（烧完按复位键或开 `idf.py monitor` 自动复位）。
+- 本工具只用 stdlib，`uv run` 默认环境没有 esptool，解析顺序：① 当前 Python 有 esptool → `python -m esptool`；② PATH 有 `esptool`/`esptool.py`（IDF 环境自带）→ 直接调用；③ 都没有 → 报错并提示 `uv run --with esptool tools/audio_pack.py --flash <port>`。
+- 烧录前确认串口空闲（**不要**与 `idf.py monitor` 同时开）；脚本独占串口的时间只有 esptool 运行期。
+
+### 只烧 assets 分区替换提示音（app 不动）流程
+
+1. **改源**：直接替换 `tools/prompts_src/<name>.wav`（保持 16 kHz/16 bit/mono；改完先 `uv run tools/audio_pack.py --check`），
+   或 `uv run tools/prompt_gen.py` 重新生成 4 条错误提示音；
+2. `uv run tools/audio_pack.py` → 记下打印的 pack 总长/sha256/header_crc32；
+3. `uv run tools/audio_pack.py --flash /dev/cu.usbmodem...`（**不需要** `idf.py build/flash`；设备复位后生效）；
+4. 复位后在 monitor 里确认：`prompt info` 显示 `mode=mmap`、`version=1`、`count=5`、`total_len=181300`（与构建值一致）；
+   再 `fb test net|cloud|timeout|tts` 试听四类、`afplay tools/lexin.wav` 听唤醒应答；
+5. 回归：`uv run tools/error_prompt_test.py`（289 项）+ `uv run tools/voice_test.py --volume 50`。
+   只烧 assets 时 app 基线不变（动态行为一致）；pack 缺失/损坏不崩：`prompt info` 显示降级原因，
+   唤醒跳过「我在呢」直接起轮、错误反馈只记日志。
+6. **同时改了 app 代码时**：先 `idf.py -p <port> flash` 烧 app，再按上面烧 assets（两个分区独立，顺序不影响）。
+
+### 重新生成 4 条错误提示音（`prompt_gen.py`）
+
+```bash
+uv run tools/prompt_gen.py                         # say -v Tingting → 裁静音/去直流/归一 13311/首尾淡入淡出 → prompts_src/*.wav + manifest
+uv run tools/prompt_gen.py --check                 # = audio_pack.py --check 的校验口径（不合成，非 macOS 也能跑）
+uv run tools/prompt_gen.py --audition-dir build/t35_prompts   # 可选：另存试听副本
+uv run tools/prompt_gen.py --rate 190              # 可选：强制语速（默认按确定性梯子自动挑）
+```
+
+- 生成模式只支持 macOS（`say` + `afconvert`），**产物写 `tools/prompts_src/`**（不再有 C 数组）；
+  同机重复生成逐字节稳定（已实测 5/5 PCM sha256 与 manifest 完全一致），因此 pack 可复现。
+- **`wake.wav` 不会被重新生成**（T3.1 冻结资源）：脚本只读取/校验它，缺失时报错要求从 git 恢复；
+  想换唤醒应答音属于听感变更，需单独走评审（会改变迁移对拍基准）。
+- 默认语速梯子：200 → 190/210 → …，选第一个让 4 条**全部**满足契约（时长/峰值/首尾静音/直流）的语速（本机 200）；
+  改文案/语速会改变 PCM → 需同步 `docs/ARCHITECTURE.md` §3.4 的 5 条资源表与 `build/t36_contract.md` 口径。
+
+### 约束与边界
+
+- pack **只读**、启动时校验一次并常驻映射（不 unmap）；工具**不参与固件构建**，pack 是独立烧录步骤。
+- `assets` 分区的 SubType 在 `partitions.csv` 里仍写作 `spiffs`（历史遗留字段），**内容不是 SPIFFS**，方案 D 不挂文件系统。
+- 本工具**不自带 esptool**、不做设备探测/重试；板测（真机烧录/听感/回归）由 Lead 执行。
+- 源 WAV 是唯一源：**不要**手改 `build/assets.bin`（每次构建都会覆盖）；pack 可随时从源重建（同源同 sha256）。
 
 ## ws_mock_server.py —— 本地「云端」WS 模拟服务（T1.5 / T2.4）
 

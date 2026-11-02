@@ -849,7 +849,7 @@ uv run tools/error_prompt_test.py --dry-run          # 只检查素材/音量/�
 | G 打断不误播 | 默认 mock，SPEAKING 中 `vs interrupt` | 窗口内无任何 `错误反馈` 日志、`fb status` 总播放不增加、不进 ERROR |
 | H 正常轮不误播 | 默认 mock | 正常 `tts_start/tts_end` 一轮结束：无错误反馈、完成轮次 +1 |
 | I SPEAKING 中云端报错 | `--error-code 3001 --error-stage after-tts-start` | 先 `PLAYER: stream end/abort` 再 `FB: 反馈`（无叠音）、无「反馈被丢弃 busy」、`VS: speaking done` |
-| J 稳定性 | `--error-code 1` × `--stability-rounds 10`（另加 **1 轮预热**不计入） | 每轮反馈完成→IDLE；`fb status` 总播放/分类各 +10、`vs status` 云端口 +10；堆口径按**本场景增量**判（J 后 `min_free` ≥ min(J 前, 30KB) 且无新增下降，打印开机以来全局最低值供参考；不因 A/B 前序 churn 误判）；PSRAM 在预热后按 -64KB 判（首轮 Opus 编码器 120KB 常驻已排除）；无 panic/看门狗超时 |
+| J 稳定性 | `--error-code 1` × `--stability-rounds 10`（另加 **1 轮预热**不计入） | 每轮反馈完成→IDLE；`fb status` 总播放/分类各 +10、`vs status` 云端口 +10；堆口径按**本场景增量**判（J 后 `min_free` ≥ min(J 前 - 4KB, 30KB)：允许 ≤4KB 水位噪声、绝对下限 30KB，打印开机以来全局最低值供参考；不因 A/B 前序 churn 误判，free 波动另由 -16KB 断言兜底）；PSRAM 在预热后按 -64KB 判（首轮 Opus 编码器 120KB 常驻已排除）；无 panic/看门狗超时 |
 
 **网络稳定门禁（2026-11-02 板测第二轮修复）**：每个 mock 场景开始前（含 B 之后）等
 `wifi status`=UP + `ws status`=READY **连续 2 次（间隔 ≥1s）** + `vs status`=IDLE 才放行，

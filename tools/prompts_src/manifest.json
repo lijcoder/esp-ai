@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "sample_rate": 16000,
+  "prompts": [
+    {
+      "id": 0,
+      "name": "wake",
+      "file": "wake.wav",
+      "samples": 12800,
+      "pcm_sha256": "40b268d815386eb3cd4c1c53d125b95d95df205e36547f06d41e5ff01addd6f5"
+    },
+    {
+      "id": 1,
+      "name": "net-offline",
+      "file": "net-offline.wav",
+      "samples": 17201,
+      "pcm_sha256": "9efa0dc8ff102a318a5e6064a852c8e82a2d2682f1ad19eb48cbdb92b10bb79d"
+    },
+    {
+      "id": 2,
+      "name": "cloud-error",
+      "file": "cloud-error.wav",
+      "samples": 23487,
+      "pcm_sha256": "2360cea527bda367bf4087c953d4b0a15a4810fea2ea16f16996ab28190f65e5"
+    },
+    {
+      "id": 3,
+      "name": "timeout",
+      "file": "timeout.wav",
+      "samples": 17325,
+      "pcm_sha256": "de6425c6051f49add87411ce876c225ab46a8711e90088aad46f261142e6faed"
+    },
+    {
+      "id": 4,
+      "name": "tts-fail",
+      "file": "tts-fail.wav",
+      "samples": 19769,
+      "pcm_sha256": "913c7f85819ea9d0ebb69631ed1a20327a066f8e457475ad66ad36c587700aa2"
+    }
+  ]
+}

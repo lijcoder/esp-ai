@@ -26,6 +26,7 @@
 | 引脚 / 接线 / 电源 / 自检 | `docs/HARDWARE.md` | §2 引脚、§3 接线、§5 电源、§8 自检 |
 | 新功能要不要做 / 已知技术问题怎么取舍 | `docs/PRODUCT_IDEAS.md` | §5 优先级矩阵、§6 决策记录、§8 技术调研记录 |
 | 暂缓功能预留了什么 | `docs/ARCHITECTURE.md` | 附录 A（预留点）、附录 B（待定输入） |
+| 有哪些待验证 / 待决定的事（含提出时间与关闭条件） | `docs/PENDING.md` | §2 待真机验证、§3 待决定、§4 已关闭归档、§5 时间线 |
 | 协议字段细节 | `docs/PROTOCOL.md` | 完整契约（T2.5 定稿）：握手/帧头/上下行字段表/错误码表/版本兼容/样例；设计概览见 ARCHITECTURE §6 |
 | 文档怎么维护 / 边界 | `docs/CONVENTIONS.md` | §1 文档边界 |
 
@@ -57,3 +58,4 @@
 - [ ] `docs/STATUS.md` 的当前状态与任务看板已更新
 - [ ] 架构/协议有变 → `ARCHITECTURE.md`（及 `PROTOCOL.md`）已同步
 - [ ] 新增不确定项 → `PRODUCT_IDEAS.md` 已记录
+- [ ] 因无板/环境等原因未做真机验证的项 → `docs/PENDING.md` 已登记（带时间与验收方法）

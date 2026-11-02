@@ -581,7 +581,7 @@ THINKING 超时（10s）───┘
 > **T3.6 实测（2026-11-02，见 STATUS §5）**：新增 `components/feedback`（异常反馈路由，**不建任务/不定时器**）与 `assets` 提示音表后，静态 DIRAM **199,286 B（+144 B vs T3.4 收尾，全为状态/统计/资源表）**；`ws://` 真实语音轮（`voice_cloud_test`）内部堆峰值 **224,924 B**、**最低水位 32,679 B（≥30KB，余 2,679 B）** → 静态 + 峰值 = **424,210 B ≤ 440KB（余约 26KB）**；PSRAM 峰值 **1,596,348 B**（未新增缓冲；提示音 PCM 走 flash rodata 共 ~177KB，**不进 RAM**）；无新增任务；`vs_err` 看门狗复用一次性 `esp_timer`（`CONFIG_VS_ERROR_HOLD_MS=3000`）。
 > **Flash 增量**：bin **2,118,464 B（+163,160 B vs T3.4 收尾）**——4 条中文提示音 PCM 占 ~177KB rodata（app 分区 3M，余量仍 ~1MB）；T3.5 迁 `assets` 分区后这部分从 app 移除。**wss 握手期水位 T3.6 未复测**（无新增任务、静态 +144 B、多一个一次 esp_timer，按 T3.7 的 33,271 B 估算 ~32.2KB），归 T5.3。
 
-> **T3.5 实测（2026-11-02，见 STATUS §5）**：提示音迁 `assets` 分区（自定义只读 pack + `esp_partition_mmap` 零拷贝）后，app bin **1,941,792 B（−176,704 B vs T3.6 的 2,118,496 B）**、Flash Data 516,940→337,596 B（−179,344 B，PCM 不再编进 app）；静态 DIRAM **199,766 B（+480 B：`prompt_store` 状态/表 + `diag prompt info`）**、无新增任务；提示音 PCM 常驻 `assets` 分区、**不占 RAM**（mmap 只占 MMU 页）；pack 缺失/损坏时降级不崩溃。**wss 水位未复测**，T5.3 归口。
+> **T3.5 实测（2026-11-02，见 STATUS §5）**：提示音迁 `assets` 分区（自定义只读 pack + `esp_partition_mmap` 零拷贝）后，app bin **1,941,840 B（−176,656 B vs T3.6 的 2,118,496 B）**、Flash Data 516,940→337,596 B（−179,344 B，PCM 不再编进 app）；静态 DIRAM **199,766 B（+480 B：`prompt_store` 状态/表 + `diag prompt info`）**、无新增任务；提示音 PCM 常驻 `assets` 分区、**不占 RAM**（mmap 只占 MMU 页）；pack 缺失/损坏时降级不崩溃。**wss 水位未复测**，T5.3 归口。
 
 ### 9.3 任务与核心（确定）
 

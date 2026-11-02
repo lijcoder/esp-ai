@@ -28,6 +28,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "event_bus.h"
+#include "feedback.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "net_mgr.h"
@@ -45,7 +46,7 @@ static const char *TAG = "DIAG";
  */
 static const char *const k_tags[] = {
     "APP", "BOARD", "AUDIO_IO", "AFE", "PLAYER", "ENC", "NET",
-    "WS", "VC", "VS", "MC", "MS", "DEV", "DIAG", "CFG", "EVT",
+    "WS", "VC", "VS", "MC", "MS", "DEV", "DIAG", "CFG", "EVT", "FB",
 };
 #define TAG_COUNT (sizeof(k_tags) / sizeof(k_tags[0]))
 
@@ -1493,6 +1494,13 @@ static void print_vs_status(void)
 #else
     printf("  续听: 关闭（CONFIG_VS_FOLLOWUP_ENABLE=n）\n");
 #endif
+    printf("  错误反馈: 网络 %" PRIu32 " / 云端 %" PRIu32 " / 超时 %" PRIu32 " / TTS %" PRIu32
+           "；提示音完成 %" PRIu32 " 失败 %" PRIu32 "；最近 kind=%s code=%" PRId32
+           " 时长 %" PRIu32 " ms\n",
+           st.error_by_kind[1], st.error_by_kind[2], st.error_by_kind[3], st.error_by_kind[4],
+           st.error_feedback_ok, st.error_feedback_fail,
+           fb_kind_name((fb_kind_t)st.last_error_kind), st.last_error_code,
+           st.last_error_prompt_ms);
     printf("  说明: 唤醒自动进 LISTENING；TTS 播完进 FOLLOW_UP 续听窗口；"
            "手动调试用 vs start / vs interrupt\n");
 }
@@ -1560,7 +1568,84 @@ static int cmd_vs(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
-/* ---------------- dev 命令（按键/静音观测，T3.4） ---------------- */
+/* ---------------- fb 命令（异常反馈观测/手动试听，T3.6） ---------------- */
+
+static void print_fb_status(void)
+{
+    fb_stats_t st;
+
+    if (fb_stats_read(&st) != ESP_OK) {
+        printf("读取 feedback 统计失败\n");
+        return;
+    }
+    printf("feedback: 活动=%s%s\n",
+           st.active_kind == FB_KIND_NONE ? "空闲" : fb_kind_name((fb_kind_t)st.active_kind),
+           st.pending ? "（等 TTS 流结束补播）" : "");
+    printf("  通道统计: 总播放 %" PRIu32 " / 完成 %" PRIu32 " / 失败 %" PRIu32
+           "；延迟 %" PRIu32 " 丢弃 %" PRIu32 " 中止 %" PRIu32 "\n",
+           st.plays, st.done_ok, st.done_fail, st.deferred, st.rejected, st.aborts);
+    printf("  分类: 网络 %" PRIu32 " / 云端 %" PRIu32 " / 超时 %" PRIu32 " / TTS %" PRIu32
+           "；最近时长 %" PRIu32 " ms\n",
+           st.by_kind[FB_KIND_NET_OFFLINE], st.by_kind[FB_KIND_CLOUD_ERROR],
+           st.by_kind[FB_KIND_TIMEOUT], st.by_kind[FB_KIND_TTS_FAIL], st.last_dur_ms);
+    printf("  说明: 语音只是当前反馈通道；APP_EVT_FEEDBACK 事件供未来屏幕/灯光通道订阅（T3.6）\n");
+}
+
+static bool fb_kind_from_arg(const char *arg, fb_kind_t *out)
+{
+    if (strcmp(arg, "net") == 0 || strcmp(arg, "net-offline") == 0) {
+        *out = FB_KIND_NET_OFFLINE;
+    } else if (strcmp(arg, "cloud") == 0 || strcmp(arg, "cloud-error") == 0) {
+        *out = FB_KIND_CLOUD_ERROR;
+    } else if (strcmp(arg, "timeout") == 0) {
+        *out = FB_KIND_TIMEOUT;
+    } else if (strcmp(arg, "tts") == 0 || strcmp(arg, "tts-fail") == 0) {
+        *out = FB_KIND_TTS_FAIL;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static int cmd_fb(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: fb status | reset | test <net|cloud|timeout|tts>\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *sub = argv[1];
+    if (strcmp(sub, "status") == 0 || strcmp(sub, "stat") == 0) {
+        print_fb_status();
+        return ESP_OK;
+    }
+    if (strcmp(sub, "reset") == 0) {
+        fb_stats_reset();
+        printf("feedback 统计已清零\n");
+        return ESP_OK;
+    }
+    if (strcmp(sub, "test") == 0) {
+        if (argc < 3) {
+            printf("用法: fb test <net|cloud|timeout|tts>（手动试听提示音，不起会话）\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        fb_kind_t kind;
+        if (!fb_kind_from_arg(argv[2], &kind)) {
+            printf("未知反馈类别: %s（可用: net | cloud | timeout | tts）\n", argv[2]);
+            return ESP_ERR_INVALID_ARG;
+        }
+        esp_err_t err = fb_notify(kind, 0, vs_current_sid());
+        if (err != ESP_OK) {
+            printf("反馈测试失败: %s（可能正在播另一条提示音）\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("已请求反馈测试：%s（提示音播放期间 R1 暂停收音）\n", fb_kind_name(kind));
+        return ESP_OK;
+    }
+
+    printf("未知子命令: %s（可用: status | reset | test <net|cloud|timeout|tts>）\n", sub);
+    return ESP_ERR_INVALID_ARG;
+}
 
 static void print_dev_status(void)
 {
@@ -2371,6 +2456,12 @@ static esp_err_t register_commands(void)
             .help = "按键/静音：dev status | mute [on|off] | reset（T3.4；LED 已移除）",
             .hint = "status|mute|reset",
             .func = cmd_dev,
+        },
+        {
+            .command = "fb",
+            .help = "异常反馈（T3.6）：fb status | reset | test <net|cloud|timeout|tts>",
+            .hint = "status|reset|test",
+            .func = cmd_fb,
         },
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST
         {

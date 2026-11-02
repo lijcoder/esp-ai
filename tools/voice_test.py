@@ -45,12 +45,50 @@ SYSTEM_VOLUME_MAX = 50
 
 # 唤醒链路的完整日志顺序（ARCHITECTURE §3.3 R1/R2）。T3.1 起唤醒编排归 voice_session
 # （TAG VS），兼容旧固件的 APP 前缀。
-WAKE_CHAIN = (
+# T3.6 起分两条分支：
+#   online  —— WS READY（有 mock）：旧链 唤醒 → 提示音"我在呢" → feed resumed → 起轮；
+#   offline —— 云端未就绪：不播"我在呢"，直接播「网络未连接」反馈音后 ERROR → IDLE
+#              （新链：wake → LISTENING→ERROR(net-offline) → FB 反馈 → play → feed paused
+#               → FB 提示音完成 → ERROR→IDLE → feed resumed）。
+# 本机跑 voice_test 不依赖 mock，通常走 offline 分支；两条都算 PASS。
+WAKE_CHAIN_ONLINE = (
     ("wake", re.compile(r"(?:APP|VS): wake detected")),
     ("pause", re.compile(r"AFE: feed paused")),
     ("play", re.compile(r"PLAYER: play \d+ samples")),
     ("done", re.compile(r"(?:APP|VS): prompt done, feed resumed")),
 )
+RE_WAKE_PROMPT_DONE = re.compile(r"(?:APP|VS): prompt done, feed resumed")
+RE_WAKE_OFFLINE_STATE = re.compile(
+    r"VS: state LISTENING -> ERROR（[^）]*原因=net-offline[^）]*）")
+RE_WAKE_FB_START = re.compile(r"FB: 反馈 kind=net-offline")
+WAKE_CHAIN_OFFLINE = (
+    ("wake", re.compile(r"(?:APP|VS): wake detected")),
+    ("error", RE_WAKE_OFFLINE_STATE),
+    ("fb", RE_WAKE_FB_START),
+    ("play", re.compile(r"PLAYER: play \d+ samples")),
+    ("pause", re.compile(r"AFE: feed paused")),
+    ("fb_done", re.compile(r"FB: 提示音完成 kind=net-offline ok=1")),
+    ("idle", re.compile(r"VS: state ERROR -> IDLE")),
+    ("resume", re.compile(r"AFE: feed resumed")),
+)
+
+
+def detect_wake_branch(dev: "Device", mark: int, timeout: float) -> str | None:
+    """唤醒后判断走哪条链路：online=有云端（旧链）/ offline=云端未就绪（T3.6 新链）。
+
+    不按"等不到旧链再等新链"的顺序试：离线时旧链最后一条 `prompt done` 永远不会出现，
+    逐个等会白等 8 个超时；这里只等首个分支标志出现（ERROR 迁移或 prompt done）。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        lines = [line for _, line in dev.lines_since(mark)]
+        if any(RE_WAKE_PROMPT_DONE.search(line) for line in lines):
+            return "online"
+        if any(RE_WAKE_OFFLINE_STATE.search(line) or RE_WAKE_FB_START.search(line)
+               for line in lines):
+            return "offline"
+        dev.pump(0.05)
+    return None
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -307,19 +345,29 @@ class Result:
 
 
 def error_lines(lines: list[str]) -> list[str]:
-    """筛出与语音链路相关的错误：网络/WS 的 ERROR 与本次测试无关，忽略。"""
+    """筛出与语音链路相关的错误：网络/WS 的 ERROR 与本次测试无关，忽略。
+
+    T3.6 起 `E (...) VS: 会话进入 ERROR（原因=…）` 是**预期异常反馈日志**（随后会播错误
+    提示音、ERROR→IDLE 收尾），不是崩溃；与 NET/WS 一样按白名单排除。真正的 panic/
+    assert/Guru Meditation 不受影响（仍 FAIL）。
+    """
     pat = re.compile(r"ERROR|panic|abort|Guru Meditation|stack overflow|StoreProhibited")
     tag_re = re.compile(r"[EW] \(\d+\) ([A-Za-z_0-9-]+):")
     ignored_tags = {
         "NET", "WS", "wifi", "websocket_client", "esp_netif", "esp-tls", "esp_wifi",
         "wpa_supplicant", "phy_init", "net80211", "esp_https_ota", "HTTP_CLIENT",
     }
+    ignored_patterns = (
+        re.compile(r"VS: 会话进入 ERROR（"),  # T3.6 异常反馈的预期语义日志
+    )
     out = []
     for line in lines:
         if not pat.search(line):
             continue
         m = tag_re.search(line)
         if m and m.group(1) in ignored_tags:
+            continue
+        if any(ignored.search(line) for ignored in ignored_patterns):
             continue
         out.append(line)
     return out
@@ -395,6 +443,8 @@ def run(args: argparse.Namespace) -> int:
 
         # 唤醒测试
         print(f"\n===== 唤醒测试（{args.wakes} 轮，{WAKE_WAV}）=====")
+        print("  分支说明：有 mock/WS READY → 旧链（我在呢 → 起轮）；无 mock → T3.6 离线链"
+              "（直接播「网络未连接」→ ERROR → IDLE）")
         wake_pass = 0
         for i in range(args.wakes):
             dev.pump(args.pause_between)
@@ -402,22 +452,39 @@ def run(args: argparse.Namespace) -> int:
             mark = dev.mark()
             t_play = time.time()
             dev.play(os.path.join(HERE, WAKE_WAV))
+            branch = detect_wake_branch(dev, mark, args.wake_timeout)
+            chain = {"online": WAKE_CHAIN_ONLINE, "offline": WAKE_CHAIN_OFFLINE}.get(branch, ())
             chain_hits = []
-            for label, pat in WAKE_CHAIN:
-                hit = dev.wait_line(pat, args.wake_timeout, mark)
+            # 分支已确认后，剩余模式通常已经出现；仍留出短超时（离线链 8 条逐条等满会太慢）
+            per_pat_timeout = args.wake_timeout if branch == "online" else 2.0
+            for label, pat in chain:
+                hit = dev.wait_line(pat, per_pat_timeout, mark)
                 chain_hits.append(hit is not None)
             lines = [l for _, l in dev.lines_since(mark)]
-            ok = all(chain_hits) and not error_lines(lines)
+            cross = []
+            if branch == "offline":
+                # 离线分支不应再出现"我在呢"播放完成（T3.6 语义：直接播错误提示音）
+                cross = [l for l in lines if RE_WAKE_PROMPT_DONE.search(l)]
+            elif branch == "online":
+                # 有云端时不应误播错误反馈
+                cross = [l for l in lines if "错误反馈" in l or "FB: 反馈" in l]
+            ok = branch is not None and all(chain_hits) and not cross and not error_lines(lines)
             if ok:
                 wake_pass += 1
                 wake_ts = next((ts for ts, l in dev.lines_since(mark) if "wake detected" in l), None)
                 latency = (wake_ts - t_play) * 1000 if wake_ts else float("nan")
-                print(f"  第 {i + 1} 轮 PASS  唤醒响应 {latency:.0f} ms（含 afplay 启动开销）")
+                print(f"  第 {i + 1} 轮 PASS  唤醒响应 {latency:.0f} ms（分支={branch}，"
+                      f"含 afplay 启动开销）")
             else:
-                print(f"  第 {i + 1} 轮 FAIL  链路: "
-                      + " → ".join(f"{n}={'ok' if h else 'miss'}" for (n, _), h in zip(WAKE_CHAIN, chain_hits)))
+                detail = "branch=未识别" if branch is None else (
+                    f"分支={branch} 链路: "
+                    + " → ".join(f"{n}={'ok' if h else 'miss'}"
+                                 for (n, _), h in zip(chain, chain_hits)))
+                if cross:
+                    detail += f"；不该出现: {cross[0].strip()}"
+                print(f"  第 {i + 1} 轮 FAIL  {detail}")
                 for line in lines:
-                    if "APP:" in line or "VS:" in line or "AFE:" in line or "PLAYER:" in line:
+                    if any(k in line for k in ("APP:", "VS:", "AFE:", "PLAYER:", "FB:")):
                         print(f"    {line.strip()}")
             dev.pump(0.3)
         res.check(wake_pass >= args.min_wake_pass,

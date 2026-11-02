@@ -25,6 +25,16 @@ P2–P4 都能脱机联调，不占端侧排期（ROADMAP §2.0 P1 顺序 0）�
   uv run tools/ws_mock_server.py --tts-mp3 tts.mp3 --tts-stall-ms 600 --tts-stall-at 30
   uv run tools/ws_mock_server.py --tts-mp3 tts.mp3 --tts-late-bin  # 窗口外帧（端侧应丢弃）
 
+T3.6 错误提示（tools/error_prompt_test.py 会自动用这些参数起 mock，手工联调同理）：
+  uv run tools/ws_mock_server.py --scenario error                        # audio_end 后 error code=1
+  uv run tools/ws_mock_server.py --scenario error --error-code 3001      # TTS 失败类错误码
+  uv run tools/ws_mock_server.py --scenario error --error-code 3001 --error-stage after-asr
+  uv run tools/ws_mock_server.py --scenario error --error-code 3001 \
+      --error-stage after-tts-start     # 先 tts_start + 3~5 帧真实 MP3 再报错（SPEAKING 中报错）
+  uv run tools/ws_mock_server.py --tts-bad-codec   # tts_start codec="pcm" + tts_end、不发帧
+  # ↑ 触发设备侧 TTS 无法播放（VC_EVT_TTS_FAIL）→ feedback 播「语音播放失败」
+  # --error-stage / --error-code 只对 --scenario error 生效；--tts-bad-codec 与它互斥。
+
 T3.1 测试用的「真 ASR」（可选，独立实现见 tools/mock_asr.py，不依赖 DSH）：
   # 依赖通过 --with 临时装进 uv 环境（脚本自身的 PEP 723 依赖仍只有 websockets）
   uv run --with av --with numpy --with sherpa-onnx tools/ws_mock_server.py --asr sensevoice
@@ -52,6 +62,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
+import io
 import json
 import logging
 import os
@@ -82,6 +94,12 @@ MAX_UPLINK_PAYLOAD = 4096    # 20ms Opus 帧约 40B；4KB 足够，同时挡住�
 
 TTS_CODEC = "mp3"
 TTS_SAMPLE_RATE = 24000
+
+# T3.6：云端错误注入与设备侧 TTS 失败注入（测试工具用，不是协议扩展——error 事件与 tts_start
+# 字段都来自 PROTOCOL.md §3.2/§4，这里只是让 mock 能按时机/按错误码下发）
+TTS_BAD_CODEC = "pcm"  # 设备不支持的可播放 codec：端侧应上报 VC_EVT_TTS_FAIL 而不是静默失败
+ERROR_STAGES = ("after-audio-end", "after-asr", "after-tts-start")
+ERROR_TTS_FRAMES = 4   # after-tts-start：报错前下发的真实 MP3 帧数（契约 §5.1 要求 3~5 帧）
 
 # 鉴权失败关闭码：契约未定义，暂用 4001/4002 应用码（已登记为待确认项）
 CLOSE_BAD_DEVICE = 4001
@@ -269,6 +287,10 @@ class Config:
     tts_piper_speed: float = 1.0     # Piper length_scale：>1 更慢
     tts_piper_model_dir: str = ""    # Piper 音色目录（空=自动找缓存）
     tts_piper_download: bool = False # 音色缺失时下载（约 60MB）
+    # ---- T3.6：错误提示（云端错误码/报错时机/坏 codec 注入；error_prompt_test.py 用） ----
+    error_code: int = 1                   # --scenario error 下发的 error.code（默认 1=通用）
+    error_stage: str = "after-audio-end"  # audio_end 后 / asr_final 后 / tts_start+真实 MP3 帧后
+    tts_bad_codec: bool = False           # tts_start 用 codec="pcm" 且不发音频帧（设备侧 TTS 失败）
     quiet: bool = False          # 自测用：只打 WARN 及以上
     verbose: bool = False        # 打印上行 payload 前 16 字节
 
@@ -549,6 +571,11 @@ class Session:
             extra += f" sid={obj['sid']}"
         if "text" in obj:
             extra += f" text={obj['text']!r}"
+        # T3.6：tts_start 的 codec/sr 与 error 的 code 是测试断言依据，日志里带上
+        if obj.get("t") == "tts_start":
+            extra += f" codec={obj.get('codec')} sr={obj.get('sr')}"
+        if obj.get("t") == "error":
+            extra += f" code={obj.get('code')} msg={obj.get('msg')!r}"
         if obj.get("t") == "pong":
             self._log(logging.INFO, "--> pong")
         else:
@@ -678,6 +705,54 @@ class Session:
             self._log(logging.WARNING, f"[ASR] 识别失败（回退 --tts-text）：{exc}")
             return self.cfg.tts_text
 
+    async def _send_tts_start(self, sid: int | None, codec: str) -> None:
+        """下发 tts_start（codec/sr 按参数：正常 mp3，--tts-bad-codec 时故意用 pcm）。"""
+        await self._send_json(
+            {"t": "tts_start", "sid": sid, "codec": codec, "sr": TTS_SAMPLE_RATE}
+        )
+
+    async def _error_flow(self, sid: int | None) -> None:
+        """--scenario error：按 --error-stage 决定报错时机，再下发 error 事件（T3.6）。
+
+        三个时机覆盖三条端侧路径：
+          - after-audio-end（默认，T2.5 现状）：LISTENING 结束即报错 → VS 从 THINKING 进 ERROR；
+          - after-asr：先发 asr_final 再报错（ASR 之后服务失败）；
+          - after-tts-start：先发 tts_start + 若干**真实 MP3 帧**再报错 → 设备已进 SPEAKING，
+            用于验证「SPEAKING 中云端报错」时先停 TTS 流再播错误提示音、无叠音。
+        error.code 由 --error-code 控制（3001/3002 会映射到 tts-fail 提示音）。
+        """
+        cfg = self.cfg
+        if cfg.error_stage == "after-asr":
+            await self._send_json({"t": "asr_final", "sid": sid, "text": cfg.tts_text})
+        elif cfg.error_stage == "after-tts-start":
+            await self._send_tts_start(sid, TTS_CODEC)
+            frames = self.server.error_audio_frames()
+            total = min(ERROR_TTS_FRAMES, len(frames))
+            for index in range(total):
+                frame = frames[index]
+                await self._send_bin(frame.payload)
+                await self._pace_after_frame(index, frame.duration_ms)
+            self._log(
+                logging.INFO,
+                f"--error-stage after-tts-start：已下发 {total} 帧真实 MP3 "
+                f"（{frames[0].sample_rate if frames else 0} Hz）后报错",
+            )
+
+        self.stats.errors += 1
+        await self._send_json(
+            {
+                "t": "error",
+                "sid": sid,
+                "code": cfg.error_code,
+                "msg": f"mock: 模拟错误（code={cfg.error_code}）",
+            }
+        )
+        self._log(
+            logging.WARNING,
+            f"error 阶段={cfg.error_stage} code={cfg.error_code}"
+            "（码表见 PROTOCOL.md §4：3001/3002=TTS 失败，其余=通用/服务异常）",
+        )
+
     async def _tts_flow(self, asr_packets: list[bytes] | None = None) -> None:
         sid = self.sid
         try:
@@ -696,14 +771,7 @@ class Session:
                 )
 
             if self.cfg.scenario == "error":
-                self.stats.errors += 1
-                await self._send_json(
-                    {"t": "error", "sid": sid, "code": 1, "msg": "mock: 模拟 TTS 失败"}
-                )
-                self._log(
-                    logging.WARNING,
-                    "error 码表已由 PROTOCOL.md 定稿：1=通用/未知（T2.5）",
-                )
+                await self._error_flow(sid)
                 return
 
             text = await self._asr_text(asr_packets)
@@ -734,18 +802,27 @@ class Session:
 
             sent_frames = 0
             sent_bytes = 0
-            if self.cfg.no_tts:
-                await self._send_json(
-                    {"t": "tts_start", "sid": sid, "codec": TTS_CODEC, "sr": TTS_SAMPLE_RATE}
+            if self.cfg.tts_bad_codec:
+                # T3.6-F：tts_start 用设备无法播放的 codec（"pcm"）后立即 tts_end、不发音频帧。
+                # 端侧应上报 VC_EVT_TTS_FAIL → feedback 播「语音播放失败」，而不是静默失败。
+                await self._send_tts_start(sid, TTS_BAD_CODEC)
+                self._log(
+                    logging.WARNING,
+                    f"--tts-bad-codec：tts_start codec={TTS_BAD_CODEC} 且不发音频帧"
+                    "（设备侧应报「无法播放」→ VC_EVT_TTS_FAIL → tts-fail 提示音）",
                 )
+                await self._send_json({"t": "tts_end", "sid": sid})
+                self._log(logging.INFO, "tts 下发完成 frames=0 bytes=0 mode=bad-codec")
+                return
+
+            if self.cfg.no_tts:
+                await self._send_tts_start(sid, TTS_CODEC)
                 self._log(logging.INFO, "（--no-tts：跳过二进制帧，仅验证 JSON 链路）")
             else:
                 if self.cfg.tts_late_bin:
                     # tts_start 之前：端侧还没开 0x02 接收窗口，必须丢弃（T2.4 契约 §2.3）
                     await self._send_bin(self._late_bin_payload(), note="late-pre")
-                await self._send_json(
-                    {"t": "tts_start", "sid": sid, "codec": TTS_CODEC, "sr": TTS_SAMPLE_RATE}
-                )
+                await self._send_tts_start(sid, TTS_CODEC)
                 frames = echo_frames if echo_frames is not None else self.server.tts_mp3_frames
                 if frames is None:
                     total = max(1, self.cfg.max_tts_frames)
@@ -856,6 +933,8 @@ class MockServer:
         self.history: list[Session] = []
         # --tts-mp3：启动时解析一次，所有连接共享（只读）；None 表示合成帧模式
         self.tts_mp3_frames: list[Mp3Frame] | None = None
+        # T3.6：--error-stage after-tts-start 用的真实 MP3 帧（--tts-mp3 优先，否则用内嵌段）
+        self._embedded_mp3_frames: list[Mp3Frame] | None = None
 
     async def start(self) -> int:
         if self.cfg.tts_mp3 and self.tts_mp3_frames is None:
@@ -915,6 +994,19 @@ class MockServer:
             return self.cfg.host
         ips = _lan_ips()
         return ips[0] if ips else "127.0.0.1"
+
+    def error_audio_frames(self) -> list[Mp3Frame]:
+        """--error-stage after-tts-start 下发用的真实 24k/单声道 MP3 帧（T3.6）。
+
+        优先用 --tts-mp3 的素材；没给时用脚本内嵌的真实 MP3（与 --self-test 同一段，
+        22 帧/528ms）——这样「SPEAKING 中云端报错」场景即使不配素材，设备也能真的解码
+        出声音，而不是收到不可解码的合成帧。
+        """
+        if self.tts_mp3_frames is not None:
+            return self.tts_mp3_frames
+        if self._embedded_mp3_frames is None:
+            self._embedded_mp3_frames = _embedded_real_mp3_frames()
+        return self._embedded_mp3_frames
 
     def on_session_closed(self, session: Session) -> None:
         self.active.pop(session.conn_id, None)
@@ -1016,6 +1108,9 @@ def _print_banner(server: MockServer) -> None:
         f"python {sys.version.split()[0]} / websockets {websockets.__version__}",
         f"scenario={cfg.scenario} think={cfg.think_ms}ms chunk={cfg.chunk_bytes}B/{cfg.chunk_ms}ms "
         f"max_tts_frames={cfg.max_tts_frames} no_tts={cfg.no_tts} drop_pong={cfg.drop_pong}"
+        + (f" error_code={cfg.error_code} error_stage={cfg.error_stage}"
+           if cfg.scenario == "error" else "")
+        + (" tts_bad_codec" if cfg.tts_bad_codec else "")
         + (f" close_after={cfg.close_after}s" if cfg.close_after else ""),
         _tts_mode_line(server),
         (
@@ -1045,6 +1140,21 @@ def _tts_mode_line(server: MockServer) -> str:
     """横幅里的 TTS 下发模式摘要：真实 MP3 的帧数/时长，或合成帧提示。"""
     cfg = server.cfg
     frames = server.tts_mp3_frames
+    if cfg.tts_bad_codec:
+        return (
+            'TTS 模式: --tts-bad-codec（tts_start codec="pcm" → tts_end、不发音频帧；'
+            "测设备侧 TTS 无法播放 → tts-fail 提示音）"
+        )
+    if cfg.scenario == "error":
+        return (
+            f"错误注入: code={cfg.error_code} stage={cfg.error_stage}"
+            + ("（先发 asr_final）" if cfg.error_stage == "after-asr" else "")
+            + (
+                f"（先发 tts_start + {ERROR_TTS_FRAMES} 帧真实 MP3）"
+                if cfg.error_stage == "after-tts-start"
+                else ""
+            )
+        )
     if server.tts_piper_module is not None:
         mode = (
             f"TTS 模式: 回声（ASR 识别文本 → Piper {cfg.tts_piper_voice} → 24k MP3，"
@@ -1161,11 +1271,21 @@ _SELFTEST_MP3_B64 = (
 )
 
 
+def _embedded_real_mp3_bytes() -> bytes:
+    """内嵌的真实 MP3 字节（lameenc 24k/单声道/32kbps；`--self-test` 与 T3.6 报错注入共用）。"""
+    return base64.b64decode(_SELFTEST_MP3_B64)
+
+
+def _embedded_real_mp3_frames() -> list[Mp3Frame]:
+    """内嵌真实 MP3 切帧结果：--error-stage after-tts-start 在没给 --tts-mp3 时用它下发。"""
+    return parse_mp3_frames(_embedded_real_mp3_bytes(), source="<内嵌真实 MP3>")
+
+
 def _write_selftest_mp3() -> str:
     directory = tempfile.mkdtemp(prefix="ws_mock_selftest_")
     path = os.path.join(directory, "selftest_24k_mono.mp3")
     with open(path, "wb") as handle:
-        handle.write(base64.b64decode(_SELFTEST_MP3_B64))
+        handle.write(_embedded_real_mp3_bytes())
     return path
 
 
@@ -1205,6 +1325,27 @@ async def _collect_round(
         assert item[1] == "bin", f"tts_end 后期望窗口外二进制帧，实际收到 {item[2]!r}"
         collected.append(item)
     return collected
+
+
+async def _collect_until(
+    ws: Any, sid: int, stop_event: str, timeout: float = 10.0
+) -> list[tuple[float, str, Any]]:
+    """跑一轮上行后收集下行，直到出现 JSON `t == stop_event`（error 路径没有 tts_end）。
+
+    `sid` 由假客户端给出（真实端侧由 voice_session 分配，mock 原样回填）。
+    """
+    await ws.send(json.dumps({"t": "hello", "device_id": "dev1", "ver": 1}))
+    await ws.send(json.dumps({"t": "audio_start", "sid": sid}))
+    for index in range(3):
+        await ws.send(build_frame(TYPE_AUDIO_UP, index, b"\x01" * 40))
+    await ws.send(json.dumps({"t": "audio_end", "sid": sid}))
+    collected: list[tuple[float, str, Any]] = []
+    deadline = time.monotonic() + timeout
+    while True:
+        item = await _recv_one(ws, deadline)
+        collected.append(item)
+        if item[1] == "json" and item[2].get("t") == stop_event:
+            return collected
 
 
 async def _t_hello(cfg: Config) -> None:
@@ -1551,6 +1692,163 @@ async def _t_auth_rejected(cfg: Config) -> None:
         await server.stop()
 
 
+# ---- T3.6：错误提示/坏 codec 注入（error_prompt_test.py 的 mock 侧契约） ----
+
+
+def _json_of(messages: list[tuple[float, str, Any]], event: str) -> dict[str, Any] | None:
+    for _, kind, msg in messages:
+        if kind == "json" and msg.get("t") == event:
+            return msg
+    return None
+
+
+def _types_of(messages: list[tuple[float, str, Any]]) -> list[str]:
+    return [msg["t"] for _, kind, msg in messages if kind == "json"]
+
+
+async def _t_error_default(cfg: Config) -> None:
+    """--scenario error 默认行为（T2.5 兼容）：audio_end 后直接 error，code=1，无 asr/tts。"""
+    server, url = await _start(replace(cfg, scenario="error"))
+    try:
+        async with connect(url) as ws:
+            messages = await _collect_until(ws, sid=31, stop_event="error")
+        types = _types_of(messages)
+        err = _json_of(messages, "error")
+        assert err is not None, f"未收到 error：{types}"
+        assert err.get("sid") == 31, f"error.sid 未回填：{err}"
+        assert err.get("code") == 1, f"默认 error.code 应为 1，实为 {err.get('code')}"
+        assert "asr_final" not in types and "tts_start" not in types, (
+            f"after-audio-end 不应先发 asr/tts：{types}"
+        )
+        bins = [msg for _, kind, msg in messages if kind == "bin"]
+        assert bins == [], f"error 路径不应下发二进制帧：{len(bins)} 帧"
+        await _wait_closed(server, 1)
+        stats = server.history[-1].stats
+        assert stats.errors == 1 and stats.tts_frames == 0, (
+            f"统计异常：errors={stats.errors} tts_frames={stats.tts_frames}"
+        )
+    finally:
+        await server.stop()
+
+
+async def _t_error_code(cfg: Config) -> None:
+    """--error-code：下发 JSON 里的 code 必须原样等于参数（3001 用于 TTS 失败类）。"""
+    server, url = await _start(replace(cfg, scenario="error", error_code=3001))
+    try:
+        async with connect(url) as ws:
+            messages = await _collect_until(ws, sid=32, stop_event="error")
+        err = _json_of(messages, "error")
+        assert err is not None and err.get("code") == 3001, (
+            f"--error-code 3001 未生效：{err}"
+        )
+    finally:
+        await server.stop()
+
+
+async def _t_error_after_asr(cfg: Config) -> None:
+    """--error-stage after-asr：先发 asr_final 再 error（ASR 之后服务失败）。"""
+    server, url = await _start(replace(cfg, scenario="error", error_stage="after-asr"))
+    try:
+        async with connect(url) as ws:
+            messages = await _collect_until(ws, sid=33, stop_event="error")
+        types = _types_of(messages)
+        assert "asr_final" in types, f"after-asr 应先发 asr_final：{types}"
+        assert types.index("asr_final") < types.index("error"), f"事件顺序错误：{types}"
+        assert "tts_start" not in types, f"after-asr 不应下发 tts_start：{types}"
+        await _wait_closed(server, 1)
+        assert server.history[-1].stats.tts_frames == 0
+    finally:
+        await server.stop()
+
+
+async def _t_error_after_tts_start(cfg: Config) -> None:
+    """--error-stage after-tts-start：tts_start + 3~5 帧真实 MP3 之后再 error（SPEAKING 中报错）。"""
+    server, url = await _start(
+        replace(cfg, scenario="error", error_code=3001, error_stage="after-tts-start")
+    )
+    try:
+        async with connect(url) as ws:
+            messages = await _collect_until(ws, sid=34, stop_event="error")
+        types = _types_of(messages)
+        assert "tts_start" in types and "error" in types, f"缺 tts_start/error：{types}"
+        assert types.index("tts_start") < types.index("error"), f"事件顺序错误：{types}"
+        assert "tts_end" not in types, f"报错轮不应发 tts_end：{types}"
+        tts_start = _json_of(messages, "tts_start")
+        assert tts_start is not None and tts_start.get("codec") == TTS_CODEC, (
+            f"tts_start.codec 应为 {TTS_CODEC}：{tts_start}"
+        )
+        bins = [msg for _, kind, msg in messages if kind == "bin"]
+        assert ERROR_TTS_FRAMES <= len(bins) <= 5, (
+            f"报错前应发 3~5 帧真实 MP3，实际 {len(bins)} 帧"
+        )
+        for raw in bins:
+            frame_type, _, payload = parse_frame(raw)
+            assert frame_type == TYPE_AUDIO_DOWN, f"下行帧类型错误 0x{frame_type:02X}"
+            assert payload[:2] == b"\xff\xfb" or (payload[1] & 0xE0) == 0xE0, (
+                "报错前下发的不是真实 MP3 帧（帧同步字不符）"
+            )
+        await _wait_closed(server, 1)
+        assert server.history[-1].stats.errors == 1
+    finally:
+        await server.stop()
+
+
+async def _t_tts_bad_codec(cfg: Config) -> None:
+    """--tts-bad-codec：tts_start codec="pcm" + tts_end，且一帧音频都不发。"""
+    server, url = await _start(replace(cfg, tts_bad_codec=True))
+    try:
+        async with connect(url) as ws:
+            messages = await _collect_round(ws, sid=35)
+        tts_start = _json_of(messages, "tts_start")
+        assert tts_start is not None and tts_start.get("codec") == TTS_BAD_CODEC, (
+            f"tts_start.codec 应为 {TTS_BAD_CODEC}：{tts_start}"
+        )
+        assert tts_start.get("sr") == TTS_SAMPLE_RATE, f"tts_start.sr 异常：{tts_start}"
+        bins = [msg for _, kind, msg in messages if kind == "bin"]
+        assert bins == [], f"--tts-bad-codec 不应发音频帧：{len(bins)} 帧"
+        types = _types_of(messages)
+        assert "tts_end" in types, f"缺 tts_end：{types}"
+        assert "asr_final" in types, f"正常轮仍应先发 asr_final：{types}"
+        await _wait_closed(server, 1)
+        stats = server.history[-1].stats
+        assert stats.frames_down == 0 and stats.tts_frames == 0, (
+            f"统计异常：frames_down={stats.frames_down} tts_frames={stats.tts_frames}"
+        )
+    finally:
+        await server.stop()
+
+
+async def _t_cli_config() -> None:
+    """CLI：--error-code/--error-stage/--tts-bad-codec 默认值与解析（含非法 stage 拒绝）。"""
+    defaults = _parse_args([])
+    assert defaults.error_code == 1, f"--error-code 默认应为 1：{defaults.error_code}"
+    assert defaults.error_stage == "after-audio-end", (
+        f"--error-stage 默认应为 after-audio-end：{defaults.error_stage}"
+    )
+    assert defaults.tts_bad_codec is False, "--tts-bad-codec 默认应关闭"
+
+    explicit = _parse_args(
+        ["--error-code", "3001", "--error-stage", "after-tts-start", "--tts-bad-codec"]
+    )
+    assert explicit.error_code == 3001, f"--error-code 解析错误：{explicit.error_code}"
+    assert explicit.error_stage == "after-tts-start", (
+        f"--error-stage 解析错误：{explicit.error_stage}"
+    )
+    assert explicit.tts_bad_codec is True, "--tts-bad-codec 解析错误"
+
+    for stage in ERROR_STAGES:
+        parsed = _parse_args(["--error-stage", stage])
+        assert parsed.error_stage == stage, f"--error-stage {stage} 解析错误"
+
+    rejected = False
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            _parse_args(["--error-stage", "after-everything"])
+        except SystemExit:
+            rejected = True
+    assert rejected, "非法 --error-stage 应被 argparse 拒绝"
+
+
 async def run_self_test() -> int:
     base = Config(
         host="127.0.0.1",
@@ -1575,6 +1873,31 @@ async def run_self_test() -> int:
         ("TTS 流进行中 ping 仍能收到 pong", _t_ping_during_tts(replace(base, chunk_ms=20, max_tts_frames=100))),
         ("token 不匹配时按约定关闭码拒绝", _t_auth_rejected(base)),
         ("--drop-pong 不回 pong（端侧超时路径）", _t_drop_pong(replace(base, drop_pong=True))),
+        # ---- T3.6：错误提示 mock 扩展（error_prompt_test.py 依赖） ----
+        (
+            "error 默认：audio_end 后直接报错（code=1、无 asr/tts）",
+            _t_error_default(replace(base, scenario="error")),
+        ),
+        (
+            "error --error-code 3001：下发 JSON code 原样",
+            _t_error_code(replace(base, scenario="error", error_code=3001)),
+        ),
+        (
+            "error --error-stage after-asr：先 asr_final 再 error",
+            _t_error_after_asr(replace(base, scenario="error", error_stage="after-asr")),
+        ),
+        (
+            "error --error-stage after-tts-start：先真实 MP3 帧再 error",
+            _t_error_after_tts_start(replace(base, scenario="error")),
+        ),
+        (
+            "--tts-bad-codec：tts_start codec=pcm + tts_end、不发音频帧",
+            _t_tts_bad_codec(replace(base, tts_bad_codec=True)),
+        ),
+        (
+            "CLI：--error-code/--error-stage/--tts-bad-codec 解析与默认值",
+            _t_cli_config(),
+        ),
     ]
 
     passed = 0
@@ -1674,6 +1997,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="真实 MP3 发送节奏：帧时长的百分比（100=实时；测试可略快，如 90）",
     )
     parser.add_argument("--verbose", action="store_true", help="打印上行 payload 前 16 字节")
+    # ---- T3.6：错误提示（云端错误码/报错时机/坏 codec 注入；error_prompt_test.py 用） ----
+    parser.add_argument(
+        "--error-code",
+        type=int,
+        default=1,
+        help="--scenario error 下发的 error.code（默认 1=通用；3001/3002=TTS 失败，端侧应播 tts-fail 提示音）",
+    )
+    parser.add_argument(
+        "--error-stage",
+        choices=ERROR_STAGES,
+        default="after-audio-end",
+        help="云端报错时机：audio_end 后（现状）/ asr_final 后 / tts_start+3~5 帧真实 MP3 后",
+    )
+    parser.add_argument(
+        "--tts-bad-codec",
+        action="store_true",
+        help='tts_start 用 codec="pcm" 后发 tts_end、不发音频帧（触发设备侧 TTS 无法播放 → 失败提示音）',
+    )
     parser.add_argument("--self-test", action="store_true", help="进程内自测，不需要硬件")
     return parser.parse_args(argv)
 
@@ -1692,6 +2033,13 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--tts-piper（回声测试）与 --tts-mp3（固定音频）互斥，二选一")
     if args.tts_piper and args.asr == "none":
         raise SystemExit("--tts-piper 是回声测试：需要同时开 --asr sensevoice 才有识别文本可复读")
+    if args.tts_bad_codec and args.scenario == "error":
+        raise SystemExit(
+            "--tts-bad-codec（设备侧 TTS 失败路径）与 --scenario error（云端 error 事件）互斥，"
+            "两者测的是不同反馈来源；需要云端 TTS 错误码用 --scenario error --error-code 3001"
+        )
+    if args.error_code < 0:
+        raise SystemExit(f"--error-code 必须 >= 0（当前 {args.error_code}）")
     max_tts_frames = args.max_tts_frames
     if max_tts_frames is None:
         # 真实音频（固定 MP3 / 回声合成）默认全发；合成帧默认 100 帧 ≈ 2s
@@ -1728,6 +2076,9 @@ def main(argv: list[str] | None = None) -> int:
         tts_piper_speed=args.tts_piper_speed,
         tts_piper_model_dir=args.tts_piper_model_dir,
         tts_piper_download=args.tts_piper_download,
+        error_code=args.error_code,
+        error_stage=args.error_stage,
+        tts_bad_codec=args.tts_bad_codec,
         quiet=args.self_test,
         verbose=args.verbose,
     )
@@ -1736,6 +2087,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.asr_threads < 1:
         raise SystemExit(f"--asr-threads 必须 >= 1（当前 {args.asr_threads}）")
     _setup_logging(cfg)
+    if args.scenario != "error" and (args.error_code != 1 or args.error_stage != "after-audio-end"):
+        LOG.warning("--error-code/--error-stage 只在 --scenario error 下生效，本次启动忽略")
+    if args.tts_bad_codec:
+        LOG.info("已启用 --tts-bad-codec：下一轮 tts_start 用 codec=%s 且不发音频帧", TTS_BAD_CODEC)
 
     if args.self_test:
         return asyncio.run(run_self_test())

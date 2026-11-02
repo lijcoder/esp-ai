@@ -1959,7 +1959,7 @@ def run_self_test() -> bool:
         "S27 evt post BUTTON 回显识别（带 payload 措辞容错）",
     )
     result.check(
-        RE_EVT_POST_REJECT.search("未知事件: BUTTON（evt list 查看；支持名字或 0~12 的 ID）")
+        RE_EVT_POST_REJECT.search("未知事件: BUTTON（evt list 查看；支持名字或 0~13 的 ID）")
         is not None,
         "S28 evt post 被拒绝可检出（负例）",
     )

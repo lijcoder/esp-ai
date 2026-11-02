@@ -693,19 +693,28 @@ def preflight_assets() -> list[dict]:
 
 
 def error_lines(lines: list[str]) -> list[str]:
-    """筛出与本链路相关的错误：网络/WS 的 ERROR 与本次测试无关，忽略（与 voice_test 一致）。"""
+    """筛出与本链路相关的错误：网络/WS 的 ERROR 与本次测试无关，忽略（与 voice_test 一致）。
+
+    T3.6：`E (...) VS: 会话进入 ERROR（原因=…）` 是预期异常反馈语义日志（随后播错误
+    提示音并 ERROR→IDLE），按白名单排除；panic/assert/Guru 仍会返回并 FAIL。
+    """
     pat = re.compile(r"ERROR|panic|abort|Guru Meditation|stack overflow|StoreProhibited")
     tag_re = re.compile(r"[EW] \(\d+\) ([A-Za-z_0-9-]+):")
     ignored_tags = {
         "NET", "WS", "wifi", "websocket_client", "esp_netif", "esp-tls", "esp_wifi",
         "wpa_supplicant", "phy_init", "net80211", "esp_https_ota", "HTTP_CLIENT",
     }
+    ignored_patterns = (
+        re.compile(r"VS: 会话进入 ERROR（"),  # T3.6 异常反馈的预期语义日志
+    )
     out = []
     for line in lines:
         if not pat.search(line):
             continue
         m = tag_re.search(line)
         if m and m.group(1) in ignored_tags:
+            continue
+        if any(ignored.search(line) for ignored in ignored_patterns):
             continue
         out.append(line)
     return out

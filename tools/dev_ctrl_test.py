@@ -188,6 +188,10 @@ def scenario_short(dev: Device, result: Result) -> None:
     )
     result.check(after.get("long") == before.get("long"), "A: 短按不增加长按计数")
     dev.console("vs interrupt", re.compile(r"已打断|未在进行"), timeout=2.0)
+    # T3.6：无 mock（--skip-interrupt / WS 未 READY）时，短按起轮失败会播「网络未连接」
+    # 提示音并走 ERROR → IDLE。这里等状态机收尾，避免提示音窗口干扰 B（长按静音）时序；
+    # 等待失败不判 FAIL（有 mock 时本来就只有 2~3s 的 TTS 流程，状态自然回 IDLE）。
+    wait_vs_state(dev, "IDLE", 6.0)
 
 
 def scenario_mute(dev: Device, result: Result) -> None:
@@ -492,8 +496,14 @@ def main() -> int:
         scenario_heap(dev, result, args)
 
         errors = [line for _, line in dev.lines if re.search(r"^\s*E \(", line)]
-        dev_ns = [line for line in errors if "DEV:" in line or "PLAYER:" in line or "VS:" in line]
-        result.check(not dev_ns, f"全程无 DEV/PLAYER/VS 相关 ERROR 日志（{len(dev_ns)} 条）")
+        # T3.6：`VS: 会话进入 ERROR（…）` 是预期异常反馈语义日志（离线/云端错误时随提示音
+        # 出现），不是崩溃；panic/assert 与其它 ERROR 仍要 FAIL。
+        unexpected = [line for line in errors if "VS: 会话进入 ERROR（" not in line]
+        dev_ns = [line for line in unexpected
+                  if "DEV:" in line or "PLAYER:" in line or "VS:" in line]
+        result.check(not dev_ns,
+                     f"全程无 DEV/PLAYER/VS 相关 ERROR 日志（{len(dev_ns)} 条，"
+                     f"已排除 T3.6 预期异常反馈 {len(errors) - len(unexpected)} 条）")
     finally:
         # 收尾：恢复默认状态（未静音 / LED auto / 续听开）
         try:

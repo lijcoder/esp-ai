@@ -13,6 +13,7 @@
 | `voice_cloud_test.py` | 语音云端到端真机自测（T2.5）：起 mock → 唤醒 → 上行 Opus → 下行事件 → sid/统计断言 | `uv run tools/voice_cloud_test.py`，见下文 |
 | `tts_stream_test.py` | 下行 TTS **流式播放**真机自测（T2.4 / T3.2 R3–R5）：真实 MP3 经 WS 0x02 下发 → 首帧延迟/欠载/解码对拍/abort/排空/10 轮堆稳定；可选 R4 按键打断、R5 无丢弃、R3 ducking、提示音 R1 原因位 | `uv run tools/tts_stream_test.py`，见下文 |
 | `e2e_voice_test.py` | **端到端语音**真机自测（T2.6）：唤醒 → 上行 Opus → 真实 MP3 下行流式播放 → R2，10 轮稳定性 + P2 验收断言 | `uv run tools/e2e_voice_test.py`，见下文 |
+| `error_prompt_test.py` | **T3.6 错误提示**真机自测：mock 注入云端错误码/时机/坏 codec → 离线唤醒/中途断网/ERROR 反馈/超时/TTS 失败/打断/稳定性，断言 `VS:`/`FB:` 日志与 `fb status`/`vs status`/`mic stat` | `uv run tools/error_prompt_test.py`，见下文 |
 | `record_wav.py` | 串口采集 WAV，用于唤醒/AEC 实测（**T5.2 计划，尚未实现**） | — |
 
 ## 语音测试素材 —— lexin.wav + 两个交互语音
@@ -103,7 +104,10 @@ uv run tools/voice_test.py --no-reset --wakes 1   # 设备已在跑、不想复�
 - 系统输出未静音、音量 ≤ 50%；`--volume` 临时改音量，结束（含异常/Ctrl-C）恢复原值。
 - 素材存在且为 24 kHz / 16 bit / mono；设备启动/控制台就绪，启动无语音相关 ERROR。
 - `mic stat` 基线 I2S 读失败 0 次；基线 RMS 偏高时 WARN（环境噪声会拉低唤醒率）。
-- 唤醒链路完整顺序：`wake detected → feed paused → PLAYER: play → prompt done, feed resumed`；默认要求全部成功，`--min-wake-pass` 可放宽。
+- 唤醒链路完整顺序（**T3.6 起双分支**，按设备当时是否连上 mock 自动判定并分别断言）：
+  - 有 mock / WS READY（旧链）：`wake detected → feed paused → PLAYER: play → prompt done, feed resumed`；
+  - 无 mock / 云端未就绪（T3.6 离线链）：`wake detected → LISTENING->ERROR(net-offline) → FB: 反馈 → PLAYER: play → feed paused → FB: 提示音完成 → ERROR->IDLE → feed resumed`，且**不得**出现 `prompt done`（不播「我在呢」，直接播「网络未连接」）。
+  默认要求全部成功，`--min-wake-pass` 可放宽；两条分支都算 PASS。
 - 两个交互语音：误唤醒 0、回放后 `收音 开启`（R2）、I2S 读失败 0、无 ERROR；VAD 非人声只 WARN（环境相关）。
 - 结束 `sys info` 无 ERROR/panic。
 
@@ -815,6 +819,47 @@ uv run tools/e2e_voice_test.py --no-reset --log /tmp/e2e.log
 - 跑测试时**宿主不要并发重负载**：mock 进程被抢占 >150ms 会造成 1 次真欠载（环境噪声，重跑即可，
   不要改阈值/调大 pace 掩盖）。真实云端同样必须关 Nagle（见 `ws_mock_server.py` 章节）。
 
+## error_prompt_test.py —— T3.6 错误提示真机自测（8 类异常反馈路径）
+
+**作用**：一条命令按场景**重启 mock**（错误码/报错时机/坏 codec）→ 复位设备 → 逐场景触发异常
+（离线唤醒 / 中途断网 / 云端 error / THINKING 超时 / 设备侧 TTS 失败 / 打断 / 正常轮 / SPEAKING 中报错 /
+10 轮稳定性）→ 断言 `VS:`/`FB:`/`PLAYER:` 日志与 `fb status`/`vs status`/`mic stat` 字段 →
+逐场景 PASS/FAIL + 机器可读汇总 + 退出码 0/1。契约依据 `build/t36_contract.md` §3.2/§3.3/§5.2。
+
+```bash
+uv run tools/error_prompt_test.py                    # 全场景（约 2~3 分钟；脚本自己起/重启 mock）
+uv run tools/error_prompt_test.py --scenarios A       # 只测离线唤醒反馈（不需要 mock）
+uv run tools/error_prompt_test.py --scenarios C,D,J   # 只测云端 error 两档 + 稳定性
+uv run tools/error_prompt_test.py --no-mock --scenarios B   # 复用外部 mock（mock 侧断言跳过）
+uv run tools/error_prompt_test.py --self-test        # 离线自检解析/判定（38 项，不连设备）
+uv run tools/error_prompt_test.py --dry-run          # 只检查素材/音量/串口/场景计划（不开串口）
+```
+
+**场景与断言**（触发方式：A 走真实唤醒；B 走真实 `wifi reconnect`；C~J 用 `vs start` + `vc stop` 确定性起轮，
+让 voice_session 真的拥有本轮；`--scenarios` 支持 `A,C,J` 与范围 `A-C`）：
+
+| 场景 | 注入（mock 参数） | 关键断言 |
+|---|---|---|
+| A 起轮前网络未连接 | 不启 mock，`afplay lexin.wav` | T3.6 离线唤醒链：`VS: wake detected` → `state LISTENING -> ERROR`（原因 net-offline）→ `FB: 反馈 kind=net-offline` → `PLAYER: play` → `FB: 提示音完成` → `ERROR -> IDLE`；**无** `prompt done`；`hold_mask` 0x1→0x0；`fb status`/`vs status` 各类计数 +1 |
+| B 会话中途断网 | 默认 mock + `wifi reconnect` | `VS: 网络断开` → net-offline 反馈 → `ERROR -> IDLE`；`vc status` 回 IDLE（无残留轮次） |
+| C 云端通用 error | `--scenario error --error-code 1` | cloud-error 提示音 + `VS: 会话进入 ERROR（cloud-error）` + `VC: 云端 error code=1` |
+| D 云端 TTS 错误 | `--error-code 3001` | 同一 error 事件映射为 **tts-fail** 提示音（code→kind 映射） |
+| E THINKING 超时 | `--think-ms 12000` | `VC: 等待云端响应超时` → timeout 提示音；`audio_end → 提示音` 耗时 **9.5~13.0s** |
+| F 设备侧 TTS 失败 | `--tts-bad-codec` | `VC: tts_start codec=pcm 非 mp3` / `无法播放` WARN → tts-fail 提示音 |
+| G 打断不误播 | 默认 mock，SPEAKING 中 `vs interrupt` | 窗口内无任何 `错误反馈` 日志、`fb status` 总播放不增加、不进 ERROR |
+| H 正常轮不误播 | 默认 mock | 正常 `tts_start/tts_end` 一轮结束：无错误反馈、完成轮次 +1 |
+| I SPEAKING 中云端报错 | `--error-code 3001 --error-stage after-tts-start` | 先 `PLAYER: stream end/abort` 再 `FB: 反馈`（无叠音）、无「反馈被丢弃 busy」、`VS: speaking done` |
+| J 稳定性 | `--error-code 1` × `--stability-rounds 10` | 每轮反馈完成→IDLE；`fb status` 总播放/分类各 +10、`vs status` 云端口 +10；内部堆最低水位 ≥30KB、free/PSRAM 波动在阈值内、无 panic |
+
+**依赖与限制**：PEP 723 内联声明 `pyserial>=3.5`；`afplay` 回放遵守用户音量口径（默认 `--volume 50`
+临时调到上限、结束恢复）。脚本**独占串口**（先关 `idf.py monitor`）；会按场景重启 mock，设备通过
+`ws reconnect` 重新握手。**真机板测由 Lead 执行**（本脚本开发者不在本机开串口），因此交付验证只做
+`--self-test` + `--dry-run`；真实断言口径与 `--self-test` 复用同一套解析函数。
+
+**与其它脚本的分工**：`voice_test.py` 只验唤醒/拾音（T3.6 起兼容有/无 mock 两条唤醒链）；
+`voice_cloud_test.py`/`tts_stream_test.py` 验协议与流式播放（不应出现错误反馈）；`e2e_voice_test.py`
+验正常端到端；本脚本专测**异常路径的反馈**（谁触发、播哪条、是否收尾、是否误播、资源是否泄漏）。
+
 ## ws_mock_server.py —— 本地「云端」WS 模拟服务（T1.5 / T2.4）
 
 **作用**：在真实后端就绪前，用一台电脑模拟云端 WebSocket 服务（握手、心跳、事件下发、TTS 音频流），让端侧 T1.4/T1.6 以及 P2–P4 全部能脱机联调（ROADMAP §2.0 P1 顺序 0：可最早启动，端侧不必等后端）。T2.4 起支持 `--tts-mp3` 下发**真实 MP3**（按帧切分、实时节奏），并可用 `--tts-stall-*`/`--tts-late-bin` 制造欠载与窗口外帧。
@@ -839,12 +884,12 @@ uv run tools/ws_mock_server.py                  # 起服务，打印可直连的
 
 ```bash
 uv run tools/ws_mock_server.py --self-test
-# [1/13] PASS  hello / hello_ack 握手与参数解析
+# [1/19] PASS  hello / hello_ack 握手与参数解析
 # ...
-# self-test: 13/13 PASS   退出码 0
+# self-test: 19/19 PASS   退出码 0
 ```
 
-进程内起服务 + 起客户端，覆盖 **13 项**：`hello`/`hello_ack` 握手、**accept 连接 `TCP_NODELAY=1`（getsockopt 校验，防 Nagle 假欠载）**、ping→pong、一轮语音的事件顺序/`sid` 回填/二进制帧头、**tts-mp3（真实 MP3 按帧切分/帧头连续/实时节奏）**、**tts-stall（中途停发且不丢帧）**、**tts-late-bin（tts_start 前/tts_end 后各 1 帧窗口外注入）**、坏帧容错、`interrupt` 取消、断线重连、TTS 流中 ping、token 拒绝关闭码、`--drop-pong`。
+进程内起服务 + 起客户端，覆盖 **19 项**：`hello`/`hello_ack` 握手、**accept 连接 `TCP_NODELAY=1`（getsockopt 校验，防 Nagle 假欠载）**、ping→pong、一轮语音的事件顺序/`sid` 回填/二进制帧头、**tts-mp3（真实 MP3 按帧切分/帧头连续/实时节奏）**、**tts-stall（中途停发且不丢帧）**、**tts-late-bin（tts_start 前/tts_end 后各 1 帧窗口外注入）**、坏帧容错、`interrupt` 取消、断线重连、TTS 流中 ping、token 拒绝关闭码、`--drop-pong`；**T3.6 新增 6 项**：error 默认（code=1、无 asr/tts）、`--error-code` 原样下发、`--error-stage after-asr`（先 asr_final 再 error）、`--error-stage after-tts-start`（先 tts_start + 3~5 帧真实 MP3 再 error、无 tts_end）、`--tts-bad-codec`（codec=pcm + tts_end、0 音频帧）、CLI 参数解析/默认值/非法 stage 拒绝。
 
 自测用的真实 MP3 以 base64 内嵌在脚本里（lameenc 生成、22 帧/528ms），**不依赖 `av`/`lameenc`**，
 仍是一行命令零硬件；内嵌码流同时验证解析器能跳过 ID3v2 头。
@@ -1017,6 +1062,9 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 | `--tts-piper` | 关 | **回声测试**：ASR 识别文本 → 本地 Piper 合成后下发（与 `--tts-mp3` 互斥，需 `--asr`） |
 | `--tts-piper-voice` / `--tts-piper-speed` | `zh_CN-huayan-medium` / 1.0 | Piper 音色与语速（length_scale，>1 更慢） |
 | `--tts-piper-model-dir` / `--tts-piper-download` | 空 / 关 | Piper 音色目录 / 缺失时下载（约 60MB） |
+| `--error-code N` | 1 | **T3.6**：`--scenario error` 下发的 `error.code`（3001/3002 映射 tts-fail 提示音） |
+| `--error-stage S` | `after-audio-end` | **T3.6**：报错时机 `after-audio-end`（现状）/ `after-asr`（先 asr_final）/ `after-tts-start`（先 tts_start + 3~5 帧真实 MP3，测 SPEAKING 中报错） |
+| `--tts-bad-codec` | 关 | **T3.6**：`tts_start` 用 `codec:"pcm"` 后发 `tts_end`、**不发音频帧**（触发设备侧 TTS 无法播放 → tts-fail 提示音）；与 `--scenario error` 互斥 |
 | `--verbose` | 关 | 打印上行 payload 前 16 字节（库自身的握手 DEBUG 已压到 WARNING） |
 | `--self-test` | — | 进程内自测，不需要硬件 |
 
@@ -1051,10 +1099,12 @@ uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc
 - **每条 accept 连接默认开 `TCP_NODELAY`（关 Nagle）**：mock 每 ~20ms 下发一个 0x02 帧，若被 Nagle 攒批（叠加端侧 delayed ACK 的 ~200ms），设备会每 200–250ms 才集中收一批，ring 耗尽被误判成端侧 `underrun>0` 的**假欠载**（T2.4-C2 真机实测：`tts_stream_test.py` 稳态 underrun=1）。实现方式：`serve(..., process_request=...)` 在握手前对 `connection.transport` 调 `setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)`，handler 里再兜底设一次；`--self-test` 有一条用 `getsockopt` 校验。**真实云端实现同样必须关 Nagle**；这是服务端/测试环境的修复，**不放宽契约 `underrun=0` 阈值**。
 - `scenario=music` 只回 `music_track`，`url` 不可播放（T1.5 不提供 HTTP 音频服务，P4 前补）；`music_status` 只记日志。
 - `--tts-mp3` 的帧切分/节奏是**工具行为**，不改协议：帧头 8B / seq / tts_start·tts_end 顺序与合成帧模式完全一致；`--tts-late-bin`/`--tts-stall-*` 都只影响 mock 发送时序，端侧契约不变。
-- 契约已由 T2.5 全部定稿并回填 [PROTOCOL.md](../docs/PROTOCOL.md)：`hello_ack` / 鉴权关闭码 / `pong` 口径 / 双传输 / 二进制帧 `sid` 关联（P-2）/ `error` 码表（P-4）；只剩音乐事件 `sid` 归属留 T4.2（P-3）。mock 的 `error` 用 `code=1`（通用）。
+- 契约已由 T2.5 全部定稿并回填 [PROTOCOL.md](../docs/PROTOCOL.md)：`hello_ack` / 鉴权关闭码 / `pong` 口径 / 双传输 / 二进制帧 `sid` 关联（P-2）/ `error` 码表（P-4）；只剩音乐事件 `sid` 归属留 T4.2（P-3）。mock 的 `error` 默认 `code=1`（通用），**T3.6 起可用 `--error-code` 注入 3001/3002 等码表值**（用于验证端侧「语音播放失败」提示音）。
+- **T3.6 新增参数只影响 mock 发送时机/字段，不改协议**：`--error-stage` 只是把既有 `asr_final`/`tts_start`/二进制帧与 `error` 的先后顺序换一下；`--tts-bad-codec` 仍是合法的 `tts_start.codec` 字段（设备对未知 codec 的降级行为由端侧实现）。
 
 ## 后续（未做）
 
+- **T3.6 错误提示**由 `error_prompt_test.py` 覆盖（云端 error/超时/设备侧 TTS 失败/离线唤醒/中途断网/打断/正常轮/10 轮稳定性），mock 侧由 `--error-code/--error-stage/--tts-bad-codec` 支撑；host 纯逻辑单测见 `test/host/`。
 - `voice_cloud_test.py` 已承接 P2 端到端断言（唤醒 → 上行 Opus → ASR/LLM/TTS → 收尾/中止 + sid 过滤）；`mp3_test.py` 承接下行解码断言（T2.3 已交付）；**`tts_stream_test.py` 承接 T2.4 流式播放断言**（真实 MP3 → 首帧延迟/欠载/解码对拍/abort/排空/堆稳定）；P3 半双工：T3.1 会话状态机由 `voice_cloud_test.py` 覆盖，**T3.2 R4 按键打断 / R5 无丢弃 / R3 ducking 由 `tts_stream_test.py` 的 `--interrupt`/`--r5`/`--r3-duck` 覆盖**；**T3.4 按键/LED/静音由 `dev_ctrl_test.py` 覆盖**（真实 GPIO0 按键路径 + 停声 <100ms + LED 模式）；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
 - 下行流式播放断言（T2.4）→ **已交付 `tts_stream_test.py`**；mock 真实 MP3 下发 → **已交付 `--tts-mp3`**。
 - HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求），P4（T4.1/T4.2）前补。

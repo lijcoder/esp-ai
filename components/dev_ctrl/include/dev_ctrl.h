@@ -15,6 +15,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -67,6 +68,39 @@ esp_err_t dev_led_set_mode(dev_led_mode_t mode);
 
 /** 当前 LED 模式 */
 dev_led_mode_t dev_led_get_mode(void);
+
+/** 运行期亮度（0~255），覆盖 Kconfig 默认值（不持久化，T3.4 调试/观感校准用） */
+esp_err_t dev_led_set_brightness(uint8_t brightness);
+
+/** 当前运行期亮度 */
+uint8_t dev_led_get_brightness(void);
+
+/** 直接发一帧原始 RGB（不做亮度缩放、不改模式；`dev led rgb` 调试用） */
+esp_err_t dev_led_raw_rgb(uint8_t r, uint8_t g, uint8_t b);
+
+/** 切换 WS2812 时序预设（0..dev_led_preset_count()-1；`dev led timing` 调试用） */
+esp_err_t dev_led_set_preset(int preset);
+
+/** 时序预设总数 */
+unsigned dev_led_preset_count(void);
+
+/** 当前时序预设号 */
+int dev_led_get_timing_preset(void);
+
+/** 时序预设名（打印用；越界返回 "?"） */
+const char *dev_led_preset_name(int preset);
+
+/** 打印自检信息（时序预设/实测循环开销/整帧 cycle）；返回实测开销 cycle 数 */
+unsigned dev_led_selfcheck(void);
+
+/** 依次把 bit0 高电平从 500ns 缩到 100ns 并各发一帧全黑（约 10s，看灯何时变黑） */
+void dev_led_sweep_t0h(void);
+
+/** 发任意字节序列（MSB 先发）：试 RGB(3 字节) / RGBW(4 字节) 等变体 */
+esp_err_t dev_led_send_bytes(const uint8_t *data, size_t n);
+
+/** 实测四段脉宽（ns） */
+esp_err_t dev_led_measure_segments(uint16_t *t0h, uint16_t *t0l, uint16_t *t1h, uint16_t *t1l);
 
 /** 读取统计（out 为空返回 ESP_ERR_INVALID_ARG） */
 esp_err_t dev_stats_read(dev_stats_t *out);

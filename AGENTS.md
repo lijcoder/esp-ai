@@ -22,7 +22,7 @@
 | 现在做到哪、下一步做什么 | `docs/STATUS.md` | §1 当前状态、§2 任务看板 |
 | 任务定义 / 工期 / 验收标准 | `docs/ROADMAP.md` | §2 任务清单、§5 交付标准 |
 | 某个功能怎么设计 | `docs/ARCHITECTURE.md` | §1 范围、§3 音频、§4 模块、§6 协议、§7 状态机、§9 分区 |
-| 代码怎么写才合规 | `docs/CONVENTIONS.md` | 全文（约 90 行） |
+| 代码怎么写才合规 | `docs/CONVENTIONS.md` | 全文（分层/音频/内存/提交规则） |
 | 引脚 / 接线 / 电源 / 自检 | `docs/HARDWARE.md` | §2 引脚、§3 接线、§5 电源、§8 自检 |
 | 新功能要不要做 / 已知技术问题怎么取舍 | `docs/PRODUCT_IDEAS.md` | §5 优先级矩阵、§6 决策记录、§8 技术调研记录 |
 | 暂缓功能预留了什么 | `docs/ARCHITECTURE.md` | 附录 A（预留点）、附录 B（待定输入） |
@@ -35,9 +35,10 @@
 - 直接执行：`idf.py build`、`idf.py -p <PORT> flash monitor`、`idf.py size`。
 - **不要 `source export.sh`**：本机是 EIM 安装方式，PATH 已就绪，source 反而报错。
 - 提交前必须：build 通过 + size 无明显增长。
-- **唤醒别喊话**：测"嗨，乐鑫"用 `afplay tools/lexin.wav`（Mac 扬声器回放、设备麦克风拾音），不需要人工喊；`idf.py -p <PORT> monitor` 侧预期 `APP: wake detected` → `AFE: feed paused` → `PLAYER: play ...` → `APP: prompt done, feed resumed`。**音量按用户定稿：系统音量正常 31%、上限 50%（不得超过；70% 已否决）、`afplay` 默认增益**；`-v` 放大须满足 系统音量×增益 ≤50%（如 31% + `-v 1.5` ≈ 46.5% 可）。用法与注意事项见 `tools/README.md`。
+- **唤醒别喊话**：测"嗨，乐鑫"用 `afplay tools/lexin.wav`（Mac 扬声器回放、设备麦克风拾音），不需要人工喊；`idf.py -p <PORT> monitor` 侧预期 `VS: wake detected`（旧固件 `APP:`）→ `AFE: feed paused` → `PLAYER: play ...` → `(VS|APP): prompt done, feed resumed`。**离线时（ws 未 READY）T3.6 起不播"我在呢"、直接播"网络未连接"提示音后回 IDLE**（`voice_test.py` 双分支兼容）。**音量按用户定稿：系统音量正常 31%、上限 50%（不得超过；70% 已否决）、`afplay` 默认增益**；`-v` 放大须满足 系统音量×增益 ≤50%（如 31% + `-v 1.5` ≈ 46.5% 可）。用法与注意事项见 `tools/README.md`。
 - **交互语音也回放**：唤醒提示音结束（`feed resumed`）之后用 `afplay tools/今天天气如何.wav` / `afplay tools/今天吃了什么.wav` 模拟用户说话；**自动回归一条命令**：`uv run tools/voice_test.py --volume 50`（覆盖 3 个素材 + 串口断言，音量临时调到上限后自动恢复）。实测与参数见 `tools/README.md`。
 - **端云链路自动回归（T2.5 起）**：`uv run tools/voice_cloud_test.py` 自己拉起 mock、复位设备、回放唤醒+交互语音，断言上行 Opus/下行 ASR-TTS 事件/`sid` 过滤/收尾与内存，43 项 PASS 才算过；`--inject-late` 额外验证迟到帧丢弃。参数见 `tools/README.md`。
+- **异常反馈自动回归（T3.6 起）**：`uv run tools/error_prompt_test.py` 自己拉起 mock/复位设备/回放唤醒，覆盖四类异常（网络未连接 / 云端 error / THINKING 超时 / TTS 失败）+「播放中打断不误播 / 正常轮不误播 / SPEAKING 中云端报错先停 TTS 再播 / 10 轮稳定」，**289 项 PASS** 才算过（`--self-test` 离线 51 项、`--dry-run`、`--scenarios A-C` 可挑场景；设备侧 `fb status` / `fb test <net|cloud|timeout|tts>` 可人工试听）。参数见 `tools/README.md`。
 
 ## 4. 铁律（违反会返工，完整版见 CONVENTIONS）
 

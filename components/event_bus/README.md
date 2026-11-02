@@ -22,7 +22,9 @@
 | `APP_EVT_TTS_START` | `app_evt_tts_start_t { sid, codec(1=mp3), sr }` |
 | `APP_EVT_TTS_END` | `app_evt_tts_end_t { sid, frames }`（本轮下行音频帧数） |
 | `APP_EVT_VOICE_STATE_CHANGED` | `app_evt_voice_state_t { sid, from, to, reason, dur_ms }`（T3.1 定稿；`voice_session` 每次迁移后投递） |
-| 其余 10 个事件 | 暂无（post 时传 `NULL`），使用方落地时补定义并同步 ARCHITECTURE §4.2 |
+| `APP_EVT_BUTTON` | `app_evt_button_t { action(1=短按/2=长按), reserved[3] }`（T3.2 定稿；T3.4 `dev_ctrl` 投递，`voice_session` 消费短按） |
+| `APP_EVT_FEEDBACK` | `app_evt_feedback_t { uint16_t sid; int32_t code; uint8_t kind; uint8_t reserved[3]; }`（T3.6 定稿；`kind` = `fb_kind_t`：1=`net-offline`/2=`cloud-error`/3=`timeout`/4=`tts-fail`。由 `feedback` 组件在 `fb_notify()` 调用方上下文投递，**语音只是当前反馈通道**；未来屏幕/灯光等组件订阅本事件即可，不改 `feedback`/`voice_session`） |
+| 其余 5 个事件 | 暂无 payload（`WAKE_DETECTED`、`VAD_SPEECH_START/END`、`MUSIC_STATE_CHANGED`、`MUSIC_ERROR`；post 时传 `NULL`），使用方落地时补定义并同步 ARCHITECTURE §4.2 |
 
 payload 统一装进定长 32 字节的 `app_evt_data_t`：投递时整块拷贝，**发布方不需要保活数据**，处理器拿到的 `data` 只在本次回调内有效。文本类 payload 的定长/截断口径已由 T2.5 定稿（ASR 文本最多 28B，完整文本走 `voice_cloud` 日志/回调）；**不要自行往 union 里加变长字段**，新增字段先改 ARCHITECTURE §4.2。
 
@@ -52,7 +54,7 @@ payload 统一装进定长 32 字节的 `app_evt_data_t`：投递时整块拷贝
 `diag` 提供命令：
 
 ```
-evt list                          # 列出 13 个事件与 payload 支持情况
+evt list                          # 列出 14 个事件与 payload 支持情况
 evt post <name|id>                # 投递一个事件（网络事件带示例 payload）
 evt burst <n>                     # 连续投递 n 个无 payload 事件，验证非阻塞与队列满路径
 evt trace on|off                  # 订阅/取消订阅全部事件，在 evt 任务上下文打印 INFO

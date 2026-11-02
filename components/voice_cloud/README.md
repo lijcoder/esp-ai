@@ -13,7 +13,7 @@
 |---|---|
 | 一轮上行链路（读 PCM → 编码 → 发帧 → 收尾）、协议超时 | 会话状态机 `IDLE/LISTENING/THINKING/SPEAKING/ERROR`（T3.1 `voice_session`，已落地） |
 | `audio_start` / `audio_end` 报文（`sid` 由 `voice_session` 传入） | VAD/唤醒事件接线（T1.2b 已由 `voice_session` 消费）、会话级错误策略与提示音 |
-| 下行语音事件解析、`sid` 过滤、事件/回调分发 | 错误提示音（T3.6）、按键打断（T3.2/T3.4） |
+| 下行语音事件解析、`sid` 过滤、事件/回调分发；**T3.6：`VC_EVT_TTS_FAIL` 上报设备侧播不出 TTS 的原因** | 错误提示音的播放/展示（`feedback`，T3.6；本组件只上报事实）、按键打断（T3.2/T3.4） |
 | 下行 0x02 → `audio_player` 流式播放的接线（开流/写帧/收尾/打断 + R1/R2） | MP3 解码与 I2S 输出本身（`audio_player`，T2.4-A） |
 | 上行/下行统计（`vc status`） | 音乐协议（T4.2） |
 
@@ -26,8 +26,8 @@
 | `vc_stop()` | 优雅收尾：补 `enc_flush` 尾帧 + 发 `audio_end`（用于调试/按键路径） |
 | `vc_cancel()` | 立即放弃：不补尾帧、不发 `audio_end` |
 | `vc_interrupt()` | **T3.2 R4**：先发 `{"t":"interrupt","sid":N}` 报文，再 `vc_cancel()`；无进行中的轮次时只打日志不发报文。报文发送失败只 WARN（本地照样打断），不等待服务端应答 |
-| `vc_is_busy()` / `vc_get_state()` / `vc_state_name()` / `vc_current_sid()` | 三态观测（`IDLE` / `UPLINK` / `WAIT_RESPONSE`） |
-| `vc_register_cb(cb, arg)` | 业务回调（覆盖语义），与 `event_bus` 事件同时分发；回调在 `ws_client` 任务上下文，**禁止阻塞**，`text` 只在回调内有效。T3.1 起事件枚举增加 `VC_EVT_UPLINK_END`（`code`=收尾原因）与 `VC_EVT_ROUND_END`（`round_end`=`vc_round_end_t`），供 `voice_session` 驱动状态机 |
+| `vc_is_busy()` / `vc_is_ready()` / `vc_get_state()` / `vc_state_name()` / `vc_current_sid()` | 三态观测（`IDLE` / `UPLINK` / `WAIT_RESPONSE`）；**T3.6 `vc_is_ready()`**：唤醒前预判“现在能不能起一轮”（已初始化 + WS READY + 无进行中/待起轮），供 `voice_session` 决定播“我在呢”还是直接给“网络未连接”反馈 |
+| `vc_register_cb(cb, arg)` | 业务回调（覆盖语义），与 `event_bus` 事件同时分发；回调在 `ws_client` 任务上下文，**禁止阻塞**，`text` 只在回调内有效。T3.1 起事件枚举增加 `VC_EVT_UPLINK_END`（`code`=收尾原因）与 `VC_EVT_ROUND_END`（`round_end`=`vc_round_end_t`），供 `voice_session` 驱动状态机；**T3.6 增加 `VC_EVT_TTS_FAIL`（`code`=`vc_tts_fail_t`：非 MP3/缺采样率/MP3 能力不可用/播放器忙/开流失败），每轮最多上报一次** |
 | `vc_stats_read()` / `vc_stats_reset()` | 轮次/上行帧/字节/首帧耗时/下行事件/`sid` 丢弃/解析失败/下行音频播放与丢弃等统计（`diag` 的 `vc status` 使用） |
 
 ## 一轮的时序
@@ -61,9 +61,9 @@ voice_session（IDLE→LISTENING，提示音播完、sid 已分配）
 |---|---|
 | `asr_partial` / `asr_final` | 投 `APP_EVT_ASR_PARTIAL/FINAL`（`app_evt_asr_t`，文本截断到 28B）+ `vc_register_cb` 回调；完整文本打 INFO 日志 |
 | `llm_delta` | 仅回调 + DEBUG 日志（ARCH §4.2 未定义对应 event_bus 事件） |
-| `tts_start` | 校验 `codec=mp3`、记 `sr`；`audio_player_stream_open(1, sr)` 成功 → `audio_fe_set_feed_enabled(false)`（R1），失败只 WARN；投 `APP_EVT_TTS_START` + 回调；打开下行 0x02 接收窗口 |
+| `tts_start` | 校验 `codec=mp3`、记 `sr`；`audio_player_stream_open(1, sr)` 成功 → `audio_fe_set_feed_enabled(false)`（R1），失败只 WARN **并投 `VC_EVT_TTS_FAIL`（T3.6，设备侧播不出来也反馈）**；投 `APP_EVT_TTS_START` + 回调；打开下行 0x02 接收窗口 |
 | `tts_end` | `audio_player_stream_end()` 排空收尾；投 `APP_EVT_TTS_END`（带**本轮**下行帧数，T3.1 修正了原先的会话累计口径）+ 回调；关闭窗口，本轮结束 |
-| `error` | ERROR 日志（码表见 PROTOCOL §4）+ `audio_player_stream_abort()` + 回调；结束本轮，不自动重试 |
+| `error` | ERROR 日志（码表见 PROTOCOL §4）+ `audio_player_stream_abort()` + 回调；结束本轮，不自动重试。**T3.6**：`voice_session` 按 code 分流（3001/3002→“语音播放失败”，其余→“服务异常”） |
 | 下行 0x02 帧 | 窗口内（`WAIT_RESPONSE` 且未收 `tts_end`）→ `audio_player_stream_write()`（成功计入「音频帧」）；窗口外/收尾后/播放器未开流/ring 满 → 丢弃 + 计入「音频丢弃」帧/字节（限频 WARN） |
 | 其它 `t` | WARN 后忽略（契约外事件，如 T2.5 阶段的 `music_track`） |
 | 无/非法 `sid`、`sid ≠ 当前` | 丢弃 + 计数（`vc status` 的「sid 丢弃」），不结束本轮 |
@@ -147,6 +147,6 @@ voice_session（IDLE→LISTENING，提示音播完、sid 已分配）
 
 ## 后续
 
-- 错误提示音（T3.6）接入后，ERROR 状态的停留时长改为提示音时长（`CONFIG_VS_ERROR_HOLD_MS`）；
+- ✅ T3.6：`vc_is_ready()` + `VC_EVT_TTS_FAIL` 已交付，错误反馈由 `feedback` 组件统一处理（本组件不播提示音）；
 - ✅ 按键打断 R4（T3.2：80ms 淡出 + `interrupt` 报文 + 恢复后丢弃 50ms；按键来源与完整语义仍归 T3.4）；
 - 如需进一步降 CPU，可把 VAD 静音判定改为事件驱动（T1.2b 已具备事件源）。

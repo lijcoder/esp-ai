@@ -6,7 +6,7 @@
 
 | 接口 | 说明 |
 |---|---|
-| `diag_init()` | 打印启动横幅 → 在 UART0（115200，GPIO43/44）起 REPL → 注册 `help`/`sys`/`log`/`mic`/`cfg`/`evt`/`wifi`/`ws`/`vc`/`vs`；只能在 `app_main` 最前部调用一次，重复调用返回 `ESP_ERR_INVALID_STATE` |
+| `diag_init()` | 打印启动横幅 → 在 UART0（115200，GPIO43/44）起 REPL → 注册 `help`/`sys`/`log`/`mic`/`cfg`/`evt`/`wifi`/`ws`/`vc`/`vs`/`dev`/`fb`；只能在 `app_main` 最前部调用一次，重复调用返回 `ESP_ERR_INVALID_STATE` |
 
 ## console 命令（本轮）
 
@@ -17,7 +17,7 @@
 | `sys heap` | 内部 RAM 与 PSRAM 的总量/剩余/最大块/最低水位/峰值占用 |
 | `sys tasks` | 每个任务的名称、状态、优先级、栈剩余（字节）、CPU 累计占比（双核总算力口径，所有任务相加≈200%） |
 | `sys reboot` | 软复位 |
-| `log` | 列出 16 个固定 TAG 的当前日志级别（含 `*` 全局级别） |
+| `log` | 列出 17 个固定 TAG 的当前日志级别（含 `*` 全局级别） |
 | `log <tag>\|\* <level>` | 运行时调整日志级别，级别取 `none/error/warn/info/debug/verbose`；未知 TAG 或非法级别直接报错（不静默生效） |
 | `mic stat` | 麦克风统计窗口：电平 RMS/峰值（dBFS）、窗口时长与采样数、已喂帧数、I2S 读失败次数、收音开关、VAD、累计唤醒次数 |
 | `mic reset` | 清零麦克风统计窗口（帧数、失败次数、唤醒次数、电平一起清零） |
@@ -26,7 +26,7 @@
 | `cfg set <key> <int>` | **底层存储调试口**：原样写 int 到 NVS（不做范围/语义校验），重启后生效 |
 | `cfg setstr <key> <value>` | 写字符串（单参数，不支持空格） |
 | `cfg erase <key>` | 删除键，重启后恢复缺省；键本来不存在时提示而不算错误 |
-| `evt list` | 列出 `APP_EVT` 的 13 个事件与是否带 payload（与 ARCHITECTURE §4.2 一致） |
+| `evt list` | 列出 `APP_EVT` 的 14 个事件与是否带 payload（与 ARCHITECTURE §4.2 一致） |
 | `evt post <name\|id>` | 投递一个事件（网络事件自动带示例 payload），用于验证投递链路 |
 | `evt burst <n>` | 连续投递 n 个（1~256）无 payload 事件，验证"非阻塞 + 队列满丢弃"路径 |
 | `evt trace on\|off` | 订阅/取消订阅全部事件，在 `evt` 任务上下文打印收到的每个事件（验证跨任务分发，而不是只看投递） |
@@ -39,6 +39,9 @@
 | `vs interrupt` | 打断当前会话：`vc cancel` + 回 `IDLE`（R4 完整淡出与按键来源归 T3.2/T3.4） |
 | `vs reset` | 清零 VS 统计（保留最近 sid/停留时长） |
 | `vs followup on\|off` | **T3.7**：连续对话续听窗口运行期开关（不持久化，重启恢复 Kconfig）；关闭时若正在 FOLLOW_UP 立即回 IDLE |
+| `vs status` 的「错误反馈」行 | **T3.6**：四类异常计数（网络/云端/超时/TTS）、提示音完成/失败数、最近 `kind`/`code`/时长 |
+| `fb status` / `fb reset` | **T3.6**：异常反馈观测——当前活动反馈（或空闲/等 TTS 补播）、通道统计（总播放/完成/失败/延迟/丢弃/中止）、四类计数与最近时长 |
+| `fb test <net\|cloud\|timeout\|tts>` | **T3.6**：手动播放一条错误提示音（不起会话，回板人工听感验收用；播放期间 R1 暂停收音） |
 | `wifi status` | 网络状态：state、SSID、IP、RSSI、SNTP 是否对时、累计重连次数与当前退避 |
 | `wifi reconnect` | 主动断开并重连（重置退避）；已联网时先投 `NET_DOWN` 再恢复，用于验证重连链路 |
 | `ws status` | WebSocket 状态：状态机、脱敏端点（不回显 token）、握手次数、心跳 RTT、收发/丢弃/坏帧计数、队列占用 |
@@ -65,12 +68,12 @@
 ## 已知 TAG
 
 与 `docs/CONVENTIONS.md` §5 的固定清单保持一致，是 `log` 命令的唯一数据源：
-`APP / BOARD / AUDIO_IO / AFE / PLAYER / ENC / NET / WS / VC / VS / MC / MS / DEV / DIAG / CFG / EVT`。
+`APP / BOARD / AUDIO_IO / AFE / PLAYER / ENC / NET / WS / VC / VS / MC / MS / DEV / FB / DIAG / CFG / EVT`。
 新增组件时**两处同步**：CONVENTIONS §5（及 ARCHITECTURE §10.2）+ 本组件的 `k_tags[]`。
 
 ## 依赖
 
-- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计）、`config_store`（`cfg` 读写 NVS）、`event_bus`（`evt` 投递/订阅）、`net_mgr`（`wifi status/reconnect`）、`transport_ws`（`ws status/reconnect/send/sendbin/rxlog`）、`voice_cloud`（`vc status/start/stop/cancel`）、`voice_session`（`vs status/start/interrupt/reset`），均为**私有依赖**，不对外暴露头文件。
+- 组件：`console`（esp_console/linenoise）、`esp_app_format`（`esp_app_get_description`）、`esp_timer`（运行时长）；`audio_fe`（`mic stat` 读统计）、`config_store`（`cfg` 读写 NVS）、`event_bus`（`evt` 投递/订阅）、`net_mgr`（`wifi status/reconnect`）、`transport_ws`（`ws status/reconnect/send/sendbin/rxlog`）、`voice_cloud`（`vc status/start/stop/cancel`）、`voice_session`（`vs status/start/interrupt/reset`）、`feedback`（`fb status/reset/test`），均为**私有依赖**，不对外暴露头文件。
 - IDF 配置：`CONFIG_FREERTOS_USE_TRACE_FACILITY`（任务枚举）与 `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` + `COUNTER_TYPE_U64`（CPU 占比，64 位计数避免 esp_timer 32 位约 71 分钟回绕）。已固化在 `sdkconfig.defaults.esp32s3`；若关掉 trace facility，`sys tasks` 会提示不可用而不是编译失败。
 - 硬件：UART0 115200，GPIO43/44（见 `docs/HARDWARE.md`）。
 

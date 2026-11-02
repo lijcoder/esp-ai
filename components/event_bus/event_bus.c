@@ -52,6 +52,7 @@ static const char *const k_evt_names[APP_EVT_COUNT] = {
     [APP_EVT_BUTTON] = "BUTTON",
     [APP_EVT_MUSIC_STATE_CHANGED] = "MUSIC_STATE_CHANGED",
     [APP_EVT_MUSIC_ERROR] = "MUSIC_ERROR",
+    [APP_EVT_FEEDBACK] = "FEEDBACK",
 };
 
 _Static_assert(sizeof(k_evt_names) / sizeof(k_evt_names[0]) == APP_EVT_COUNT,

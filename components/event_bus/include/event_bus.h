@@ -39,6 +39,9 @@ typedef enum {
     APP_EVT_BUTTON,                 /* 按键动作，payload: app_evt_button_t（T3.2 定稿） */
     APP_EVT_MUSIC_STATE_CHANGED,    /* 音乐状态变化，payload 待 T4.3 定稿 */
     APP_EVT_MUSIC_ERROR,            /* 音乐播放出错，payload 待 T4.3 定稿 */
+    APP_EVT_FEEDBACK,               /* 异常反馈（T3.6），payload: app_evt_feedback_t；
+                                     * 语义事件：语音只是当前反馈通道，屏幕/灯光等未来通道
+                                     * 订阅本事件即可，不需要改 feedback/voice_session */
     APP_EVT_COUNT,                  /* 哨兵：事件数量，不是合法事件 */
 } app_evt_t;
 
@@ -103,8 +106,9 @@ typedef struct {
 } app_evt_button_t;
 
 /* APP_EVT_VOICE_STATE_CHANGED：会话状态迁移。from/to 是 voice_session 的 vs_state_t 数值
- * （0=IDLE / 1=LISTENING / 2=THINKING / 3=SPEAKING / 4=ERROR），reason 是 vs_reason_t 数值。
- * event_bus 是 L1，不能 include L4 的 voice_session.h，所以这里用显式数值 + 注释契约。 */
+ * （0=IDLE / 1=LISTENING / 2=THINKING / 3=SPEAKING / 4=ERROR / 5=FOLLOW_UP），reason 是
+ * vs_reason_t 数值。event_bus 是 L1，不能 include L4 的 voice_session.h，所以这里用数值 +
+ * 注释契约。 */
 typedef struct {
     uint16_t sid;
     uint8_t from;
@@ -113,6 +117,18 @@ typedef struct {
     uint8_t reserved[3];
     uint32_t dur_ms; /* 迁移前状态停留时长（ms） */
 } app_evt_voice_state_t;
+
+/* APP_EVT_FEEDBACK（T3.6）：异常反馈语义事件。
+ * kind 数值与 feedback 组件的 fb_kind_t 一致：1=net-offline / 2=cloud-error / 3=timeout /
+ * 4=tts-fail（event_bus 是 L1，不能 include L3 的 feedback 头，故用数值 + 注释契约）。
+ * 当前反馈通道是语音（feedback 组件内部完成），未来屏幕/灯光组件订阅本事件即可，
+ * 不需要改 feedback/voice_session——这就是"语音只是一种反馈方式"的扩展点。 */
+typedef struct {
+    uint16_t sid;  /* 所属会话（无会话语境为最近 sid 或 0） */
+    int32_t code;  /* 原始错误码（云端 error code / vc_tts_fail_t / 0） */
+    uint8_t kind;  /* fb_kind_t 数值 */
+    uint8_t reserved[3];
+} app_evt_feedback_t;
 
 /*
  * 事件 payload 统一容器：定长 32 字节，跨任务投递时整块拷贝，发布方无需保活。
@@ -127,6 +143,7 @@ typedef union {
     app_evt_tts_end_t tts_end;
     app_evt_voice_state_t voice_state;
     app_evt_button_t button;
+    app_evt_feedback_t feedback;
     uint8_t raw[APP_EVT_DATA_MAX];
 } app_evt_data_t;
 

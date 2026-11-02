@@ -636,6 +636,54 @@ audio_player.h` 的 `audio_player_mix_*` 接口注释、`audio_player.c` 的 `mi
   FFT 幅度与幅度比、音量线性、E 的 duck 幅度/RMS、淡入/淡出/斜率/软限幅/堆判定，含正负例）和
   `--dry-run`（打印执行计划 + 同一套自检）。真机基线（每场景实测值）待 Lead 烧录 T3.3 固件后回填本节。
 
+## dev_ctrl_test.py —— 按键/LED/静音真机自测（T3.4）
+
+**作用**：验证 P3 的两条物理交互验收 —— **按键打断 < 100ms** 与 **LED 状态与实际状态一致**，
+外加长按静音往返、续听窗口内短按退出、堆稳定。
+
+**按键怎么"按"（不需要手）**：DevKit 的 USB 自动下载电路把 **DTR 接到 GPIO0（BOOT）**、**RTS 接到 EN**。
+脚本保持 `rts=False`（EN 高、设备运行），只翻转 `dtr`：`dtr=True` = 按住 BOOT（GPIO0 拉低）、
+`dtr=False` = 松开。走的是**真实 GPIO 扫描路径**（`dev_ctrl` 的 10ms `esp_timer` 扫描 + 30ms 去抖
+→ `APP_EVT_BUTTON`），**不是** `evt post BUTTON` 命令注入。
+
+```bash
+uv run tools/dev_ctrl_test.py                  # 全量（默认复位设备，独占串口，约 1.5~2 分钟）
+uv run tools/dev_ctrl_test.py --skip-interrupt # 只跑 A/B/E/F（不需要 mock、不播声音）
+uv run tools/dev_ctrl_test.py --dry-run        # 只打印计划
+uv run tools/dev_ctrl_test.py --no-reset --log /tmp/dev.log
+```
+
+### 场景与断言
+
+| 场景 | 断言 |
+|---|---|
+| A 短按（IDLE） | `DEV: 按键：短按` → `VS: 按键开始对话`（voice_session 消费）；`dev status` 短按计数 +1、长按计数不变 |
+| B 长按静音 | 音量 100→0（`PLAYER: volume=0`）→ 再长按 0→100 恢复；`dev status` 静音=开/关；**长按只触发一次、松开不再报短按** |
+| C 播放中打断（R4） | mock 真实 MP3 播放中按 BOOT：`VS: 打断当前会话` / `PLAYER: fade out` / `VC: interrupt sent sid=` / `AFE: feed resumed` / `VS: state SPEAKING -> IDLE（原因=interrupt）`；**`last_stop_ms < 100`**；mock 收到 `interrupt` 且**不再发 `tts_end`**；打断后能正常起新一轮 |
+| D 续听窗口内短按（T3.7 交集） | TTS 播完进 `FOLLOW_UP` → 短按 → `VS: state FOLLOW_UP -> IDLE` |
+| E LED 模式 | 7 种强制模式（idle/listening/thinking/speaking/followup/error/mute）逐个生效并被 `dev status` 反映；非法模式被拒绝；`dev led auto` 恢复跟随，状态迁移时 LED 帧计数增加 |
+| F 堆稳定 | 10 次按键循环后内部堆波动/下探 ≤2KB 且不单调下降（预热一轮排除一次性缓冲） |
+
+### 实测基线（2026-11-01，T3.4 固件）
+
+**53/53 PASS**。关键数据：`last_stop_ms=80~86`（P3 验收 <100ms，80ms 淡出 + 一个 10ms 输出块）；
+内部堆循环波动 32 B、相对预热基线下探 12 B；短按 10 / 长按 7；全程无 DEV/PLAYER/VS 相关 ERROR。
+
+### 参数 / 依赖 / 限制
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--port` | 自动探测 | 串口（独占） |
+| `--skip-interrupt` | 关 | 跳过 C/D（不需要 mock/TTS） |
+| `--mock-port` | 8765 | mock 端口 |
+| `--after-frames` | 15 | 打断前至少已解码帧数（确认真在播放，不打断预缓冲） |
+| `--press-rounds` | 10 | F 场景按键次数 |
+| `--heap-tol` | 2048 | F 场景允许的内部堆波动字节数 |
+| `--no-reset` / `--dry-run` / `--log` | — | 同其它脚本 |
+
+依赖 `pyserial` + `lameenc` + `av` + `numpy`（复用 `tts_stream_test.py` 的素材生成与 `Mock`）；
+需要 `CONFIG_DEV_ENABLE=y`（默认）。**不要与 `idf.py monitor` 同时开**（两者抢 DTR）。
+
 ## e2e_voice_test.py —— 端到端语音真机自测（T2.6，P2 收口）
 
 **作用**：把 T2.5（`voice_cloud` 端云协议）与 T2.4（`audio_player` 流式播放）拼成**真实用户路径**
@@ -981,7 +1029,7 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 
 ## 后续（未做）
 
-- `voice_cloud_test.py` 已承接 P2 端到端断言（唤醒 → 上行 Opus → ASR/LLM/TTS → 收尾/中止 + sid 过滤）；`mp3_test.py` 承接下行解码断言（T2.3 已交付）；**`tts_stream_test.py` 承接 T2.4 流式播放断言**（真实 MP3 → 首帧延迟/欠载/解码对拍/abort/排空/堆稳定）；P3 半双工：T3.1 会话状态机由 `voice_cloud_test.py` 覆盖，**T3.2 R4 按键打断 / R5 无丢弃 / R3 ducking 由 `tts_stream_test.py` 的 `--interrupt`/`--r5`/`--r3-duck` 覆盖**（真机验收等 Lead 固件就绪后跑）；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
+- `voice_cloud_test.py` 已承接 P2 端到端断言（唤醒 → 上行 Opus → ASR/LLM/TTS → 收尾/中止 + sid 过滤）；`mp3_test.py` 承接下行解码断言（T2.3 已交付）；**`tts_stream_test.py` 承接 T2.4 流式播放断言**（真实 MP3 → 首帧延迟/欠载/解码对拍/abort/排空/堆稳定）；P3 半双工：T3.1 会话状态机由 `voice_cloud_test.py` 覆盖，**T3.2 R4 按键打断 / R5 无丢弃 / R3 ducking 由 `tts_stream_test.py` 的 `--interrupt`/`--r5`/`--r3-duck` 覆盖**；**T3.4 按键/LED/静音由 `dev_ctrl_test.py` 覆盖**（真实 GPIO0 按键路径 + 停声 <100ms + LED 模式）；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
 - 下行流式播放断言（T2.4）→ **已交付 `tts_stream_test.py`**；mock 真实 MP3 下发 → **已交付 `--tts-mp3`**。
 - HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求），P4（T4.1/T4.2）前补。
 - `wss` + 自签证书（T1.4 决定证书策略后）。

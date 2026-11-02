@@ -730,11 +730,12 @@ static void vs_on_app_evt(void *arg, app_evt_t evt, const app_evt_data_t *data)
         vs_on_net_down(data);
         break;
     case APP_EVT_BUTTON: {
-        /* T3.2 定稿 payload；T3.4 只负责 GPIO 扫描/去抖与投递。
-         * 短按：会话中 = 打断（R4）；IDLE = 开始一轮（ARCH §8.2）。长按归 T3.4 静音。 */
+        /* T3.2 定稿 payload；T3.4 起由 dev_ctrl 做 GPIO 扫描/去抖与投递。
+         * 短按：会话中 = 打断（R4）；IDLE = 开始一轮（ARCH §8.2）。
+         * 长按：静音切换已由 dev_ctrl 自己完成（ARCH §4.2 分工），本组件只记日志不动作。 */
         const uint8_t action = (data != NULL) ? data->button.action : APP_EVT_BUTTON_SHORT;
         if (action == APP_EVT_BUTTON_LONG) {
-            ESP_LOGI(TAG, "长按事件（静音功能归 T3.4），忽略");
+            ESP_LOGD(TAG, "长按事件（静音已由 dev_ctrl 处理），会话侧忽略");
             break;
         }
         if (vs_get_state() == VS_STATE_IDLE) {

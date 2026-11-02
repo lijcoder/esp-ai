@@ -1,0 +1,45 @@
+menu "Dev Ctrl（按键/LED/静音，T3.4）"
+
+    config DEV_ENABLE
+        bool "启用按键/LED 控制（dev_ctrl）"
+        default y
+        help
+            ARCHITECTURE §4.1：GPIO0 按键扫描（短按投 APP_EVT_BUTTON 由 voice_session 消费）、
+            长按静音切换、WS2812 LED 状态指示。关闭后组件全部接口为空实现（链接不报错），
+            按键/LED/静音能力同时消失；量产不建议关闭（物理交互是半双工打断的兜底手段）。
+
+    config DEV_BUTTON_DEBOUNCE_MS
+        int "按键去抖时间（毫秒）"
+        range 10 100
+        default 30
+        depends on DEV_ENABLE
+        help
+            10ms 周期采样，连续这么长时间电平一致才认定一次真实边沿。
+            机械按键典型抖动 5~20ms，30ms 留余量；过大增加短按响应时延（<100ms 验收口径）。
+
+    config DEV_BUTTON_LONG_PRESS_MS
+        int "长按判定阈值（毫秒）"
+        range 200 3000
+        default 600
+        depends on DEV_ENABLE
+        help
+            按住超过该时长触发长按（静音切换），释放时不再报短按。
+            常见语音助手取 500ms~1s，600ms 兼顾误触与响应速度。
+
+    config DEV_LED_ENABLE
+        bool "启用 WS2812 LED 状态指示"
+        default y
+        depends on DEV_ENABLE
+        help
+            关闭后 LED 保持熄灭、静音切换不可用（dev_set_mute 返回 ESP_ERR_NOT_SUPPORTED）。
+
+    config DEV_LED_BRIGHTNESS
+        int "LED 亮度（0-255）"
+        range 1 255
+        default 24
+        depends on DEV_LED_ENABLE
+        help
+            WS2812 满亮度非常刺眼，室内取小值（24/255 ≈ 10%）；
+            闪烁与常亮都用该亮度渲染。
+
+endmenu

@@ -10,6 +10,7 @@
 #include "audio_player.h"
 #include "board.h"
 #include "config_store.h"
+#include "dev_ctrl.h"
 #include "diag.h"
 #include "esp_log.h"
 #include "event_bus.h"
@@ -79,6 +80,10 @@ void app_main(void)
 
     /* 会话状态机（T3.1）放在 vc 之后：订阅事件总线 + vc 回调 + 播放完成回调，不建任务 */
     ESP_ERROR_CHECK(vs_init());
+
+    /* 物理交互（T3.4）放在 vs 之后：LED 订阅 VOICE_STATE_CHANGED、按键投 APP_EVT_BUTTON
+     * （由 vs 消费为打断/起轮）；静音改音量走 audio_player。不建任务（仅两个 esp_timer） */
+    ESP_ERROR_CHECK(dev_init());
 
     ESP_LOGI(TAG, "ready, say \"Hi Lexin\"");
 }

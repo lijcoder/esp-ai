@@ -18,6 +18,7 @@
 #include "audio_player.h"
 #include "codec_enc.h"
 #include "config_store.h"
+#include "dev_ctrl.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_console.h"
@@ -1559,6 +1560,120 @@ static int cmd_vs(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- dev 命令（按键/LED/静音观测，T3.4） ---------------- */
+
+static const char *const k_led_mode_names[DEV_LED_MODE_COUNT] = {
+    [DEV_LED_AUTO] = "auto",     [DEV_LED_IDLE] = "idle",   [DEV_LED_LISTENING] = "listening",
+    [DEV_LED_THINKING] = "thinking", [DEV_LED_SPEAKING] = "speaking",
+    [DEV_LED_FOLLOW_UP] = "followup", [DEV_LED_ERROR] = "error", [DEV_LED_MUTE] = "mute",
+};
+
+static bool dev_parse_led_mode(const char *text, dev_led_mode_t *out)
+{
+    for (int i = 0; i < DEV_LED_MODE_COUNT; i++) {
+        if (k_led_mode_names[i] != NULL && strcmp(text, k_led_mode_names[i]) == 0) {
+            *out = (dev_led_mode_t)i;
+            return true;
+        }
+    }
+    if (strcmp(text, "follow-up") == 0 || strcmp(text, "follow_up") == 0) {
+        *out = DEV_LED_FOLLOW_UP;
+        return true;
+    }
+    return false;
+}
+
+static void print_dev_status(void)
+{
+    dev_stats_t st;
+
+    if (dev_stats_read(&st) != ESP_OK) {
+        printf("读取 dev_ctrl 统计失败\n");
+        return;
+    }
+    printf("dev_ctrl: 静音=%s，LED 模式=%s（当前音量 %u）\n", dev_is_muted() ? "开" : "关",
+           k_led_mode_names[dev_led_get_mode()] ? k_led_mode_names[dev_led_get_mode()] : "?",
+           (unsigned)audio_player_get_volume());
+    printf("  按键: 短按 %" PRIu32 " / 长按 %" PRIu32 "；事件投递失败 %" PRIu32 "\n",
+           st.short_presses, st.long_presses, st.posts_dropped);
+    printf("  LED: 已发送 %" PRIu32 " 帧\n", st.led_frames);
+#if CONFIG_DEV_ENABLE
+    printf("  参数: 去抖 %d ms / 长按 %d ms / 亮度 %d（GPIO%d 按键，GPIO48 LED）\n",
+           CONFIG_DEV_BUTTON_DEBOUNCE_MS, CONFIG_DEV_BUTTON_LONG_PRESS_MS,
+           CONFIG_DEV_LED_BRIGHTNESS, 0);
+#else
+    printf("  CONFIG_DEV_ENABLE=n（功能编译期裁剪）\n");
+#endif
+    printf("  说明: 短按投 APP_EVT_BUTTON 由 vs 消费（会话中=打断、IDLE=起轮）；"
+           "长按=静音切换；`evt post BUTTON` 仍可模拟短按\n");
+}
+
+static int cmd_dev(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: dev status | mute [on|off] | led <auto|idle|listening|thinking|speaking|"
+               "followup|error|mute> | reset\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *sub = argv[1];
+    if (strcmp(sub, "status") == 0 || strcmp(sub, "stat") == 0) {
+        print_dev_status();
+        return ESP_OK;
+    }
+
+    if (strcmp(sub, "mute") == 0) {
+        bool target = !dev_is_muted(); /* 无参数 = 切换 */
+        if (argc >= 3) {
+            if (strcmp(argv[2], "on") == 0) {
+                target = true;
+            } else if (strcmp(argv[2], "off") == 0) {
+                target = false;
+            } else {
+                printf("用法: dev mute [on|off]\n");
+                return ESP_ERR_INVALID_ARG;
+            }
+        }
+        esp_err_t err = dev_set_mute(target);
+        if (err != ESP_OK) {
+            printf("静音切换失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("静音：%s（音量 %u）\n", target ? "开" : "关",
+               (unsigned)audio_player_get_volume());
+        return ESP_OK;
+    }
+
+    if (strcmp(sub, "led") == 0) {
+        if (argc < 3) {
+            printf("用法: dev led <auto|idle|listening|thinking|speaking|followup|error|mute>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        dev_led_mode_t mode;
+        if (!dev_parse_led_mode(argv[2], &mode)) {
+            printf("未知 LED 模式: %s\n", argv[2]);
+            return ESP_ERR_INVALID_ARG;
+        }
+        esp_err_t err = dev_led_set_mode(mode);
+        if (err != ESP_OK) {
+            printf("设置 LED 模式失败: %s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("LED 模式 → %s%s\n", k_led_mode_names[mode],
+               mode == DEV_LED_AUTO ? "（跟随会话状态）" : "（强制，dev led auto 恢复）");
+        return ESP_OK;
+    }
+
+    if (strcmp(sub, "reset") == 0) {
+        esp_err_t err = dev_stats_reset();
+        printf("dev 统计已清零\n");
+        return err;
+    }
+
+    printf("未知子命令: %s（可用: status | mute [on|off] | led <mode> | reset）\n", sub);
+    return ESP_ERR_INVALID_ARG;
+}
+
 /* ---------------- evt 命令（事件总线观测，T1.2a） ---------------- */
 
 /*
@@ -2293,6 +2408,12 @@ static esp_err_t register_commands(void)
             .help = "会话状态机：vs status | start | interrupt | reset | followup on|off（T3.1/T3.7）",
             .hint = "status|start|interrupt|reset|followup",
             .func = cmd_vs,
+        },
+        {
+            .command = "dev",
+            .help = "按键/LED/静音：dev status | mute [on|off] | led <mode> | reset（T3.4）",
+            .hint = "status|mute|led|reset",
+            .func = cmd_dev,
         },
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST
         {

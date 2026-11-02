@@ -14,6 +14,7 @@
 #include "diag.h"
 #include "esp_log.h"
 #include "event_bus.h"
+#include "feedback.h"
 #include "net_mgr.h"
 #include "transport_ws.h"
 #include "voice_cloud.h"
@@ -57,6 +58,10 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "read volume failed, keep player default");
     }
+
+    /* 异常反馈路由（T3.6）：放在播放器之后（要订阅播放完成回调）、事件总线之后
+     * （fb_notify 会发布 APP_EVT_FEEDBACK 语义事件）。不建任务/定时器 */
+    ESP_ERROR_CHECK(fb_init());
 
     /* 唤醒/VAD 自 T1.2b 起走 event_bus，业务回调传 NULL（产品路径不注册） */
     ESP_ERROR_CHECK(audio_fe_init(NULL, NULL));

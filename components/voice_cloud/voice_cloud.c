@@ -68,6 +68,7 @@ static volatile uint16_t s_pending_sid;
 /* 下行 TTS 音频（T2.4）：以下标志跨 ws_client / vc / player 任务 */
 static bool s_done_subscribed;      /* audio_player 完成回调订阅成功（R2 依赖） */
 static volatile bool s_audio_attempted; /* 本轮 tts_start 尝试过开流（用于 tts_end 日志） */
+static volatile bool s_tts_fail_reported; /* 本轮已上报"设备侧 TTS 无法播放"（T3.6，每轮一次） */
 static int64_t s_audio_drop_warn_us;    /* 窗口外/写失败丢弃日志限频（1/秒） */
 
 /* 以下只由 vc 任务读写 */
@@ -554,16 +555,28 @@ static void vc_stream_done_cb(audio_player_src_t src, bool ok, void *arg)
 }
 
 /* tts_start：开流（codec=1/mp3）；成功即暂停收音（R1），失败则本轮音频只计数丢弃 */
+static void vc_report_tts_fail(vc_tts_fail_t why)
+{
+    if (s_tts_fail_reported) {
+        return; /* 每轮只报一次（多路 tts_start/重复事件不重复提示） */
+    }
+    s_tts_fail_reported = true;
+    ESP_LOGW(TAG, "设备侧 TTS 无法播放（原因=%d），上报 voice_session 做错误反馈", (int)why);
+    vc_emit(VC_EVT_TTS_FAIL, s_sid, NULL, 0, 0, 0, (int32_t)why);
+}
+
 static void vc_audio_start(uint8_t codec_id, uint32_t sample_rate)
 {
     s_audio_attempted = true;
 
     if (codec_id != APP_EVT_CODEC_MP3) {
         ESP_LOGW(TAG, "tts_start 非 MP3 音频，本轮不播放（只计数丢弃）");
+        vc_report_tts_fail(VC_TTS_FAIL_NOT_MP3);
         return;
     }
     if (sample_rate == 0) {
         ESP_LOGW(TAG, "tts_start 缺采样率，本轮不播放（只计数丢弃）");
+        vc_report_tts_fail(VC_TTS_FAIL_NO_SAMPLE_RATE);
         return;
     }
     if (audio_player_stream_active()) {
@@ -573,10 +586,12 @@ static void vc_audio_start(uint8_t codec_id, uint32_t sample_rate)
     }
     if (!audio_player_mp3_ready()) {
         ESP_LOGW(TAG, "MP3 能力不可用，本轮 TTS 音频不播放（只计数丢弃）");
+        vc_report_tts_fail(VC_TTS_FAIL_MP3_UNAVAILABLE);
         return;
     }
     if (audio_player_is_busy()) {
         ESP_LOGW(TAG, "播放器忙（提示音/本地播放），本轮 TTS 音频不播放（只计数丢弃）");
+        vc_report_tts_fail(VC_TTS_FAIL_PLAYER_BUSY);
         return;
     }
 
@@ -584,6 +599,7 @@ static void vc_audio_start(uint8_t codec_id, uint32_t sample_rate)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "流式播放 open 失败（%s），本轮 TTS 音频不播放（只计数丢弃）",
                  esp_err_to_name(err));
+        vc_report_tts_fail(VC_TTS_FAIL_OPEN_FAILED);
         return;
     }
 
@@ -911,6 +927,7 @@ static void vc_begin_round(uint16_t sid)
     s_tts_end_seen = false;
     s_cloud_error = false;
     s_audio_attempted = false;
+    s_tts_fail_reported = false;
     s_sid = sid;
     s_round_frames = 0;
     s_round_bytes = 0;
@@ -1297,6 +1314,11 @@ esp_err_t vc_interrupt(void)
 bool vc_is_busy(void)
 {
     return s_state != VC_STATE_IDLE;
+}
+
+bool vc_is_ready(void)
+{
+    return s_inited && ws_is_ready() && s_state == VC_STATE_IDLE && !s_pending_start;
 }
 
 vc_state_t vc_get_state(void)

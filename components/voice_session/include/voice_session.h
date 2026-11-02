@@ -7,6 +7,10 @@
  *   - 每轮 `sid` 分配（uint16 自增、0 保留），通过 `vc_start(sid)` 交给 voice_cloud 执行；
  *   - 超时与错误处理策略：THINKING 10s 超时（计时在 voice_cloud 的协议超时里）→ ERROR；
  *     云端 `error` 码 → ERROR；断链/打断 → IDLE；ERROR 同轮不重试；
+ *   - 异常反馈（T3.6）：四类异常（网络未连接/云端 error/THINKING 超时/TTS 失败）→ 进 ERROR
+ *     并调用 `feedback` 组件播放提示音；提示音完成回调驱动 `ERROR → IDLE`，
+ *     `CONFIG_VS_ERROR_HOLD_MS` 只作兜底看门狗。**本组件不直接播错误提示音**（语音只是
+ *     feedback 的一个通道，屏幕/灯光等未来通道订阅 `APP_EVT_FEEDBACK` 即可）；
  *   - 连续对话（T3.7）：TTS 正常播完后进入 FOLLOW_UP 续听窗口（`CONFIG_VS_FOLLOWUP_*`），
  *     窗口内 VAD 判到人声即起下一轮（不再唤醒、不再播应答提示音）；静音超时/轮数上限/
  *     按键/断网 → IDLE；窗口内再次唤醒 = 重开一轮（播应答提示音、轮数清零）；
@@ -41,7 +45,7 @@ typedef enum {
     VS_STATE_LISTENING,     /* 已唤醒（或手动开始），播提示音 / 上行、VAD 判停 */
     VS_STATE_THINKING,      /* audio_end 已发，等 ASR/TTS */
     VS_STATE_SPEAKING,      /* 正在播放 TTS（R1：麦克风输入关闭） */
-    VS_STATE_ERROR,         /* 超时/云端错误：上报日志 + 播错误提示（提示音 T3.6） */
+    VS_STATE_ERROR,         /* 异常反馈中（T3.6）：播错误提示音，完成/看门狗后回 IDLE */
     VS_STATE_FOLLOW_UP,     /* 连续对话续听窗口（T3.7）：TTS 播完等用户直接说话 */
     VS_STATE_COUNT,
 } vs_state_t;
@@ -71,6 +75,8 @@ typedef enum {
     VS_REASON_FOLLOWUP_MAX = 20,     /* 达到连续对话轮数上限，回 IDLE */
     VS_REASON_FOLLOWUP_WAKE = 21,    /* 续听窗口内再次唤醒：重开一轮（播提示音） */
     VS_REASON_FOLLOWUP_OFF = 22,     /* 运行期关闭连续对话，退出续听窗口 */
+    VS_REASON_NET_OFFLINE = 23,      /* 网络未连接/链路不可用 → 错误反馈（T3.6） */
+    VS_REASON_TTS_FAIL = 24,         /* 设备侧/云端 TTS 播放失败 → 错误反馈（T3.6） */
 } vs_reason_t;
 
 /* 观测统计（diag `vs status` / 测试脚本断言用；累计值，临界区内合并） */
@@ -90,6 +96,16 @@ typedef struct {
     uint32_t followup_timeouts;/* 窗口静音超时回 IDLE 次数 */
     uint32_t followup_max_exits; /* 达到轮数上限回 IDLE 次数 */
     uint32_t followup_remaining_ms; /* 当前续听窗口剩余（非 FOLLOW_UP 时为 0） */
+    /* ---- T3.6 异常反馈（feedback 组件） ---- */
+    uint32_t error_feedback_plays;  /* 请求并成功启动语音反馈的次数 */
+    uint32_t error_feedback_ok;     /* 提示音正常播完次数 */
+    uint32_t error_feedback_fail;   /* 提示音失败/被丢弃/看门狗次数 */
+    uint32_t error_watchdog;        /* CONFIG_VS_ERROR_HOLD_MS 兜底超时次数 */
+    uint32_t error_by_kind[5];      /* 各反馈类别次数（下标 = fb_kind_t：1=net-offline
+                                     * 2=cloud-error 3=timeout 4=tts-fail；0 不用） */
+    uint32_t last_error_prompt_ms;  /* 最近一次错误提示音实际时长（ms） */
+    int32_t last_error_code;        /* 最近一次原始错误码（云端 error code / vc_tts_fail_t） */
+    uint8_t last_error_kind;        /* 最近一次反馈类别（fb_kind_t 数值） */
     uint16_t last_sid;         /* 最近一轮 sid */
     uint32_t last_state_ms;    /* 上一次状态停留时长（ms） */
     uint8_t state;             /* 当前 vs_state_t（快照） */

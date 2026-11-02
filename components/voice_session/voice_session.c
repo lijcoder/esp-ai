@@ -24,11 +24,11 @@
 #include <string.h>
 
 #include "audio_fe.h"
-#include "audio_io.h"
 #include "audio_player.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "event_bus.h"
+#include "feedback.h"
 #include "freertos/FreeRTOS.h"
 #include "prompt_assets.h"
 #include "sdkconfig.h"
@@ -62,8 +62,10 @@ static void vs_followup_stop(void);
 static void vs_start_followup_round(void);
 #endif
 
-/* 前向声明：vs_transition 需要按目标/来源停止/启动续听窗口计时器 */
+/* 前向声明：vs_transition 需要按目标/来源停止/启动续听窗口计时器；
+ * vs_enter_error 被续听起轮失败等早于其定义的路径调用（T3.6） */
 static bool vs_transition(vs_state_t expect, vs_state_t to, vs_reason_t reason);
+static void vs_enter_error(fb_kind_t kind, int32_t code);
 
 /* ---------------- 状态迁移 ---------------- */
 
@@ -106,6 +108,8 @@ const char *vs_reason_name(vs_reason_t reason)
     case VS_REASON_FOLLOWUP_MAX: return "followup-max";
     case VS_REASON_FOLLOWUP_WAKE: return "followup-wake";
     case VS_REASON_FOLLOWUP_OFF: return "followup-off";
+    case VS_REASON_NET_OFFLINE: return "net-offline";
+    case VS_REASON_TTS_FAIL: return "tts-fail";
     default: return "unknown";
     }
 }
@@ -373,9 +377,9 @@ static void vs_start_followup_round(void)
     ESP_LOGI(TAG, "续听窗口内检测到人声 → 起续听轮（sid=%u，不播提示音）", (unsigned)sid);
     esp_err_t err = vc_start(sid);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "续听起轮失败（sid=%u）: %s（云端未就绪，回 IDLE）", (unsigned)sid,
-                 esp_err_to_name(err));
-        (void)vs_transition(VS_STATE_LISTENING, VS_STATE_IDLE, VS_REASON_CLOUD_NOT_READY);
+        ESP_LOGW(TAG, "续听起轮失败（sid=%u）: %s（网络未就绪 → 网络未连接反馈）",
+                 (unsigned)sid, esp_err_to_name(err));
+        vs_enter_error(FB_KIND_NET_OFFLINE, 0);
     }
 #endif
 }
@@ -436,41 +440,120 @@ static void vs_abort_to_idle(vs_reason_t reason)
     }
 }
 
+/* ERROR 状态兜底看门狗（T3.6）：正常情况下提示音完成回调会先回 IDLE，
+ * 这里只兜"提示音卡住/播放器异常/回调丢失"，避免状态机卡在 ERROR 且 R1 门控不释放。 */
 #if CONFIG_VS_ERROR_HOLD_MS > 0
 static void vs_error_timer_cb(void *arg)
 {
     (void)arg;
+    ESP_LOGW(TAG, "错误反馈看门狗超时（%d ms）→ 强制回 IDLE", CONFIG_VS_ERROR_HOLD_MS);
+    portENTER_CRITICAL(&s_mux);
+    s_stats.error_watchdog++;
+    s_stats.error_feedback_fail++;
+    portEXIT_CRITICAL(&s_mux);
+    (void)fb_abort();
     (void)vs_transition(VS_STATE_ERROR, VS_STATE_IDLE, VS_REASON_ERROR_DONE);
 }
 #endif
 
+/* fb_kind_t → 迁移原因（写日志/事件 payload 用） */
+static vs_reason_t vs_reason_for_kind(fb_kind_t kind)
+{
+    switch (kind) {
+    case FB_KIND_NET_OFFLINE: return VS_REASON_NET_OFFLINE;
+    case FB_KIND_TIMEOUT:     return VS_REASON_TIMEOUT;
+    case FB_KIND_TTS_FAIL:    return VS_REASON_TTS_FAIL;
+    case FB_KIND_CLOUD_ERROR:
+    default:                  return VS_REASON_CLOUD_ERROR;
+    }
+}
+
 /*
- * 进入 ERROR：LISTENING/THINKING/SPEAKING → ERROR。
- * ARCH §7：ERROR 播错误提示音（资源 T3.6）后回 IDLE、同轮不重试；当前提示音未接入，
- * 由 `CONFIG_VS_ERROR_HOLD_MS` 控制停留（默认 0 = 立即回 IDLE，日志里仍可见迁移）。
+ * 进入 ERROR：LISTENING/THINKING/SPEAKING → ERROR（T3.6）。
+ * ARCH §7：ERROR 播错误提示音后回 IDLE、同轮不重试。提示音由 feedback 组件播放
+ * （语音只是当前反馈通道；语义事件 APP_EVT_FEEDBACK 供未来屏幕/灯光通道订阅）；
+ * 播放完成回调 vs_on_fb_done() 驱动 ERROR → IDLE；CONFIG_VS_ERROR_HOLD_MS 只作兜底。
  */
-static void vs_enter_error(vs_reason_t reason)
+static void vs_enter_error(fb_kind_t kind, int32_t code)
 {
     const vs_state_t st = vs_get_state();
     if (st != VS_STATE_LISTENING && st != VS_STATE_THINKING && st != VS_STATE_SPEAKING) {
+        ESP_LOGD(TAG, "异常反馈忽略（state=%s，kind=%s）", vs_state_name(st),
+                 fb_kind_name(kind));
         return;
     }
+
+    const vs_reason_t reason = vs_reason_for_kind(kind);
     if (!vs_transition(st, VS_STATE_ERROR, reason)) {
         return;
     }
-    ESP_LOGE(TAG, "会话进入 ERROR（%s），本轮不自动重试", vs_reason_name(reason));
+
+    portENTER_CRITICAL(&s_mux);
+    s_stats.last_error_kind = (uint8_t)kind;
+    s_stats.last_error_code = code;
+    if (kind > FB_KIND_NONE && kind < FB_KIND_COUNT) {
+        s_stats.error_by_kind[kind]++;
+    }
+    portEXIT_CRITICAL(&s_mux);
+
+    ESP_LOGE(TAG, "会话进入 ERROR（%s，code=%d），本轮不自动重试", fb_kind_name(kind),
+             (int)code);
 
     /* 防御：让协议侧也结束本轮（cloud error / 超时路径下 vc 多半已结束，cancel 幂等） */
     (void)vc_cancel();
+
+    /* 交给 feedback：语音通道 + 语义事件（未来屏幕/灯光通道订阅事件） */
+    const uint16_t sid = vs_current_sid();
+    const esp_err_t ferr = fb_notify(kind, code, sid);
+    if (ferr != ESP_OK) {
+        ESP_LOGW(TAG, "错误反馈未启动（%s）→ 直接回 IDLE", esp_err_to_name(ferr));
+        portENTER_CRITICAL(&s_mux);
+        s_stats.error_feedback_fail++;
+        portEXIT_CRITICAL(&s_mux);
+        (void)vs_transition(VS_STATE_ERROR, VS_STATE_IDLE, VS_REASON_ERROR_DONE);
+        return;
+    }
+
+    portENTER_CRITICAL(&s_mux);
+    s_stats.error_feedback_plays++;
+    portEXIT_CRITICAL(&s_mux);
+    ESP_LOGI(TAG, "错误反馈（类别=%s，code=%d，sid=%u）→ 提示音（R1）", fb_kind_name(kind),
+             (int)code, (unsigned)sid);
 
 #if CONFIG_VS_ERROR_HOLD_MS > 0
     if (s_error_timer != NULL) {
         esp_timer_stop(s_error_timer);
         esp_timer_start_once(s_error_timer, (uint64_t)CONFIG_VS_ERROR_HOLD_MS * 1000);
-        return;
     }
 #endif
-    (void)vs_transition(VS_STATE_ERROR, VS_STATE_IDLE, VS_REASON_ERROR_DONE);
+}
+
+/* feedback 完成回调（player 任务上下文）：提示音播完/失败 → 结束 ERROR 状态 */
+static void vs_on_fb_done(fb_kind_t kind, bool ok, uint32_t dur_ms, void *arg)
+{
+    (void)arg;
+
+    portENTER_CRITICAL(&s_mux);
+    if (ok) {
+        s_stats.error_feedback_ok++;
+    } else {
+        s_stats.error_feedback_fail++;
+    }
+    s_stats.last_error_prompt_ms = dur_ms;
+    portEXIT_CRITICAL(&s_mux);
+
+    ESP_LOGI(TAG, "错误反馈完成（类别=%s，ok=%d，时长=%u ms）→ IDLE", fb_kind_name(kind),
+             (int)ok, (unsigned)dur_ms);
+
+#if CONFIG_VS_ERROR_HOLD_MS > 0
+    if (s_error_timer != NULL) {
+        esp_timer_stop(s_error_timer);
+    }
+#endif
+
+    if (vs_get_state() == VS_STATE_ERROR) {
+        (void)vs_transition(VS_STATE_ERROR, VS_STATE_IDLE, VS_REASON_ERROR_DONE);
+    }
 }
 
 /* ---------------- voice_cloud 回调（ws_client / vc 任务上下文） ---------------- */
@@ -489,22 +572,32 @@ static void vs_on_round_end(vc_round_end_t result)
         portENTER_CRITICAL(&s_mux);
         s_stats.timeouts++;
         portEXIT_CRITICAL(&s_mux);
-        vs_enter_error(VS_REASON_TIMEOUT);
+        vs_enter_error(FB_KIND_TIMEOUT, 0);
         break;
 
     case VC_ROUND_ABORT_ERROR:
-        vs_enter_error(VS_REASON_CLOUD_ERROR); /* CLOUD_ERROR 事件先到时会幂等返回 */
+        /* CLOUD_ERROR 事件先到时会带具体 code，这条用于兜底（幂等） */
+        vs_enter_error(FB_KIND_CLOUD_ERROR, 0);
         break;
 
     case VC_ROUND_ABORT_LINK:
-        vs_abort_to_idle(VS_REASON_LINK_LOST);
+        /* 链路不可用（WS 断链）：对用户等同"网络未连接"，给本地提示音反馈（T3.6） */
+        vs_enter_error(FB_KIND_NET_OFFLINE, 0);
         break;
 
     case VC_ROUND_ABORT_CANCEL:
     case VC_ROUND_ABORT_NEW:
-    case VC_ROUND_ABORT_SETUP:
     default:
         vs_abort_to_idle(VS_REASON_ROUND_ABORT);
+        break;
+
+    case VC_ROUND_ABORT_SETUP:
+        /* 起轮失败：云端未 READY 时按"网络未连接"反馈；其它（编码器/上行占用）保持静默中止 */
+        if (!vc_is_ready()) {
+            vs_enter_error(FB_KIND_NET_OFFLINE, 0);
+        } else {
+            vs_abort_to_idle(VS_REASON_ROUND_ABORT);
+        }
         break;
     }
 
@@ -540,7 +633,14 @@ static void vs_on_vc_event(const vc_event_msg_t *msg, void *arg)
         portENTER_CRITICAL(&s_mux);
         s_stats.cloud_errors++;
         portEXIT_CRITICAL(&s_mux);
-        vs_enter_error(VS_REASON_CLOUD_ERROR);
+        /* 按 PROTOCOL 错误码分流：3001/3002 = TTS 失败 → "语音播放失败"；其余 → "服务异常" */
+        vs_enter_error(fb_kind_from_cloud_code(msg->code), msg->code);
+        break;
+
+    case VC_EVT_TTS_FAIL:
+        /* 设备侧无法播放云端 TTS（codec 不支持/开流失败等）：给"语音播放失败"反馈 */
+        ESP_LOGW(TAG, "设备侧 TTS 无法播放（原因=%d）→ 语音播放失败反馈", (int)msg->code);
+        vs_enter_error(FB_KIND_TTS_FAIL, msg->code);
         break;
 
     case VC_EVT_ROUND_END:
@@ -579,9 +679,16 @@ static void vs_on_play_done(audio_player_src_t src, bool ok, void *arg)
     }
 
     /* R2：唤醒应答播完恢复收音（T3.2 起走原因位仲裁，release 幂等）；
-     * 日志文案与 T1.2b 之前的 APP 版本保持一致（测试脚本依赖） */
-    audio_fe_feed_release(AUDIO_FE_HOLD_PROMPT);
-    ESP_LOGI(TAG, "prompt done, feed resumed");
+     * 日志文案与 T1.2b 之前的 APP 版本保持一致（测试脚本依赖）。
+     * T3.6：若已进入 ERROR（如提示音期间断网），PROMPT 位由 feedback 的错误提示音
+     * 完成回调释放，这里不能抢先 release，否则错误提示音播放期间麦克风会被打开。 */
+    const bool error_owns_prompt = (vs_get_state() == VS_STATE_ERROR);
+    if (!error_owns_prompt) {
+        audio_fe_feed_release(AUDIO_FE_HOLD_PROMPT);
+        ESP_LOGI(TAG, "prompt done, feed resumed");
+    } else {
+        ESP_LOGW(TAG, "唤醒提示音播完但已进入 ERROR：R1 交给错误提示音完成回调释放");
+    }
 
     if (vs_get_state() != VS_STATE_LISTENING) {
         return; /* 提示音期间已被打断/断网：本轮不再起 */
@@ -596,9 +703,9 @@ static void vs_on_play_done(audio_player_src_t src, bool ok, void *arg)
     const uint16_t sid = vs_current_sid();
     esp_err_t err = vc_start(sid);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "起轮失败（sid=%u）: %s（网络未就绪，本轮降级结束）", (unsigned)sid,
+        ESP_LOGW(TAG, "起轮失败（sid=%u）: %s（网络未就绪 → 网络未连接反馈）", (unsigned)sid,
                  esp_err_to_name(err));
-        (void)vs_transition(VS_STATE_LISTENING, VS_STATE_IDLE, VS_REASON_CLOUD_NOT_READY);
+        vs_enter_error(FB_KIND_NET_OFFLINE, 0);
     }
 }
 
@@ -648,6 +755,14 @@ static void vs_on_wake(void)
         return;
     }
 
+    /* T3.6：云端现在起不了轮（未联网/WS 未 READY）就不要先播"我在呢"再播"网络未连接"，
+     * 直接给"网络未连接"反馈（也顺带确认了唤醒），避免两段提示音连播。 */
+    if (!vc_is_ready()) {
+        ESP_LOGW(TAG, "唤醒时云端未就绪（ws 未 READY）→ 网络未连接反馈（不播应答提示音）");
+        vs_enter_error(FB_KIND_NET_OFFLINE, 0);
+        return;
+    }
+
     if (music_playing) {
         ESP_LOGW(TAG, "音乐播放中唤醒（R3）：淡出音乐让出输出通道 %d ms（混音叠加归 T3.3/P4）",
                  CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS);
@@ -664,8 +779,18 @@ static void vs_on_wake(void)
     portEXIT_CRITICAL(&s_mux);
     audio_fe_feed_hold(AUDIO_FE_HOLD_PROMPT);
 
-    esp_err_t err = audio_player_play_pcm(prompt_wo_zai_ne_pcm, prompt_wo_zai_ne_samples,
-                                          AUDIO_IO_MIC_SAMPLE_RATE);
+    const prompt_clip_t *wake_clip = prompt_assets_get(PROMPT_WAKE_OK);
+    if (wake_clip == NULL || wake_clip->pcm == NULL || wake_clip->samples == 0) {
+        ESP_LOGE(TAG, "唤醒应答提示音资源缺失，本轮放弃");
+        portENTER_CRITICAL(&s_mux);
+        s_prompt_playing = false;
+        portEXIT_CRITICAL(&s_mux);
+        audio_fe_feed_release(AUDIO_FE_HOLD_PROMPT);
+        (void)vs_transition(VS_STATE_LISTENING, VS_STATE_IDLE, VS_REASON_PROMPT_FAILED);
+        return;
+    }
+    esp_err_t err = audio_player_play_pcm(wake_clip->pcm, wake_clip->samples,
+                                          wake_clip->sample_rate);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "唤醒应答播放失败: %s", esp_err_to_name(err));
         portENTER_CRITICAL(&s_mux);
@@ -679,11 +804,34 @@ static void vs_on_wake(void)
 static void vs_on_net_down(const app_evt_data_t *data)
 {
     const app_evt_net_down_t *down = (data != NULL) ? &data->net_down : NULL;
+    const uint32_t reason_code = (down != NULL) ? down->reason : 0u;
     ESP_LOGW(TAG, "网络断开（reason=%u，重试 %u ms）→ 结束当前会话",
-             down != NULL ? (unsigned)down->reason : 0u,
-             down != NULL ? (unsigned)down->retry_ms : 0u);
+             (unsigned)reason_code, (unsigned)(down != NULL ? down->retry_ms : 0u));
+
+    const vs_state_t st = vs_get_state();
     (void)vc_cancel();
-    vs_abort_to_idle(VS_REASON_NET_DOWN);
+
+    if (st == VS_STATE_LISTENING || st == VS_STATE_THINKING || st == VS_STATE_SPEAKING) {
+        /* 会话中途断网（T3.6 用户拍板：也要出声）→ 网络未连接提示音 → IDLE */
+        vs_enter_error(FB_KIND_NET_OFFLINE, (int32_t)reason_code);
+        return;
+    }
+    if (st == VS_STATE_FOLLOW_UP) {
+        /* 续听窗口按 T3.7 规则退出，随后补一声本地提示音（不进 ERROR：窗口本就要结束） */
+        vs_followup_stop();
+        (void)vs_transition(VS_STATE_FOLLOW_UP, VS_STATE_IDLE, VS_REASON_NET_DOWN);
+        const esp_err_t ferr = fb_notify(FB_KIND_NET_OFFLINE, (int32_t)reason_code,
+                                         vs_current_sid());
+        if (ferr != ESP_OK) {
+            ESP_LOGW(TAG, "断网反馈未启动（%s）", esp_err_to_name(ferr));
+        }
+        return;
+    }
+    if (st == VS_STATE_ERROR) {
+        return; /* 已经在错误反馈中（如 TTS 播放中收到 error 后又断网），不重复提示 */
+    }
+    /* IDLE：无会话可中止；待机断网不出声（独立"断网状态反馈"仍归 PD-002） */
+    ESP_LOGI(TAG, "待机状态网络断开，无会话可中止（不出声）");
 }
 
 /* T3.7：续听窗口内 VAD 判到人声 → 确认后起下一轮（不播提示音、不再唤醒） */
@@ -812,16 +960,20 @@ esp_err_t vs_init(void)
     }
 #endif
 
+    /* T3.6：反馈完成回调（player 任务上下文）驱动 ERROR → IDLE */
+    fb_register_done_cb(vs_on_fb_done, NULL);
+
     s_state_since_us = esp_timer_get_time();
     s_state = VS_STATE_IDLE;
     s_inited = true;
 #if CONFIG_VS_FOLLOWUP_ENABLE
     ESP_LOGI(TAG,
-             "ready（%d 态事件驱动，无独立任务；异常保持 %d ms；续听窗口 %d ms / 最多 %d 轮）",
+             "ready（%d 态事件驱动，无独立任务；异常反馈看门狗 %d ms；"
+             "续听窗口 %d ms / 最多 %d 轮）",
              (int)VS_STATE_COUNT, CONFIG_VS_ERROR_HOLD_MS, CONFIG_VS_FOLLOWUP_WINDOW_MS,
              CONFIG_VS_FOLLOWUP_MAX_ROUNDS);
 #else
-    ESP_LOGI(TAG, "ready（%d 态事件驱动，无独立任务；异常保持 %d ms；续听窗口关）",
+    ESP_LOGI(TAG, "ready（%d 态事件驱动，无独立任务；异常反馈看门狗 %d ms；续听窗口关）",
              (int)VS_STATE_COUNT, CONFIG_VS_ERROR_HOLD_MS);
 #endif
     return ESP_OK;
@@ -841,8 +993,8 @@ esp_err_t vs_start(void)
 
     esp_err_t err = vc_start(sid);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "手动起轮失败: %s", esp_err_to_name(err));
-        (void)vs_transition(VS_STATE_LISTENING, VS_STATE_IDLE, VS_REASON_CLOUD_NOT_READY);
+        ESP_LOGW(TAG, "手动起轮失败: %s（网络未就绪 → 网络未连接反馈）", esp_err_to_name(err));
+        vs_enter_error(FB_KIND_NET_OFFLINE, 0);
         return err;
     }
     return ESP_OK;
@@ -861,6 +1013,19 @@ esp_err_t vs_interrupt(void)
     s_stats.interrupts++;
     portEXIT_CRITICAL(&s_mux);
     ESP_LOGW(TAG, "打断当前会话（state=%s）", vs_state_name(vs_get_state()));
+
+    if (vs_get_state() == VS_STATE_ERROR) {
+        /* T3.6：错误提示音期间按键 = 中止这次反馈并回 IDLE（不向云端发 interrupt：本轮早已作废） */
+        (void)fb_abort();
+#if CONFIG_VS_ERROR_HOLD_MS > 0
+        if (s_error_timer != NULL) {
+            esp_timer_stop(s_error_timer);
+        }
+#endif
+        ESP_LOGW(TAG, "ERROR 反馈被按键中止 → IDLE");
+        (void)vs_transition(VS_STATE_ERROR, VS_STATE_IDLE, VS_REASON_INTERRUPT);
+        return ESP_OK;
+    }
 
     /* R4：① 播放通道淡出（请求在这里、执行在 player 任务，80ms 见 Kconfig）；
      *     ② 给云端发 interrupt 报文并作废本轮（vc_interrupt）；

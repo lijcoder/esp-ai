@@ -49,7 +49,20 @@ typedef enum {
     /* T3.1：供 voice_session 驱动会话状态机 */
     VC_EVT_UPLINK_END,      /* audio_end 已发出；code = vc_finish_t（0=vad/1=max/2=stop） */
     VC_EVT_ROUND_END,       /* 本轮结束（正常/超时/断链/取消/起轮失败）；round_end 给原因 */
+    /* T3.6：设备侧无法播放云端 TTS（云端没报 error，但端侧确实播不出来）；
+     * code = vc_tts_fail_t；voice_session 据此给"语音播放失败"反馈 */
+    VC_EVT_TTS_FAIL,
 } vc_event_t;
+
+/* VC_EVT_TTS_FAIL 的原因（设备侧，T3.6） */
+typedef enum {
+    VC_TTS_FAIL_NONE = 0,
+    VC_TTS_FAIL_NOT_MP3 = 1,        /* tts_start codec 不是 MP3（端侧只实现 MP3） */
+    VC_TTS_FAIL_NO_SAMPLE_RATE = 2, /* tts_start 缺采样率 */
+    VC_TTS_FAIL_MP3_UNAVAILABLE = 3,/* audio_player 的 MP3 能力不可用（PSRAM 分配失败等） */
+    VC_TTS_FAIL_PLAYER_BUSY = 4,    /* 播放器忙（提示音/本地播放占着） */
+    VC_TTS_FAIL_OPEN_FAILED = 5,    /* audio_player_stream_open 返回错误 */
+} vc_tts_fail_t;
 
 /* 一轮结束的原因（VC_EVT_ROUND_END 的 round_end 字段） */
 typedef enum {
@@ -141,6 +154,15 @@ esp_err_t vc_interrupt(void);
 
 /* 是否有一轮在进行（UPLINK 或 WAIT_RESPONSE） */
 bool vc_is_busy(void);
+
+/**
+ * @brief 云端是否"现在就能起一轮"（T3.6：voice_session 在唤醒前预判，避免先播"我在呢"
+ *        再播"网络未连接"两段提示音）
+ *
+ * 判据：已初始化 + WS READY + 没有进行中的轮次/待起轮请求。
+ * 注意不是"网络是否可用"的权威判断（真正起轮仍以 vc_start() 返回值为准）。
+ */
+bool vc_is_ready(void);
 
 vc_state_t vc_get_state(void);
 const char *vc_state_name(vc_state_t state);

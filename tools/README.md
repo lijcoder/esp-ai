@@ -1020,6 +1020,28 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 | `--verbose` | 关 | 打印上行 payload 前 16 字节（库自身的握手 DEBUG 已压到 WARNING） |
 | `--self-test` | — | 进程内自测，不需要硬件 |
 
+### 回声测试（你说什么 → 它复读什么）的实战注意（2026-11-02）
+
+```bash
+uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc \
+  tools/ws_mock_server.py --asr sensevoice --tts-piper \
+  --asr-download --tts-piper-download
+```
+
+- **默认（不加 `--asr`）听到的永远是固定文案**：`--tts-text` 默认"今天天气不错…"；
+  用 `--tts-mp3 <file>` 则永远是那个文件的内容。要复读**你自己说的话**必须 `--asr sensevoice --tts-piper`。
+- **`[ASR] 识别结果: '.'` = 那 2~3 秒音频里没有语音**（纯静音/噪声）。常见原因：
+  ① 在提示音期间说话（R1 门控，麦克风被关掉，说的话不会上行）；
+  ② 离设备太远/太轻（设备端 `mic stat` 看说话时 RMS 应在数百~数千，<300 基本识别不到）；
+  ③ 环境噪声触发 VAD 起了轮，但你还没开口。
+  → 现在会 WARN 并回退 `--tts-text`，**不再拿标点去合成**。
+- **踩过的坑（已修）**：ASR 返回 `"."` 时 Piper 生成 0 帧音频并抛 `wave.Error: # channels not specified`，
+  当时以 `SystemExit` 穿出线程 → **整个 mock 进程退出**。现在 `mock_tts` 统一抛 `RuntimeError`，
+  mock 侧 `except BaseException` 兜底 + 统计 `复读合成失败 N 次`，单轮合成失败只降级不影响协议链路。
+- 验证"链路是否听懂"最快的方法：**先别用自己的嗓子**，在 `VS: prompt done, feed resumed` 之后
+  `afplay tools/今天天气如何.wav`；如果 `ASR final` 出现接近"今天天气如何"的文字，说明 ASR/上行都对，
+  剩下的就是你说话的音量和距离问题。
+
 ## 约束与边界
 
 - **只做开发联调工具**，不进固件、不占设备资源；零固件改动。

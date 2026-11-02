@@ -299,6 +299,7 @@ class Stats:
     asr_errors: int = 0
     asr_audio_ms: int = 0
     asr_infer_ms: int = 0
+    tts_piper_errors: int = 0  # 复读合成失败次数（回退合成帧，不中断协议链路）
 
     def summary(self) -> str:
         duration = time.monotonic() - self.started_at
@@ -307,6 +308,8 @@ class Stats:
             extra += f" 窗口外注入 {self.late_bins} 帧"
         if self.tts_stalls:
             extra += f" stall {self.tts_stalls} 次"
+        if self.tts_piper_errors:
+            extra += f" 复读合成失败 {self.tts_piper_errors} 次"
         if self.asr_rounds or self.asr_errors:
             extra += (
                 f" | ASR {self.asr_rounds} 轮成功/{self.asr_errors} 失败"
@@ -321,6 +324,15 @@ class Stats:
 
 
 # ---------------- 单个设备会话 ----------------
+
+
+def module_speakable(text: str) -> bool:
+    """文本里是否有真正可发音的字符（中文/字母/数字）；纯标点/空白视为"没有内容"。
+
+    ASR 静音时常返回 "."、TTS 拿到这种文本会生成 0 帧并让 piper 抛
+    `wave.Error: # channels not specified`，所以链路前后都要判一次。
+    """
+    return any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in text or "")
 
 
 class Session:
@@ -651,6 +663,15 @@ class Session:
             if not result["text"]:
                 self._log(logging.WARNING, "[ASR] 未识别到文字，回退 --tts-text")
                 return self.cfg.tts_text
+            # SenseVoice 在"整段只有静音/噪声"时常返回 "." 这类纯标点：那不是一句话，
+            # 当成没听到（否则复读模式会拿标点去合成、piper 直接报错）。
+            if not module_speakable(result["text"]):
+                self._log(
+                    logging.WARNING,
+                    f"[ASR] 只识别到标点 {result['text']!r}（整段没听到语音）→ 回退 --tts-text；"
+                    "若确实说了话，检查麦克风电平（设备上 `mic stat`）与说话距离",
+                )
+                return self.cfg.tts_text
             return result["text"]
         except Exception as exc:  # noqa: BLE001 - 单轮识别失败不能拖垮 mock
             self.stats.asr_errors += 1
@@ -690,10 +711,21 @@ class Session:
             # 回声测试：把识别文本用本地 Piper 合成为 TTS 音频（失败回退合成帧）
             echo_frames: list[Mp3Frame] | None = None
             if self.server.tts_piper_module is not None:
-                try:
-                    echo_frames = await asyncio.to_thread(self._synthesize_echo_frames, text)
-                except Exception as exc:  # noqa: BLE001 - 单轮合成失败不拖垮 mock
-                    self._log(logging.WARNING, f"[TTS] 复读合成失败（回退合成帧）：{exc}")
+                if not module_speakable(text):
+                    self._log(
+                        logging.WARNING,
+                        f"[TTS] 文本没有可念内容（{text!r}），跳过复读合成 → 回退合成帧",
+                    )
+                else:
+                    try:
+                        echo_frames = await asyncio.to_thread(self._synthesize_echo_frames, text)
+                    except BaseException as exc:  # noqa: BLE001
+                        # 必须是 BaseException：piper/编码链路可能抛 SystemExit，
+                        # `except Exception` 抓不住它，会让整个 mock 进程退出（2026-11-02 实测踩到）。
+                        if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+                            raise
+                        self.stats.tts_piper_errors += 1
+                        self._log(logging.WARNING, f"[TTS] 复读合成失败（回退合成帧）：{exc}")
 
             await self._send_json({"t": "asr_partial", "sid": sid, "text": text[: max(1, len(text) // 2)]})
             await self._send_json({"t": "asr_final", "sid": sid, "text": text})

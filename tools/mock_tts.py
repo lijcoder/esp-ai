@@ -171,11 +171,27 @@ def ensure_voice(voice: str, model_dir: str | Path | None = None, *, download: b
 # ---------------------------------------------------------------- 合成与编码
 
 
+def speakable_text(text: str) -> str:
+    """挑出真正可发音的字符（去掉标点/空白）。
+
+    ASR 在"没听到语音"时常返回 "." / "。" 这类纯标点文本，直接喂给 piper 会生成
+    0 帧音频并让 piper 自己抛 `wave.Error: # channels not specified`（且历史上以
+    SystemExit 逃出线程、整崩 mock）。调用方应先用本函数判断有没有内容可念。
+    """
+    return "".join(ch for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+
 def piper_tts(text: str, onnx: Path, config: Path, *, speed: float = 1.0) -> tuple[np.ndarray, int]:
-    """调用 piper CLI 生成 PCM（返回 int16 单声道 + 原始采样率）。"""
+    """调用 piper CLI 生成 PCM（返回 int16 单声道 + 原始采样率）。
+
+    失败一律抛 `RuntimeError`（而不是 SystemExit）：本模块被 ws_mock_server 当库调用，
+    SystemExit 会穿透 `except Exception`，把整个 mock 进程带崩。
+    """
+    if not speakable_text(text):
+        raise RuntimeError(f"没有可合成的文字（{text!r}）")
     piper = shutil.which("piper")
     if piper is None:
-        raise SystemExit("找不到 piper 命令（PEP 723 依赖应已安装，请用 `uv run tools/mock_tts.py` 运行）")
+        raise RuntimeError("找不到 piper 命令（PEP 723 依赖应已安装，请用 `uv run tools/mock_tts.py` 运行）")
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
         raw_path = Path(handle.name)
     try:
@@ -187,7 +203,10 @@ def piper_tts(text: str, onnx: Path, config: Path, *, speed: float = 1.0) -> tup
             stderr=subprocess.PIPE,
         )
         if proc.returncode != 0:
-            raise SystemExit(f"piper 合成失败（exit {proc.returncode}）：{proc.stderr.decode('utf-8', 'replace')[-400:]}")
+            raise RuntimeError(
+                f"piper 合成失败（exit {proc.returncode}）："
+                f"{proc.stderr.decode('utf-8', 'replace')[-400:]}"
+            )
         with wave.open(str(raw_path), "rb") as wav:
             rate = wav.getframerate()
             channels = wav.getnchannels()
@@ -195,6 +214,8 @@ def piper_tts(text: str, onnx: Path, config: Path, *, speed: float = 1.0) -> tup
         pcm = np.frombuffer(frames, dtype=np.int16)
         if channels > 1:
             pcm = pcm.reshape(-1, channels).mean(axis=1).astype(np.int16)
+        if pcm.size == 0:
+            raise RuntimeError("piper 返回 0 帧音频（文本可能不可发音）")
         return pcm, rate
     finally:
         raw_path.unlink(missing_ok=True)
@@ -235,6 +256,8 @@ def synthesize_mp3(
 
     供 `ws_mock_server.py --tts-piper` 做「ASR 文本 → 复读」回声测试复用。
     """
+    if not speakable_text(text):
+        raise RuntimeError(f"没有可合成的文字（{text!r}）")
     onnx, config = ensure_voice(voice, model_dir, download=download, log=log)
     pcm, rate = piper_tts(text, onnx, config, speed=speed)
     pcm24 = resample(pcm, rate)

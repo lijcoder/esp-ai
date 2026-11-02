@@ -46,6 +46,15 @@ WAKE_CHAIN = (
     ("play", re.compile(r"PLAYER: play \d+ samples")),
     ("done", re.compile(r"(?:APP|VS): prompt done, feed resumed")),
 )
+# T3.6：本脚本不依赖 mock，ws 未 READY 时唤醒走"离线分支"——不播"我在呢"，
+# 直接播"网络未连接"提示音后 ERROR→IDLE（没有 prompt done，但仍有 R1 paused/resumed）。
+WAKE_CHAIN_OFFLINE = (
+    ("wake", re.compile(r"(?:APP|VS): wake detected")),
+    ("pause", re.compile(r"AFE: feed paused")),
+    ("play", re.compile(r"PLAYER: play \d+ samples")),
+    ("resumed", re.compile(r"AFE: feed resumed")),
+)
+RE_OFFLINE_WAKE = re.compile(r"原因=net-offline|FB: 反馈 kind=net-offline")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 ERROR_RE = re.compile(r"\bE \(|ERROR|panic|abort\(\)|Guru Meditation|stack overflow")
@@ -59,6 +68,8 @@ TAG_RE = re.compile(r"[EW] \(\d+\) ([A-Za-z_0-9-]+):")
 
 
 def error_lines(lines: list[str]) -> list[str]:
+    """筛出音频链路相关错误。T3.6 起 `E (...) VS: 会话进入 ERROR（…）` 是预期异常反馈
+    日志（随后播提示音并回 IDLE），与网络/WS 噪声一样白名单排除；panic/assert 仍 FAIL。"""
     out = []
     for line in lines:
         if not ERROR_RE.search(line):
@@ -66,6 +77,10 @@ def error_lines(lines: list[str]) -> list[str]:
         m = TAG_RE.search(line)
         if m and m.group(1) in IGNORED_TAGS:
             continue
+        if "VS: 会话进入 ERROR（" in line:
+            continue
+        if re.search(r"VS: state [A-Z_]+ -> [A-Z_]+（", line):
+            continue  # 状态迁移日志里的 "ERROR" 是状态名（进/出 ERROR），不是错误
         out.append(line)
     return out
 
@@ -407,16 +422,21 @@ def run(args: argparse.Namespace) -> int:
         print("\n== D. 回归：唤醒链路 ==")
         mark = len(dev.lines)
         dev.play(wav_wake)
-        # 唤醒应答要播完（"我在呢" 0.8s + 300ms 尾音）才有 prompt done，先等链路收尾再断言
-        dev.wait_line(re.compile(r"(?:APP|VS): prompt done, feed resumed"), 6.0, mark)
+        # 分支判断：有云端 → 旧链（先"我在呢"再起轮）；ws 未 READY → T3.6 离线链
+        # （直接"网络未连接"提示音 → ERROR → IDLE，没有 prompt done）。
+        dev.wait_line(re.compile(r"(?:APP|VS): prompt done, feed resumed|AFE: feed resumed"), 6.0, mark)
+        dev.pump(0.5)
+        window_lines = [text for _, text in dev.lines[mark:]]
+        offline = any(RE_OFFLINE_WAKE.search(line) for line in window_lines)
+        chain = WAKE_CHAIN_OFFLINE if offline else WAKE_CHAIN
         seen = set()
-        for _, line in dev.lines[mark:]:
-            for name, pattern in WAKE_CHAIN:
+        for line in window_lines:
+            for name, pattern in chain:
                 if pattern.search(line):
                     seen.add(name)
-        missing = [name for name, _ in WAKE_CHAIN if name not in seen]
-        res.check("D1 唤醒链路完整（wake→paused→play→resumed）", not missing,
-                  f"missing={missing}" if missing else f"{len(seen)}/4")
+        missing = [name for name, _ in chain if name not in seen]
+        res.check(f"D1 唤醒链路完整（wake→paused→play→{'resumed' if offline else 'done'}）", not missing,
+                  f"missing={missing}" if missing else f"{len(seen)}/{len(chain)}")
         dev.pump(0.5)
         errors = error_lines([text for _, text in dev.lines[mark:]])
         res.check("D2 无音频链路 ERROR/panic（网络/WS 重连噪音已忽略）", not errors,

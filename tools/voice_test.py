@@ -356,9 +356,14 @@ def error_lines(lines: list[str]) -> list[str]:
     ignored_tags = {
         "NET", "WS", "wifi", "websocket_client", "esp_netif", "esp-tls", "esp_wifi",
         "wpa_supplicant", "phy_init", "net80211", "esp_https_ota", "HTTP_CLIENT",
+        # T3.6：ws 重连/断链是预期噪声（离线唤醒分支没有 mock，设备持续重连）
+        "transport_base", "transport_ws", "transport_ssl", "transport_tcp", "esp_transport",
+        "ws_client", "esp-tls",
     }
     ignored_patterns = (
-        re.compile(r"VS: 会话进入 ERROR（"),  # T3.6 异常反馈的预期语义日志
+        re.compile(r"VS: 会话进入 ERROR（"),   # T3.6 异常反馈的预期语义日志
+        # 状态迁移日志（A -> B）里的 "ERROR" 是状态名，不是错误（进/出 ERROR 都算）
+        re.compile(r"VS: state [A-Z_]+ -> [A-Z_]+（"),
     )
     out = []
     for line in lines:
@@ -482,6 +487,8 @@ def run(args: argparse.Namespace) -> int:
                                  for (n, _), h in zip(chain, chain_hits)))
                 if cross:
                     detail += f"；不该出现: {cross[0].strip()}"
+
+
                 print(f"  第 {i + 1} 轮 FAIL  {detail}")
                 for line in lines:
                     if any(k in line for k in ("APP:", "VS:", "AFE:", "PLAYER:", "FB:")):

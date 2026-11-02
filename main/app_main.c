@@ -16,6 +16,7 @@
 #include "event_bus.h"
 #include "feedback.h"
 #include "net_mgr.h"
+#include "prompt_assets.h"
 #include "transport_ws.h"
 #include "voice_cloud.h"
 #include "voice_session.h"
@@ -44,6 +45,11 @@ void app_main(void)
     ESP_ERROR_CHECK(app_evt_init());
 
     ESP_LOGI(TAG, "booting esp-ai (wake + prompt + cloud session)");
+
+    /* 提示音资源（T3.5）：assets 分区 pack → mmap；失败不致命（业务降级：缺提示音） */
+    if (prompt_store_init() != ESP_OK) {
+        ESP_LOGW(TAG, "提示音资源不可用（assets pack 缺失/损坏），业务按缺提示音降级");
+    }
 
     ESP_ERROR_CHECK(board_init());
     ESP_ERROR_CHECK(audio_io_init());

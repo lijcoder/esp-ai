@@ -773,22 +773,25 @@ static void vs_on_wake(void)
         }
     }
 
+    const prompt_clip_t *wake_clip = prompt_assets_get(PROMPT_WAKE_OK);
+    if (wake_clip == NULL || wake_clip->pcm == NULL || wake_clip->samples == 0) {
+        /* T3.5 降级：assets pack 缺失/损坏 → 跳过"我在呢"，直接起轮（不能卡会话） */
+        ESP_LOGW(TAG, "唤醒应答提示音不可用（assets pack 缺失/损坏）→ 跳过提示音直接起轮");
+        const uint16_t fallback_sid = vs_current_sid();
+        esp_err_t serr = vc_is_ready() ? vc_start(fallback_sid) : ESP_ERR_INVALID_STATE;
+        if (serr != ESP_OK) {
+            ESP_LOGW(TAG, "降级起轮失败: %s → 网络未连接反馈", esp_err_to_name(serr));
+            vs_enter_error(FB_KIND_NET_OFFLINE, 0);
+        }
+        return;
+    }
+
     /* R1：应答提示音播放期间暂停收音（原因位 PROMPT，与 TTS 的 R1 互不覆盖） */
     portENTER_CRITICAL(&s_mux);
     s_prompt_playing = true;
     portEXIT_CRITICAL(&s_mux);
     audio_fe_feed_hold(AUDIO_FE_HOLD_PROMPT);
 
-    const prompt_clip_t *wake_clip = prompt_assets_get(PROMPT_WAKE_OK);
-    if (wake_clip == NULL || wake_clip->pcm == NULL || wake_clip->samples == 0) {
-        ESP_LOGE(TAG, "唤醒应答提示音资源缺失，本轮放弃");
-        portENTER_CRITICAL(&s_mux);
-        s_prompt_playing = false;
-        portEXIT_CRITICAL(&s_mux);
-        audio_fe_feed_release(AUDIO_FE_HOLD_PROMPT);
-        (void)vs_transition(VS_STATE_LISTENING, VS_STATE_IDLE, VS_REASON_PROMPT_FAILED);
-        return;
-    }
     esp_err_t err = audio_player_play_pcm(wake_clip->pcm, wake_clip->samples,
                                           wake_clip->sample_rate);
     if (err != ESP_OK) {

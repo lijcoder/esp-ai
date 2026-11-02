@@ -33,6 +33,7 @@
 #include "freertos/task.h"
 #include "net_mgr.h"
 #include "nvs.h"
+#include "prompt_assets.h"
 #include "sdkconfig.h"
 #include "transport_ws.h"
 #include "voice_cloud.h"
@@ -46,7 +47,7 @@ static const char *TAG = "DIAG";
  */
 static const char *const k_tags[] = {
     "APP", "BOARD", "AUDIO_IO", "AFE", "PLAYER", "ENC", "NET",
-    "WS", "VC", "VS", "MC", "MS", "DEV", "DIAG", "CFG", "EVT", "FB",
+    "WS", "VC", "VS", "MC", "MS", "DEV", "DIAG", "CFG", "EVT", "FB", "PROMPT",
 };
 #define TAG_COUNT (sizeof(k_tags) / sizeof(k_tags[0]))
 
@@ -1647,6 +1648,58 @@ static int cmd_fb(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* ---------------- prompt 命令（提示音资源观测，T3.5） ---------------- */
+
+static const char *prompt_mode_name(uint8_t mode)
+{
+    switch (mode) {
+    case PROMPT_STORE_MODE_MMAP: return "flash-mmap";
+    case PROMPT_STORE_MODE_PSRAM: return "psram-fallback";
+    default: return "none";
+    }
+}
+
+static int cmd_prompt(int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "info") != 0) {
+        printf("用法: prompt info（assets 分区提示音 pack 状态）\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    prompt_store_info_t info;
+    esp_err_t err = prompt_store_info(&info);
+    if (err != ESP_OK) {
+        printf("提示音资源未初始化: %s（prompt_store_init 是否在 app_main 调用？）\n",
+               esp_err_to_name(err));
+        return ESP_OK;
+    }
+    if (!info.ready) {
+        printf("提示音资源不可用：%s\n", info.error);
+        printf("  业务已降级：唤醒跳过应答提示音直接起轮；错误反馈只记日志\n");
+        return ESP_OK;
+    }
+
+    printf("提示音资源: %s（pack v%u，%u 条，%u B，加载 %u us，base=%p）\n",
+           prompt_mode_name(info.mode), (unsigned)info.version, (unsigned)info.count,
+           (unsigned)info.total_len, (unsigned)info.load_us, info.base);
+    for (unsigned i = 0; i < (unsigned)PROMPT_COUNT; i++) {
+        const prompt_clip_t *clip = prompt_assets_get((prompt_id_t)i);
+        if (clip == NULL) {
+            printf("  [%u] %-11s <缺失>\n", i, prompt_assets_name((prompt_id_t)i));
+            continue;
+        }
+        const uint64_t dur_us = (uint64_t)clip->samples * 1000000u / clip->sample_rate;
+        printf("  [%u] %-11s %u 样本 / %u.%03u ms @ %u Hz，pcm=%p\n", i,
+               prompt_assets_name((prompt_id_t)i), (unsigned)clip->samples,
+               (unsigned)(dur_us / 1000u), (unsigned)(dur_us % 1000u),
+               (unsigned)clip->sample_rate, clip->pcm);
+    }
+    printf("  说明: 资源在 assets 分区（0x7a0000）；单独烧该分区即可替换提示音（app 不动）\n");
+    return ESP_OK;
+}
+
+/* ---------------- dev 命令（按键/静音观测，T3.4） ---------------- */
+
 static void print_dev_status(void)
 {
     dev_stats_t st;
@@ -2462,6 +2515,12 @@ static esp_err_t register_commands(void)
             .help = "异常反馈（T3.6）：fb status | reset | test <net|cloud|timeout|tts>",
             .hint = "status|reset|test",
             .func = cmd_fb,
+        },
+        {
+            .command = "prompt",
+            .help = "提示音资源（T3.5）：prompt info（assets 分区 pack 状态/条目/映射地址）",
+            .hint = "info",
+            .func = cmd_prompt,
         },
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST
         {

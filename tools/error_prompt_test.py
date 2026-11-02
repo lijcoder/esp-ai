@@ -1366,10 +1366,12 @@ class Runner:
             timeout=2.0)
         log_text = "\n".join(log_lines)
         m = re.search(r"已知 TAG（(\d+) 个）", log_text)
-        r.check(m is not None and int(m.group(1)) == 17,
-                f"[P] `log` TAG 数 17（实际 {m.group(1) if m else '未解析'}）")
+        r.check(m is not None and int(m.group(1)) == 18,
+                f"[P] `log` TAG 数 18（实际 {m.group(1) if m else '未解析'}）")
         r.check(re.search(r"(?m)^  FB\s", log_text) is not None,
                 "[P] `log` TAG 表含 FB（异常反馈）")
+        r.check(re.search(r"(?m)^  PROMPT\s", log_text) is not None,
+                "[P] `log` TAG 表含 PROMPT（提示音资源，T3.5）")
 
         vs = self.vs_status()
         r.check(bool(vs.get("feedback")), "[P] `vs status` 含「错误反馈: 网络 … / 云端 …」行")

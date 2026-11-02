@@ -831,7 +831,7 @@ uv run tools/error_prompt_test.py                    # 全场景（约 2~3 分�
 uv run tools/error_prompt_test.py --scenarios A       # 只测离线唤醒反馈（不需要 mock）
 uv run tools/error_prompt_test.py --scenarios C,D,J   # 只测云端 error 两档 + 稳定性
 uv run tools/error_prompt_test.py --no-mock --scenarios B   # 复用外部 mock（mock 侧断言跳过）
-uv run tools/error_prompt_test.py --self-test        # 离线自检解析/判定（38 项，不连设备）
+uv run tools/error_prompt_test.py --self-test        # 离线自检解析/判定（45 项，不连设备）
 uv run tools/error_prompt_test.py --dry-run          # 只检查素材/音量/串口/场景计划（不开串口）
 ```
 
@@ -850,6 +850,14 @@ uv run tools/error_prompt_test.py --dry-run          # 只检查素材/音量/�
 | H 正常轮不误播 | 默认 mock | 正常 `tts_start/tts_end` 一轮结束：无错误反馈、完成轮次 +1 |
 | I SPEAKING 中云端报错 | `--error-code 3001 --error-stage after-tts-start` | 先 `PLAYER: stream end/abort` 再 `FB: 反馈`（无叠音）、无「反馈被丢弃 busy」、`VS: speaking done` |
 | J 稳定性 | `--error-code 1` × `--stability-rounds 10` | 每轮反馈完成→IDLE；`fb status` 总播放/分类各 +10、`vs status` 云端口 +10；内部堆最低水位 ≥30KB、free/PSRAM 波动在阈值内、无 panic |
+
+**健康检查口径（2026-11-02 板测后定稿）**：`无非预期 ERROR/panic` 沿用 `mixer_test.py` 的两层白名单——
+① **网络/传输层既有噪声不计 FAIL**：`transport_base`/`transport_ws`/`websocket_client`/`ws_client`/
+`esp-tls`/`esp_netif*`/`wifi` 等 TAG，或 `Failed to open a new connection` / `Error connecting to host` /
+`tcp_write error` / `Software caused connection abort` 等行内片段（场景 A 故意不启 mock、B 主动
+`wifi reconnect`、C~J 重启 mock 都会刷）；② 错误场景下额外排除 `VS: 会话进入 ERROR` 等 T3.6 预期反馈日志。
+**panic/assert/Guru/stack overflow/StoreProhibited/LoadProhibited 优先级最高（带噪声 TAG 也 FAIL），
+业务侧 ERROR（`PLAYER:`/`APP:`/`VS:` 等）不会被白名单掩盖。**
 
 **依赖与限制**：PEP 723 内联声明 `pyserial>=3.5`；`afplay` 回放遵守用户音量口径（默认 `--volume 50`
 临时调到上限、结束恢复）。脚本**独占串口**（先关 `idf.py monitor`）；会按场景重启 mock，设备通过

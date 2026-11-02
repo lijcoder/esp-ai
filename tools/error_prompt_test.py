@@ -136,11 +136,27 @@ RE_WS_READY = re.compile(r"WS: 握手完成（hello_ack）")
 
 # ---------------------------------------------------------------- 健康检查
 RE_ANY_E = re.compile(r"^\s*E \(\d+\)")
-RE_PANIC = re.compile(r"panic|Guru Meditation|stack overflow|StoreProhibited|assert failed")
-RE_IGNORED_E_TAG = re.compile(
-    r"[EW] \(\d+\) (NET|WS|wifi|websocket_client|esp_netif|esp-tls|esp_wifi|wpa_supplicant|"
-    r"phy_init|net80211|esp_https_ota|HTTP_CLIENT):")
-# T3.6 异常反馈是**预期**的 E 级语义日志（不是崩溃），健康检查按白名单排除
+# 真错误：任何情况下都 FAIL（优先级高于网络/传输层白名单与预期反馈白名单）
+RE_PANIC = re.compile(
+    r"panic|Guru Meditation|stack overflow|StoreProhibited|LoadProhibited|"
+    r"assert failed|abort\(\) was called")
+# 网络/传输层既有噪声 TAG（口径同 tools/mixer_test.py 的 IGNORED_ERROR_TAGS）：
+# 场景 A 故意不启 mock、场景 B 主动 wifi reconnect、C~J 重启 mock 时，esp-transport/
+# websocket_client 族会以 E 行报连接失败/断链——那是测试环境的预期噪声，不是固件问题。
+IGNORED_E_TAGS = {
+    "NET", "WS", "wifi", "ws_client", "websocket_client", "esp_netif", "esp_netif_handlers",
+    "esp-tls", "esp_wifi", "wpa_supplicant", "phy_init", "net80211", "esp_https_ota",
+    "HTTP_CLIENT",
+    # T3.6 实测补充（esp-transport 系列；WSS 重连/断链）
+    "transport_base", "transport_ws", "transport_ssl", "transport_tcp", "esp_transport",
+}
+RE_E_TAG = re.compile(r"[EW] \(\d+\) ([A-Za-z_0-9-]+):")
+# 行内兜底：TAG 拼写变化/无 TAG 时，连接失败/断链类噪声也忽略；panic/业务行不含这些片段。
+IGNORED_E_LINE = re.compile(
+    r"Failed to open a new connection|Error connecting to host|esp_transport_connect|"
+    r"tcp_write error|Software caused connection abort|Connection reset by peer|"
+    r"WS 错误|连接断开|后重连")
+# T3.6 异常反馈是**预期**的 E 级语义日志（不是崩溃），错误场景下按白名单排除
 RE_EXPECTED_E = re.compile(
     r"VS: 会话进入 ERROR（|"
     r"VC: 云端 error sid=|"
@@ -366,20 +382,29 @@ def vs_fb_delta(after: dict, before: dict, key: str) -> int | None:
 def unexpected_errors(lines: list[str], allow_feedback: bool = True) -> list[str]:
     """健康检查：E 级/panic 行中，排除网络/WS 噪声与 T3.6 预期的异常反馈日志。
 
-    `allow_feedback=True` 用于错误场景（云端 error/断网/超时/TTS 失败会有预期 E 级日志）；
-    正常轮/打断场景传 False，任何 E 级（含错误反馈）都算失败。
+    白名单两层（口径同 tools/mixer_test.py）：
+      1. 网络/传输层噪声（transport_base/transport_ws/websocket_client/esp-tls/ws_client/
+         wifi/… TAG 或 Failed to open a new connection/tcp_write error 等行内片段）——
+         场景 A/B/C~J 启停 mock、wifi reconnect 都会刷，不算固件问题；
+      2. `allow_feedback=True` 时额外的 T3.6 预期异常反馈日志（错误场景有云端 error/断网/
+         超时/TTS 失败的预期 E 级日志）；正常轮/打断场景传 False，任何 E 级都算失败。
+    panic/assert/Guru/stack overflow/StoreProhibited/LoadProhibited 优先级最高：即使带噪声
+    TAG 也 FAIL；业务侧（VS/VC/PLAYER/APP/DEV 等）ERROR 不被白名单掩盖。
     """
     out = []
     for line in lines:
         if RE_PANIC.search(line):
-            out.append(line)
+            out.append(line)  # panic/assert/Guru/… 优先级最高，任何白名单都不能掩盖
             continue
         if not RE_ANY_E.search(line):
             continue
         if allow_feedback and RE_EXPECTED_E.search(line):
-            continue
-        if RE_IGNORED_E_TAG.search(line):
-            continue
+            continue  # T3.6 错误场景下的预期异常反馈日志
+        m = RE_E_TAG.search(line)
+        if m and m.group(1) in IGNORED_E_TAGS:
+            continue  # 网络/传输层既有噪声（mock 未起/断链/重启）
+        if IGNORED_E_LINE.search(line):
+            continue  # TAG 拼写变化/无 TAG 时的连接类噪声兜底
         out.append(line)
     return out
 
@@ -1522,6 +1547,40 @@ def run_self_test() -> bool:
             "S37 离线唤醒负例：`prompt done` 不计入错误反馈")
     r.check(RE_VS_SPEAKING_DONE.search("I (1) VS: speaking done（ok=0）") is not None,
             "S38 解析 VS: speaking done（ok=0）")
+
+    # ---- 健康检查白名单（网络/传输层噪声 vs 真错误） ----
+    transport_noise = [
+        "E (100) transport_base: Failed to open a new connection: 32772",
+        "E (101) transport_ws: Error connecting to host 192.168.1.11:8765",
+        "E (102) transport_base: tcp_write error, errno=Software caused connection abort",
+        "E (103) websocket_client: websocket client stopped",
+        "E (104) esp-tls: Failed to open a new connection",
+        "E (105) ws_client: 连接断开，后重连",
+    ]
+    r.check(not unexpected_errors(transport_noise, allow_feedback=True)
+            and not unexpected_errors(transport_noise, allow_feedback=False),
+            "S39 网络/传输层噪声（transport_*/websocket_client/esp-tls/ws_client）不计 FAIL"
+            "（错误场景与正常轮都忽略）")
+    r.check(not unexpected_errors(
+        ["E (110) wifi: state: run -> init (0)"], allow_feedback=False),
+        "S40 Wi-Fi 断链/重连噪声（wifi TAG）不计 FAIL")
+    r.check(not unexpected_errors(
+        ["E (120) esp_netif_handlers: esp_netif_action_stop: netif is not up"], allow_feedback=True),
+        "S41 esp_netif_handlers 噪声不计 FAIL")
+    r.check(bool(unexpected_errors(
+        ["E (200) PLAYER: stream open failed: ESP_ERR_NO_MEM"], allow_feedback=True)),
+        "S42 业务侧 ERROR（PLAYER）不被噪声白名单掩盖，仍 FAIL")
+    r.check(bool(unexpected_errors(
+        ["E (201) APP: vc_init failed"], allow_feedback=True)),
+        "S43 业务侧 ERROR（APP）仍 FAIL")
+    r.check(bool(unexpected_errors(
+        ["E (300) transport_base: Guru Meditation Error: Core 0 panic'ed"], allow_feedback=True)),
+        "S44 panic 即使带噪声 TAG 也 FAIL（白名单不能掩盖崩溃）")
+    r.check(bool(unexpected_errors(
+        ["Guru Meditation Error: Core 0 panic'ed (LoadProhibited)"], allow_feedback=True))
+            and bool(unexpected_errors(
+                ["E (301) PLAYER: assert failed: buf != NULL"], allow_feedback=True)),
+        "S45 LoadProhibited / assert failed 仍 FAIL")
 
     ok = result.summary()
     print("\nERROR_PROMPT_TEST: SELF-TEST " + ("PASS" if ok else "FAIL")

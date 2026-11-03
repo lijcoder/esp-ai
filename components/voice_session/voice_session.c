@@ -128,6 +128,12 @@ static void vs_followup_arm(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "续听窗口计时启动失败: %s", esp_err_to_name(err));
     }
+    /* 窗口一开就开始预录：续听轮要等人声确认（250ms + VAD 判定延迟）才起轮，
+     * 若到起轮才开上行，用户这句话的开头会被整段丢掉（T3.7 缺陷，2026-11-03 修）。 */
+    err = vc_preroll_start();
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "续听预录未启动（%s），续听轮可能丢起始语音", esp_err_to_name(err));
+    }
 }
 
 static void vs_followup_stop(void)
@@ -139,6 +145,7 @@ static void vs_followup_stop(void)
     s_followup_deadline_us = 0;
     s_followup_confirming = false;
     portEXIT_CRITICAL(&s_mux);
+    vc_preroll_stop();
 }
 
 static void vs_followup_timer_cb(void *arg)
@@ -318,6 +325,9 @@ static bool vs_begin_session(vs_state_t expect, vs_reason_t reason, uint16_t *si
     s_stats.state = (uint8_t)VS_STATE_LISTENING;
     portEXIT_CRITICAL(&s_mux);
 
+    /* 重新唤醒/按键起轮：上一续听窗口若还在预录，丢掉它（本轮要从提示音之后重新收音） */
+    vc_preroll_stop();
+
     vs_notify(expect, VS_STATE_LISTENING, reason, sid, 0);
     if (sid_out != NULL) {
         *sid_out = sid;
@@ -377,6 +387,7 @@ static void vs_start_followup_round(void)
     ESP_LOGI(TAG, "续听窗口内检测到人声 → 起续听轮（sid=%u，不播提示音）", (unsigned)sid);
     esp_err_t err = vc_start(sid);
     if (err != ESP_OK) {
+        vc_preroll_stop(); /* 起轮失败：预录没人接管，立刻停掉释放上行接口 */
         ESP_LOGW(TAG, "续听起轮失败（sid=%u）: %s（网络未就绪 → 网络未连接反馈）",
                  (unsigned)sid, esp_err_to_name(err));
         vs_enter_error(FB_KIND_NET_OFFLINE, 0);

@@ -82,6 +82,10 @@ static uint32_t s_round_audio_frames; /* 本轮成功交给播放器的 0x02 帧
 static uint16_t s_next_sid;
 static portMUX_TYPE s_sid_mux = portMUX_INITIALIZER_UNLOCKED;
 
+/* T3.7 续听预录：voice_session（evt/esp_timer 任务）起停，vc 任务消费；用临界区保护 */
+static bool s_preroll;
+static portMUX_TYPE s_preroll_mux = portMUX_INITIALIZER_UNLOCKED;
+
 /* 统计：vc 任务与 ws_client 任务都会写，用临界区合并；读侧整块拷贝 */
 static vc_stats_t s_stats;
 static portMUX_TYPE s_stat_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -917,6 +921,81 @@ static bool vc_end_uplink(vc_finish_t why)
     return sent_end;
 }
 
+/* 取走预录标记（vc 任务侧用）：true 表示本轮可以接管已写入的环形缓冲 */
+static bool vc_preroll_take(void)
+{
+    bool was;
+    portENTER_CRITICAL(&s_preroll_mux);
+    was = s_preroll;
+    s_preroll = false;
+    portEXIT_CRITICAL(&s_preroll_mux);
+    return was;
+}
+
+esp_err_t vc_preroll_start(void)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!ws_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (audio_fe_uplink_active()) {
+        return ESP_ERR_INVALID_STATE; /* diag 探针占用 / 上一轮还没停 */
+    }
+    esp_err_t err = audio_fe_uplink_start();
+    if (err != ESP_OK) {
+        return err;
+    }
+    portENTER_CRITICAL(&s_preroll_mux);
+    s_preroll = true;
+    portEXIT_CRITICAL(&s_preroll_mux);
+    ESP_LOGI(TAG, "续听预录开始（起轮时保留最近 %d ms 前导）", CONFIG_VC_UPLINK_PREROLL_MS);
+    return ESP_OK;
+}
+
+void vc_preroll_stop(void)
+{
+    if (!vc_preroll_take()) {
+        return;
+    }
+    audio_fe_uplink_stop();
+    ESP_LOGD(TAG, "续听预录放弃（窗口结束/重新唤醒/起轮失败）");
+}
+
+/* 预录裁前导：只保留最近 CONFIG_VC_UPLINK_PREROLL_MS 的音频，丢掉更早的静音 */
+static void vc_uplink_preroll_trim(void)
+{
+#if CONFIG_VC_UPLINK_PREROLL_MS > 0
+    const uint32_t keep = (uint32_t)CONFIG_VC_UPLINK_PREROLL_MS * 16u; /* 16k 单声道：16 样本/ms */
+    audio_fe_uplink_stats_t st;
+    if (audio_fe_uplink_stats_read(&st) != ESP_OK) {
+        return;
+    }
+    uint32_t avail = st.samples_written - st.samples_read;
+    if (avail <= keep) {
+        ESP_LOGI(TAG, "续听预录 %u ms（未超裁剪上限，全部上传）", (unsigned)(avail / 16u));
+        return;
+    }
+    int16_t tmp[CODEC_ENC_FRAME_SAMPLES];
+    uint32_t dropped = 0;
+    while (avail > keep) {
+        uint32_t want = avail - keep;
+        if (want > CODEC_ENC_FRAME_SAMPLES) {
+            want = CODEC_ENC_FRAME_SAMPLES;
+        }
+        int got = audio_fe_uplink_read(tmp, want, 0);
+        if (got <= 0) {
+            break;
+        }
+        avail -= (uint32_t)got;
+        dropped += (uint32_t)got;
+    }
+    ESP_LOGI(TAG, "续听预录：保留 %u ms 前导（丢弃更早的 %u ms 静音）", (unsigned)(avail / 16u),
+             (unsigned)(dropped / 16u));
+#endif
+}
+
 static void vc_begin_round(uint16_t sid)
 {
     char json[VC_JSON_MAX];
@@ -938,27 +1017,41 @@ static void vc_begin_round(uint16_t sid)
     /* 新轮次覆盖旧轮次：上一路 TTS 若还在收尾/播放，立刻打断（R2 由完成回调恢复） */
     vc_audio_abort("new round");
 
+    /* T3.7：续听轮可能带着"预录"的麦克风音频进来，此时不要清空缓冲 */
+    const bool preroll = vc_preroll_take();
+
     if (!ws_is_ready()) {
+        if (preroll) {
+            audio_fe_uplink_stop();
+        }
         ESP_LOGW(TAG, "云端未就绪，跳过本轮（sid=%u）", (unsigned)sid);
         return;
     }
-    if (audio_fe_uplink_active()) {
+    if (!preroll && audio_fe_uplink_active()) {
         ESP_LOGW(TAG, "上行接口已被其它使用方占用（diag `afe uplink on`？），本轮跳过");
         return;
     }
 
     err = enc_open();
     if (err != ESP_OK) {
+        if (preroll) {
+            audio_fe_uplink_stop();
+        }
         ESP_LOGE(TAG, "打开编码器失败: %s", esp_err_to_name(err));
         return;
     }
     (void)enc_reset();
 
-    err = audio_fe_uplink_start();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "启动上行失败: %s", esp_err_to_name(err));
-        enc_close();
-        return;
+    if (preroll) {
+        /* 保留人声起始：预录缓冲里是「说话前静音 + 起轮前那几帧人声」 */
+        vc_uplink_preroll_trim();
+    } else {
+        err = audio_fe_uplink_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "启动上行失败: %s", esp_err_to_name(err));
+            enc_close();
+            return;
+        }
     }
 
     snprintf(json, sizeof(json), "{\"t\":\"audio_start\",\"sid\":%u}", (unsigned)sid);

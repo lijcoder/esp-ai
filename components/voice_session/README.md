@@ -41,7 +41,7 @@ T3.6 起四类异常（网络未连接 / 云端 error / THINKING 超时 / TTS �
 | `LISTENING → THINKING` | `VC_EVT_UPLINK_END`（`vc` 任务）：`audio_end` 已发出 | 收尾原因（vad/max/stop）在 `code` 字段 |
 | `THINKING → SPEAKING` | `VC_EVT_TTS_START`（`ws_client` 任务） | TTS 侧 R1 由 `voice_cloud` 打开流时执行 |
 | `SPEAKING → FOLLOW_UP` | 播放完成回调（`player` 任务，`STREAM_DONE(ok=true)`）或 `VC_EVT_ROUND_END(DONE)`（无可播音频） | **T3.7**：等 TTS 排空 + R2 恢复收音后开续听窗口；`ok=false`（打断/失败）仍直接回 `IDLE` |
-| `FOLLOW_UP → LISTENING` | `APP_EVT_VAD_SPEECH_START`（`evt` 任务）+ 250ms 人声确认 | 直接 `vc_start(新 sid)`，不播提示音、不再唤醒；确认期内 VAD 结束则取消并恢复剩余窗口 |
+| `FOLLOW_UP → LISTENING` | `APP_EVT_VAD_SPEECH_START`（`evt` 任务）+ 250ms 人声确认 | 直接 `vc_start(新 sid)`，不播提示音、不再唤醒；确认期内 VAD 结束则取消并恢复剩余窗口。**2026-11-03 修**：进窗口即 `vc_preroll_start()` 预录，起轮由 `vc` 接管缓冲（保留最近 `VC_UPLINK_PREROLL_MS`），否则这句话开头会丢 |
 | `FOLLOW_UP → LISTENING`（重开） | `APP_EVT_WAKE_DETECTED` | 播应答提示音、续听计数清零（原因 `followup-wake`） |
 | `FOLLOW_UP → IDLE` | 窗口静音超时（`esp_timer`）、续听轮数上限、按键/断网/`vs followup off` | 原因 `followup-timeout` / `followup-max` / `interrupt` / `net-down` / `followup-off` |
 | `THINKING/SPEAKING/LISTENING → ERROR` | T3.6：`VC_EVT_ROUND_END(TIMEOUT)` / `VC_EVT_CLOUD_ERROR`（按 code 分流）/ `VC_EVT_TTS_FAIL` / `NET_DOWN`（会话中）/ `VC_ROUND_ABORT_LINK` / 唤醒或起轮时 ws 未 READY | `voice_cloud` 报告事实，本组件决定进 `ERROR`；`feedback` 播对应提示音，完成回调驱动 `ERROR → IDLE` |

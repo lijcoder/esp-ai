@@ -49,6 +49,16 @@ menu "Voice Cloud (上行语音链路)"
             audio_fe_uplink_read() 的等待上限。AFE 每帧 32ms 输出，50ms 足够且能让
             vc_stop()/断链在 ~50ms 内被响应；不要设 0（会退化成忙轮询）。
 
+    config VC_UPLINK_PREROLL_MS
+        int "续听预录保留时长（毫秒，0=不裁剪）"
+        range 0 2048
+        default 1000
+        help
+            T3.7：进入 FOLLOW_UP 续听窗口就绪即开始写上行环形缓冲（容量 2048ms），
+            起轮时保留最近该时长的音频再上传。用来覆盖「VAD 判定延迟 + 250ms 人声
+            确认窗口」这段起轮前的语音——否则续听轮只能听到用户说话的后半句
+            （T3.7 实测缺陷，2026-11-03 修复）。设 0 表示不裁剪（最多整环 2048ms）。
+
     config VC_RESPONSE_TIMEOUT_MS
         int "audio_end 后等云端响应的超时（毫秒）"
         range 1000 60000

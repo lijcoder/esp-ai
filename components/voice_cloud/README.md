@@ -27,6 +27,7 @@
 | `vc_cancel()` | 立即放弃：不补尾帧、不发 `audio_end` |
 | `vc_interrupt()` | **T3.2 R4**：先发 `{"t":"interrupt","sid":N}` 报文，再 `vc_cancel()`；无进行中的轮次时只打日志不发报文。报文发送失败只 WARN（本地照样打断），不等待服务端应答 |
 | `vc_is_busy()` / `vc_is_ready()` / `vc_get_state()` / `vc_state_name()` / `vc_current_sid()` | 三态观测（`IDLE` / `UPLINK` / `WAIT_RESPONSE`）；**T3.6 `vc_is_ready()`**：唤醒前预判“现在能不能起一轮”（已初始化 + WS READY + 无进行中/待起轮），供 `voice_session` 决定播“我在呢”还是直接给“网络未连接”反馈 |
+| `vc_preroll_start()` / `vc_preroll_stop()` | **T3.7 续听预录（2026-11-03 修）**：进入 `FOLLOW_UP` 就启动上行环形缓冲（只写不读），起轮时 `vc` 任务接管已有音频并按 `CONFIG_VC_UPLINK_PREROLL_MS`（默认 1000ms）裁掉过靠前的静音；否则续听轮要等「VAD 判定 + 250ms 确认」才开始收音，ASR 只收到后半句。窗口退出/重新唤醒调 `vc_preroll_stop()` 丢弃并释放上行接口；**预录期间 `vc_start()` 不清空缓冲**（未预录时仍清空） |
 | `vc_register_cb(cb, arg)` | 业务回调（覆盖语义），与 `event_bus` 事件同时分发；回调在 `ws_client` 任务上下文，**禁止阻塞**，`text` 只在回调内有效。T3.1 起事件枚举增加 `VC_EVT_UPLINK_END`（`code`=收尾原因）与 `VC_EVT_ROUND_END`（`round_end`=`vc_round_end_t`），供 `voice_session` 驱动状态机；**T3.6 增加 `VC_EVT_TTS_FAIL`（`code`=`vc_tts_fail_t`：非 MP3/缺采样率/MP3 能力不可用/播放器忙/开流失败），每轮最多上报一次** |
 | `vc_stats_read()` / `vc_stats_reset()` | 轮次/上行帧/字节/首帧耗时/下行事件/`sid` 丢弃/解析失败/下行音频播放与丢弃等统计（`diag` 的 `vc status` 使用） |
 

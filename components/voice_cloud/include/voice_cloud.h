@@ -152,6 +152,24 @@ esp_err_t vc_cancel(void);
  */
 esp_err_t vc_interrupt(void);
 
+/**
+ * @brief 续听预录开始（T3.7，由 voice_session 在进入 `FOLLOW_UP` 时调用）
+ *
+ * 续听轮是「VAD 人声 + 250ms 确认」后才 `vc_start()` 的；如果到起轮才开始录，
+ * 人声起始（VAD 判定延迟 + 确认窗口）会整段丢失 → 云端 ASR 只收到后半句。
+ * 这里在窗口一开就启动上行环形缓冲（只写不读），起轮时由 `vc` 任务接管已有数据，
+ * 按 `CONFIG_VC_UPLINK_PREROLL_MS` 裁掉过靠前的静音后直接上传。
+ *
+ * @note 与 `vc_start()` 的"清空缓冲重来"语义不同：预录期间缓冲里是麦克风原始音频，
+ *       由 `vc_begin_round()` 消费；未被消费就 `vc_preroll_stop()` 则整段丢弃。
+ * @return ESP_OK 已开始预录 / ESP_ERR_INVALID_STATE 未初始化、云端未 READY，
+ *         或上行接口已被占用（如 diag `afe uplink on` 探针、上一轮未收尾）
+ */
+esp_err_t vc_preroll_start(void);
+
+/* 放弃续听预录（窗口超时/按键/断网/窗口内重新唤醒）；未启动时是 no-op */
+void vc_preroll_stop(void);
+
 /* 是否有一轮在进行（UPLINK 或 WAIT_RESPONSE） */
 bool vc_is_busy(void);
 

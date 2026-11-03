@@ -309,9 +309,15 @@ esp-ai/
 │   ├── HARDWARE.md
 │   └── PROTOCOL.md                 # 第 6 节契约的详细版（后续实现时同步补全）
 ├── tools/
-│   ├── ws_mock_server.py           # 本地云端模拟（开发联调用）
+│   ├── ws_mock_server.py           # 本地云端模拟入口（CLI；实现见 mock_* 模块）
+│   ├── mock_core.py                # 协议帧 / MP3 帧解析 / Config / Stats
+│   ├── mock_server.py              # Session（单连接）+ MockServer（WS 服务）
+│   ├── mock_downlink.py            # 下行 TTS 流 / ASR 文本 / 错误注入
+│   ├── mock_cli.py                 # 参数、校验、Config 装配、ASR/Piper 加载
+│   ├── mock_self_test.py           # 19 项进程内自测（--self-test）
+│   ├── mock_fixtures.py            # 自测/错误注入用内嵌真实 MP3
 │   ├── audio_pack.py               # 提示音格式转换与 assets 打包
-│   └── record_wav.py               # 串口采集 WAV，用于调唤醒/AEC 实测
+│   └── record_wav.py               # 串口采集 WAV，用于调唤醒/AEC 实测（T5.2 计划）
 └── test/host/                      # 帧头解析、状态机、协议编解码单测
 ```
 

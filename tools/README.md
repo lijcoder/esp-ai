@@ -19,6 +19,21 @@
 | `prompts_src/` | T3.5 提示音**唯一源**：5 条 16 kHz/16 bit/mono 源 WAV + `manifest.json`（PCM sha256/样本数），提交 git | 见「提示音资源」 |
 | `record_wav.py` | 串口采集 WAV，用于唤醒/AEC 实测（**T5.2 计划，尚未实现**） | — |
 
+### `ws_mock_server.py` 的实现结构（2026-11-03 拆分，行为不变）
+
+入口只做 CLI 分发；实现拆到同目录 6 个模块，`uv run tools/ws_mock_server.py ...` 的用法、参数、
+日志格式、`--self-test` 全部不变（拆分前后逐函数 AST 比对 78/78 一致）：
+
+| 模块 | 职责 |
+|---|---|
+| `ws_mock_server.py` | 入口：用法 docstring + `main()`（~110 行） |
+| `mock_cli.py` | 命令行参数、启动校验、`Config` 装配、ASR/Piper 后端加载 |
+| `mock_core.py` | 协议帧编解码 / MP3 帧解析 / `Config` / `Stats` / 日志 |
+| `mock_server.py` | `Session`（握手/心跳/上行/事件分派/music 骨架）+ `MockServer`（accept、TCP_NODELAY、启动横幅） |
+| `mock_downlink.py` | `DownlinkMixin`：ASR 文本、TTS 音频（合成帧 / 真实 MP3 / Piper 复读）、节奏与欠载注入、错误注入 |
+| `mock_self_test.py` | 19 项进程内自测（`--self-test`；也可 `uv run tools/mock_self_test.py` 单独跑） |
+| `mock_fixtures.py` | 自测/错误注入共用的内嵌真实 MP3（22 帧 / 528 ms） |
+
 ## 语音测试素材 —— lexin.wav + 两个交互语音
 
 **作用**：agent 不能说话，真机测唤醒/语音交互一律用 Mac 扬声器回放 `tools/` 里的 WAV、设备麦克风拾音，

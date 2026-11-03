@@ -84,6 +84,17 @@
 | 关联 | STATUS §1 阻塞项⑦（环境噪声口径）、STATUS §5 T3.5 行；`tools/e2e_voice_test.py` 环境重试逻辑 |
 
 
+### PV-007 · mock 拆分后 4 个真机脚本复跑（工具重构，板子不在手边）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-03 19:2x（采样）**，拆分完成、self-test 通过后登记 |
+| 来源 | 用户拍板"现在就拆，板子回来再测试"；`tools/ws_mock_server.py` 由 2,157 行拆为 6 个模块（入口 ~110 行） |
+| 现象/问题 | 拆分是**纯搬移**（拆分前后逐函数 AST 比对 **78/78 一致**，唯一变化是入口 `main` 重写与 `Session` 改继承 `DownlinkMixin`）；`--self-test` **19/19 PASS** 只证明 mock 自身协议行为，**4 个真机脚本是 mock 对外行为的最终证据**，当前无板未复跑 |
+| 待验证 | 回板后依次跑：`uv run tools/tts_stream_test.py`（覆盖下行 TTS 流的起播/欠载/abort/排空/DownlinkMixin 路径）、`uv run tools/error_prompt_test.py`（错误注入三段时机 + 坏 codec）、`uv run tools/voice_cloud_test.py`（上行事件/sid）、`uv run tools/e2e_voice_test.py`（端到端 ≥8/10 轮） |
+| 验收方法 | 三项指标与拆分前基线一致：tts_stream 全场景 PASS、error_prompt **290/290**、voice_cloud **43/43**（环境噪声口径按 PV-006）、e2e ≥8/10；并确认 mock 日志格式未变（`tts 下发完成 frames=`、`TTS 模式: 真实 MP3`、`C1` 前缀），脚本无需改动 |
+| 关闭条件 | 四项全绿（e2e 受环境噪声影响时按 PV-006 口径复跑），数据写回 STATUS §3 该行 |
+| 关联 | STATUS §3 2026-11-03 行；`tools/README.md`「实现结构」；PV-006（环境噪声） |
+
 ---
 
 ## 3. 待决定 / 已被暂缓（PD）
@@ -163,3 +174,4 @@
 | 2026-11-02 23:0x（采样） | 用户确认 T3.6 验收（含 4 条提示音听感）→ **PV-005 关闭归档**；下一任务 T3.5 |
 | 2026-11-02 23:0x→23:5x | T3.5 完成：用户拍板方案 D（自定义只读 pack + mmap）；`tools/prompts_src`+`audio_pack.py`+`prompt_store`；真机 error_prompt 290/290、只烧 assets 替换验证、坏包降级；**PV-003 关闭**；P3 收口 |
 | 2026-11-03 00:0x（采样） | T3.5 验收回归遇环境噪声：e2e 1/10、vc 50/51（均环境性）；voice/afe 复跑通过、手工唤醒 2/2 → 登记 **PV-006**（安静环境复跑） |
+| 2026-11-03 19:1x→19:3x（采样） | 用户要求拆 `tools/ws_mock_server.py`（"现在就拆，板子回来再测试"）→ 拆为 6 模块（行为不变，AST 78/78 一致、`--self-test` 19/19），登记 **PV-007**（4 个真机脚本复跑） |

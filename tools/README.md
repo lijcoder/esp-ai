@@ -15,6 +15,12 @@
 | `e2e_voice_test.py` | **端到端语音**真机自测（T2.6）：唤醒 → 上行 Opus → 真实 MP3 下行流式播放 → R2，10 轮稳定性 + P2 验收断言 | `uv run tools/e2e_voice_test.py`，见下文 |
 | `error_prompt_test.py` | **T3.6 错误提示**真机自测：mock 注入云端错误码/时机/坏 codec → 离线唤醒/中途断网/ERROR 反馈/超时/TTS 失败/打断/稳定性，断言 `VS:`/`FB:` 日志与 `fb status`/`vs status`/`mic stat` | `uv run tools/error_prompt_test.py`，见下文 |
 | `audio_pack.py` | **T3.5 提示音资源打包**：`tools/prompts_src/*.wav` → `assets` 分区自定义只读 pack（构建 / `--check` / `--dump` / `--flash`），**只烧分区即可替换提示音、app 不动** | `uv run tools/audio_pack.py`，见下文 |
+| `mock_offline_test.py` | **不接开发板验证 mock**（2026-11-04）：假设备发 Opus 上行 → 收集 ASR/LLM/TTS 事件与 0x02 帧 → 存 MP3/可播放 + 断言 | `uv run tools/mock_offline_test.py --expect-llm`，见下文 |
+| `llm_client.py` | LLM 流式客户端（OpenAI 兼容 `/chat/completions`，纯标准库；mock `--llm` 与 `llm_test.py` 共用） | — |
+| `llm_test.py` | **离线 LLM 模块测试**（2026-11-04）：文字 → 大模型（流式）→ 文字，不需要开发板 | `LLM_API_KEY=sk-... uv run tools/llm_test.py --text "今天天气怎么样"`，见下文 |
+| `tts_test.py` | **离线 TTS 模块测试**（2026-11-04）：文字 → Qwen3-TTS（MLX）→ 本机扬声器流式播放/存盘，不需要开发板 | `uv run tools/tts_test.py --text "你好"`，见下文 |
+| `asr_test.py` | **离线 ASR 模块测试**（2026-11-04）：麦克风/音频文件 → SenseVoice → 文字，不需要开发板 | `uv run tools/asr_test.py --seconds 5`，见下文 |
+| `mock_tts.py` | mock 的本地 TTS 后端（Qwen3-TTS / MLX）：文字 → 24kHz MP3（可流式） | `uv run tools/mock_tts.py --text "你好" --out /tmp/x.mp3`，见下文 |
 | `prompt_gen.py` | **T3.5 提示音源生成**：可复现生成 4 条错误提示音源 WAV（`say`/`afconvert`，仅 macOS）；`--check` 复用 audio_pack 口径；**不再写 C 数组** | `uv run tools/prompt_gen.py`，见下文 |
 | `prompts_src/` | T3.5 提示音**唯一源**：5 条 16 kHz/16 bit/mono 源 WAV + `manifest.json`（PCM sha256/样本数），提交 git | 见「提示音资源」 |
 | `record_wav.py` | 串口采集 WAV，用于唤醒/AEC 实测（**T5.2 计划，尚未实现**） | — |
@@ -27,10 +33,10 @@
 | 模块 | 职责 |
 |---|---|
 | `ws_mock_server.py` | 入口：用法 docstring + `main()`（~110 行） |
-| `mock_cli.py` | 命令行参数、启动校验、`Config` 装配、ASR/Piper 后端加载 |
+| `mock_cli.py` | 命令行参数、启动校验、`Config` 装配、ASR/Qwen3-TTS 后端加载（含模型预热） |
 | `mock_core.py` | 协议帧编解码 / MP3 帧解析 / `Config` / `Stats` / 日志 |
 | `mock_server.py` | `Session`（握手/心跳/上行/事件分派/music 骨架）+ `MockServer`（accept、TCP_NODELAY、启动横幅） |
-| `mock_downlink.py` | `DownlinkMixin`：ASR 文本、TTS 音频（合成帧 / 真实 MP3 / Piper 复读）、节奏与欠载注入、错误注入 |
+| `mock_downlink.py` | `DownlinkMixin`：ASR 文本、TTS 音频（合成帧 / 真实 MP3 / Qwen3-TTS 流式复读）、节奏与欠载注入、错误注入 |
 | `mock_self_test.py` | 19 项进程内自测（`--self-test`；也可 `uv run tools/mock_self_test.py` 单独跑） |
 | `mock_fixtures.py` | 自测/错误注入共用的内嵌真实 MP3（22 帧 / 528 ms） |
 
@@ -1133,45 +1139,224 @@ C1  [ASR] 识别结果: '今天天气如何？'（81 帧 / 音频 1.62s / 推理
 识别失败/设备无声时只 WARN 并回退 `--tts-text`，不打断协议链路；单轮默认最多送 30s 音频
 （`--asr-max-seconds`）；SenseVoice 支持 auto/中/英/粤/日/韩（`--asr-language`）。
 
-## mock_tts.py —— 本地 TTS 生成 mock 回复音频（Piper，T3.1 测试用）
+## tts_test.py —— 离线 TTS 模块测试：**直接调用 `mock_tts`**（Qwen3-TTS，不需要开发板）
 
-**作用**：把文字在 PC 侧合成为 **24kHz 单声道 MP3**，交给 `ws_mock_server.py --tts-mp3` 下发，让设备在联调里播放「与文本对应」的真实语音（TTS 链路/音质/时延验收不再只有合成帧或固定 MP3）。
+**设计原则（2026-11-04 修正）**：测试脚本是**薄壳**——只做"驱动 + 播放 + 断言"，
+模型解析/加载、prompt、流式生成、MP3 增量编码**全部来自 `tools/mock_tts.py`**，
+和 `ws_mock_server.py --tts-qwen` 下发时是同一份代码。之前版本复制过一份 `Qwen3Tts`
+（用户指出："测通 tts_test 不代表 mock_tts 通"），已删除重复实现。
 
-选型 **Piper（rhasspy/piper-voices，VITS，MIT）**：单音色 20~60MB、CPU 实时、许可干净；本工具预置 `zh_CN-huayan-medium`。Kokoro-82M / MeloTTS 试听体积/依赖更大，本项目暂不接入（2026-11-01 决定，先用 Piper，以后再加）。
+两种口径覆盖不同层：
 
-依赖用 PEP 723 内联声明（`piper-tts`/`lameenc`/`numpy`），`uv run` 即用；模型缓存在 `~/.cache/esp-ai-mock-tts/piper/`（家目录不可写时自动退到 `~/.cache/uv/...` 或临时目录；可用 `--model-dir`/`MOCK_TTS_CACHE` 覆盖）。
+| 口径 | 调用 | 覆盖 |
+|---|---|---|
+| `--via-pcm`（默认） | `mock_tts.get_engine(...).stream(text)` → float32 PCM | 模型解析/加载、prompt、流式分块；**默认整段合成后播**（`--stream-play` 才是边生成边播） |
+| `--via-mp3` | `mock_tts.stream_frames(text)` → MP3 帧 → PyAV 解码 | **与 mock 同一个函数**：lameenc 增量编码、MPEG 帧边界、24k/64kbps、帧时长 |
+| `--check` | 同上，不发声音 | 断言：帧非空/帧长一致/解码时长与帧统计差 ≤50ms/非静音；退出码 0-1（CI 可用） |
 
 ```bash
-uv run tools/mock_tts.py --download                                   # 首次准备模型（约 60MB，失败自动换 hf-mirror）
-uv run tools/mock_tts.py --text "今天天气不错，适合出门散步。" --out /tmp/reply.mp3
-printf '好的，我在呢。' | uv run tools/mock_tts.py --speed 1.1 --out /tmp/reply.mp3
+uv run tools/tts_test.py --text "今天天气不错，适合出门散步。"            # 合成完整段播放
+uv run tools/tts_test.py --text "..." --stream-play                    # 边生成边播（生成慢于实时会卡）
+uv run tools/tts_test.py --text "..." --via-mp3                         # 走 mock 的 MP3 帧路径并播放
+uv run tools/tts_test.py --text "..." --check                           # 只断言，不出声
+uv run tools/tts_test.py --text "..." --voice vivian --instruct '用温柔的语气说' \
+    --out /tmp/reply.wav --mp3 /tmp/reply.mp3
+uv run tools/tts_test.py --play-wav /tmp/reply.wav                      # 只播已有 WAV
+```
 
-# 交给 mock 让设备播
+**参数**：`--text`/`--text-file`/stdin、`--voice`（默认 `serena`）、`--lang`、`--instruct`、
+`--stream-interval`、`--via-mp3`/`--check`、`--stream-play`、`--no-play`、`--out`（WAV）、`--mp3`、`--model`。
+（`--mp3` 在两种口径都可用：PCM 口径用 `mock_tts.encode_pcm_to_mp3()`，与 mock 下发同一个编码器。）
+
+**关于 `--stream-play`（2026-11-04 修正）**：正确做法是**生成在独立线程、经队列交给播放线程**
+（生成 ~3x 实时，播放按实时消费）；若把 `stream.write()` 和生成放在同一线程里串行，
+写一块会阻塞到放完、再生成下一块，块间必然空档（实测稳态会掉到 0.76x，听感"一卡一卡"）。
+脚本已按前者实现；默认仍是"整段合成后播"（更稳），`--stream-play` 用来听流式行为。
+首块仍要等 prefill（1.7~2.9s，冷启动；预热后 ~0.2s）。
+
+**实测（2026-11-04，M 系列 Mac）**：`--check` 单句 → **PASS**（102 帧 / 19,584B / 2.45s，
+解码时长与帧统计一致）；`--via-pcm` 5.6s 音频 / 峰值 -12.0 dBFS / 首块 2.8~3.0s；模型加载
+1.6s（页缓存命中）~15.7s（冷启动）。
+
+**不覆盖的**：WS 传输、`tts_start/tts_end` 时序、设备侧解码播放 —— 那是 mock 端到端
+（假客户端）与真机测试的范围。
+
+**依赖**：`mlx-audio`/`numpy`/`sounddevice`/`soundfile`/`lameenc`/`huggingface_hub`/`av`（PEP 723）。
+
+## llm_client.py + llm_test.py —— LLM 模块测试（OpenAI 兼容流式，不需要开发板）
+
+**作用**：文字 → 大模型 → 文字，验证接口连通性、首包时延、回答风格；`llm_client.py` 是**纯标准库**
+的 SSE 客户端，mock 的 `--llm` 与 `llm_test.py` 共用同一份实现（不复制 HTTP 代码）。
+
+配置全走环境变量（**token 不要提交进仓库**）：
+
+```bash
+# 地址 / 模型 / token 全部走环境变量，代码与仓库里不出现任何真实值
+export LLM_BASE_URL=https://<你的网关>/v1    # 必填
+export LLM_MODEL=<模型名>                    # 必填
+export LLM_API_KEY=sk-...                    # 必填
+export LLM_SYSTEM_PROMPT="..."               # 可选：覆盖默认语音助手口径
+export LLM_MAX_TOKENS=256 LLM_TEMPERATURE=0.6 LLM_TIMEOUT_S=20 LLM_RETRIES=2
+```
+
+```bash
+uv run tools/llm_test.py --text "今天天气怎么样？"
+uv run tools/llm_test.py --text "用一句话介绍你自己" --model <另一个模型名>
+uv run tools/llm_test.py --text "..." --no-stream --max-tokens 120
+printf '明天适合跑步吗？' | uv run tools/llm_test.py
+```
+
+**输出**：流式打印回答 + `首包 x.xxs / 总 x.xxs / N 字`；失败退出码 1。
+
+**实测（2026-11-04，所选模型）**：首包 **1.0~1.4s**、58 字回答总 1.3s；另有模型会先吐 1k+ 字思考内容、
+首包 ~6s（声音场景不建议）。部分网关模型会在 `delta.reasoning_content` 里先吐思考过程，
+**客户端只取 `delta.content`**。
+网关偶发 5xx（实测遇到一次 502）：还没吐过内容时自动重试（`LLM_RETRIES`，默认 2）。
+
+**mock 接入**（`--llm`）：
+
+```bash
+export LLM_API_KEY=sk-...
+uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+  tools/ws_mock_server.py --asr sensevoice --tts-qwen --llm
+```
+
+一轮变成：`audio_end → asr_final（识别文本）→ llm_delta ×N（真增量）→ tts_start → 0x02 帧 → tts_end`。
+失败（网络/超时/5xx）自动回退"复读 ASR 文本"，不打断协议链路，`stats` 里记 `LLM n 轮/m 失败`。
+
+## mock_offline_test.py —— 不接开发板，验证 mock 的 ASR→LLM→TTS 整轮
+
+**作用**：扮演"假设备"连上正在跑的 mock：`hello → audio_start → 上行 Opus 帧（从 WAV 编码）→ audio_end`，
+收集 `asr_final / llm_delta / tts_start / 0x02 音频帧 / tts_end`，把收到的音频存成 MP3（可选本机播放），
+并断言链路完整。用来确认 `--asr` / `--tts-qwen` / `--llm` 三个开关真的接上了，**不需要 ESP32**。
+
+```bash
+# 终端 A：起 mock（LLM 三项配置走环境变量）
+export LLM_BASE_URL=... LLM_MODEL=... LLM_API_KEY=...
+uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+  tools/ws_mock_server.py --asr sensevoice --tts-qwen --llm
+
+# 终端 B：假设备跑一轮——两种"用户说话"来源
+uv run tools/mock_offline_test.py --text "今天天气怎么样？" --expect-llm --play   # 本地合成 + 实时播放
+uv run tools/mock_offline_test.py --text "帮我讲个笑话" --voice vivian
+uv run tools/mock_offline_test.py --expect-llm                                  # 默认 WAV
+uv run tools/mock_offline_test.py --wav tools/今天吃了什么.wav --play
+```
+
+`--text` 的意思是：**把你写的文字先用本地 Qwen3-TTS 合成成"用户说的话"，再走 Opus 上行**——
+所以整条链路是 `你的文字 →（本地 TTS）→ 设备上行音频 → mock ASR → LLM → Qwen3-TTS → 回答音频`，
+想测什么话就写什么话，不需要录音、不需要开发板。
+
+**阶段时间线**：脚本会打印 `上行结束 → asr_final → LLM 首包 → LLM 完成 → tts_start → 首个音频帧/开始播放`，
+用来确认顺序正确：**ASR 出文本、LLM 出完整回答之后，才 tts_start，然后边收 TTS 帧边播**（`tts_start` 早于 LLM 完成会告警）。
+
+**判定**（退出码 0/1）：收到非空 `asr_final`、`tts_start`、≥1 个 0x02 帧、`tts_end`；
+`--expect-llm` 额外断言"回答 ≠ ASR 文本"（证明是 LLM 回答而不是复读）。
+
+**实测（2026-11-04，mock 带 `--llm`）**：
+- `--wav tools/今天天气如何.wav` → `asr_final='今天天气如何？'` → LLM 回答 53 字 →
+  `tts_start→首帧 353ms`、349 帧 / 8.38s 音频、总 17.15s；
+- `--text "今天天气怎么样？"`（本地合成 1.60s 语音）→ `asr_final='今天天气怎么样？'` →
+  LLM 回答 45 字 → 首帧 **427ms**、399 帧 / **9.58s 音频**、总 12.21s；均 **PASS**。
+- `--text "你好，给我讲一个很短的笑话" --play`（**实时播放**）→ ASR 一致 → 回答 9.65s 音频、
+  首帧 405ms、总 12.28s（边收边播，播放与接收重叠，不再等整段收完）。
+
+## asr_test.py —— 离线 ASR 模块测试（SenseVoice，不需要开发板）
+
+**作用**：说话 → 文字。默认用 Mac 麦克风录 N 秒 → SenseVoiceSmall 识别；也可以直接识别音频文件。
+与 mock 的 `--asr` 是**同一份实现**（`tools/mock_asr.py` 的 `MockAsr`），所以模块测试与联调口径一致。
+
+```bash
+uv run tools/asr_test.py                          # 录 5s → 识别
+uv run tools/asr_test.py --seconds 8 --device 2   # 指定时长/输入设备（--list-devices 看设备号）
+uv run tools/asr_test.py --file tools/今天天气如何.wav   # 不录音，直接识别文件
+uv run tools/asr_test.py --out /tmp/rec.wav       # 顺便把录音存成 16k WAV（可复现）
+```
+
+**两种口径**（同样复用 mock 的实现，不复制识别逻辑）：
+
+| 口径 | 调用 | 覆盖 |
+|---|---|---|
+| 默认 | `MockAsr.transcribe_pcm(16k PCM)` | 识别器本身（模型加载、解码、后处理） |
+| `--via-opus` | 先把 PCM 编成 **20ms 裸 Opus 包**，再 `MockAsr.transcribe_opus()` | **与 mock 的 `_asr_text()` 同一个入口**：Opus 解码 + 重采样 + 识别 |
+| `--check` | 断言识别文本非空 | 退出码 0/1，CI 可用 |
+
+**输出**：录音电平（峰值/RMS dBFS；峰值 < -50 dBFS 会提示"可能没给麦克风权限"）+ 识别文本 + 耗时。
+模型自动找 `~/.cache/esp-ai-mock-asr/sensevoice` 或本机 DSH 缓存；缺失时加 `--download`（约 239MB）。
+
+**macOS 注意**：首次运行要给终端/宿主 App **麦克风权限**，否则录到全零。
+
+## mock_tts.py —— mock 的本地 TTS 后端（Qwen3-TTS / MLX）：文字 → 24kHz MP3（可流式）
+
+**作用**：把文字合成为 **24kHz 单声道 MP3**，供 `ws_mock_server.py` 两条路径使用：
+`--tts-mp3`（固定音频下发）与 `--tts-qwen`（ASR 文本 → 复读）。
+**2026-11-04 起 Piper/say 已移除**：Piper 停顿处有 **-44 dBFS** 合成噪声、峰值 **0 dBFS**
+（端侧音量 100 会撞软限幅膝点 -1.92 dBFS → "嚓嚓"/破音），Qwen3-TTS 实测峰值 **-5~-12 dBFS**（句子/语气有波动，均低于端侧软限幅膝点 -1.92 dBFS）、
+停顿干净；且 12Hz tokenizer 支持流式。
+
+模型 `mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16`（2.3GB，MLX / Apple Silicon）；
+预置音色 **serena / vivian / uncle_fu / ryan / aiden / ono_anna / sohee / eric（四川）/ dylan（北京）**，
+支持自然语言风格指令（`--instruct "用温柔的语气说"`）。依赖 PEP 723：`mlx-audio`/`lameenc`/`numpy`/`huggingface_hub`。
+模型先查**本地 HF 缓存**（离线可用），未命中才交给 mlx_audio 下载（国内 `HF_ENDPOINT=https://hf-mirror.com`）。
+
+```bash
+uv run tools/mock_tts.py --text "今天天气不错，适合出门散步。" --out /tmp/reply.mp3
+uv run tools/mock_tts.py --text "..." --voice vivian --instruct "用温柔的语气说" --out /tmp/reply.mp3
+
+# 交给 mock（固定音频下发）
 uv run tools/ws_mock_server.py --tts-mp3 /tmp/reply.mp3 --tts-pace-pct 80
 ```
 
-**参数**：`--text`/`--text-file`/stdin、`--out`（默认 `/tmp/mock_tts.mp3`）、`--voice`（默认 `zh_CN-huayan-medium`）、`--speed`（Piper length_scale，>1 更慢，<1 更快）、`--model/--config`（任意 Piper 音色）、`--download`。
+**参数**：`--text`/`--text-file`/stdin、`--out`、`--model`、`--voice`、`--lang`、`--instruct`、`--bitrate`。
 
-**实测（2026-11-01，Mac + 真机）**：`今天天气不错，适合出门散步。` → 2.87s / 24kHz 单声道 / 23,424B / 生成 1.89s；mock `--tts-mp3` 下发 **122 帧**，设备 `tts_start sr=24000` → 播完 → `round done` 正常（Mac 外放与设备扬声器均试听）。首次调用含模型加载约 1.5~2s，之后约 0.9~1.9s/句。
+**实测（2026-11-04，M 系列 Mac，冷启动）**：模型 `load()` 1.4~2.1s（页缓存命中）~15.7s（首次下载后）；
+**第一次 `generate()` 还要付 ~2.9s 的 MLX kernel 预热**——所以 `preload()` 会在加载后跑一句「嗯。」把预热做掉
+（mock 启动总耗时 ~4.8s），**之后每次首块只要 ~0.2s**。
+合成吞吐与文本长度基本线性：**音频时长 ÷ 3 + 0.2s**（实测 40 字→8.24s 音频/2.75s；73 字→18.56s/6.24s；
+165 字→33.68s/11.32s，稳态 2.98~3.01× 实时）。输出 24kHz float32、峰值 **-5~-12 dBFS**（句子/语气有波动）。
 
-**限制**：预置中文音色只有 `huayan-medium`（换音色用 `--model/--config` 指定 Piper voices 里其它音色）；线性重采样到 24k（测试够用）；情感/口语感一般（比 `macOS say` 清晰，仍偏播报）；长文本单次合成、不流式。
+**电平**：默认**不做归一**（Qwen 本身比提示音低，端侧音量 100 不会撞限幅）；`MOCK_TTS_PEAK_DBFS=<dBFS>`
+可强制把峰值缩到指定档（例如 -7.8 与提示音同档），不设/`off` 为不处理。
 
-## 回声测试：ASR 识别文本 → Piper 复读（不要固定文案）
+**音色明暗（2026-11-04 加）**：Qwen3-TTS 在 **8-12 kHz 的能量明显偏高**（相对 -10~-18 dB，
+提示音/`say` 低得多），听感"特别亮"并带颗粒"嚓嚓"。`MOCK_TTS_LOWPASS_HZ=<Hz>` 可开两级二阶
+RBJ 低通（默认 `0`=关；常用 `7000` 或 `5500`；跨块保持滤波器状态，流式不重启）。它作用于 **mock
+合成侧**，所以要设在跑 mock 的那个环境里。
 
-`ws_mock_server.py --tts-piper` 把收到的设备语音先 ASR 识别，再把**识别出的文本**用本地 Piper 合成 24kHz MP3 下发；设备会把"它听到的话"复读出来 —— 既验证 ASR 正确性，又验证 TTS/下行播放链路（识别错时复读的也是错字，一听就知道）。
+**MP3 码率（2026-11-04 加）**：默认 **96 kbps**（24k 单声道），`MOCK_TTS_BITRATE` 可调（32~320）。
+实测同一段 PCM 的 MP3 往返（对齐后）SNR：**64k=16.4 dB / 96k=20.2 dB / 128k=22.8 dB**；
+觉得有编码噪声/颗粒时先设 `128`。码率越高，下行 0x02 帧每帧字节越多（24ms/帧 → 128kbps≈384B/帧），
+设备侧 ring 足够（64KB ≈ 4s）。
+
+**限制**：需要 Apple Silicon + MLX；模型 2.3GB、常驻约 1.2GB 内存；单句首次合成要等 prefill ≈3s；
+长文本仍整段生成（不做按句切分）。
+
+## 回声测试：ASR 识别文本 → Qwen3-TTS 复读（不要固定文案）
+
+`ws_mock_server.py --tts-qwen` 把收到的设备语音先 ASR 识别，再把**识别出的文本**用 Qwen3-TTS 合成
+24kHz MP3 下发；设备把"它听到的话"复读出来 —— 既验证 ASR 正确性，又验证 TTS/下行播放链路
+（识别错时复读的也是错字，一听就知道）。
 
 ```bash
-# 依赖一次性装进 uv 环境（ASR + TTS 两套）；首次音色缺失加 --tts-piper-download
-uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc \
-  tools/ws_mock_server.py --asr sensevoice --tts-piper
+# 依赖一次性装进 uv 环境（ASR + TTS 两套）
+uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+  tools/ws_mock_server.py --asr sensevoice --tts-qwen
 ```
 
-- `--tts-piper` 与 `--tts-mp3` **互斥**；必须同时开 `--asr`（没有识别文本可复读会直接报错）。
-- 设备侧日志：`VC: ASR final sid=1: 今天天气如何？` → 约 1~2s 后 `TTS start sid=1 codec=mp3 sr=24000` → 复读；`round done` 正常。
-- mock 侧日志：`[ASR] 识别结果: '…'` → `[TTS] 复读合成：'…' → N 帧` → `tts 下发完成 frames=N mode=mp3`。
-- 可调：`--tts-piper-voice`（默认 `zh_CN-huayan-medium`）、`--tts-piper-speed`（>1 更慢）、`--tts-piper-model-dir`、`--tts-pace-pct`（默认 100=实时）。
-- **实测（2026-11-01，真机）**：设备说「今天天气如何」→ ASR `今天天气如何？` → Piper 复读（77 帧 / 14,784B / 1.80s 音频）；`audio_end → tts_start` ≈ **1.9s**（ASR 0.31s + Piper 合成 1.38s），设备播完 `round done`；假客户端离线复测同链路端到端 3.38s（63 帧）。
-- **限制**：识别错则复读错（这是刻意的）；合成失败只 WARN 并回退合成帧；Piper 单次合成约 1~2s（首次含模型加载），太长的句子会增加等待（仍 < 设备 10s 响应超时）。
+- `--tts-qwen` 与 `--tts-mp3` **互斥**；不强制开 `--asr`：没有 ASR 时用 `--tts-text` 当"识别文本"，
+  便于**不接设备/不说话**地离线验证 TTS 链路。
+- **流式下发（默认）**：生成器跑在独立线程，MP3 帧边生成边按 24ms/帧节奏发 `0x02`；
+  首帧约在 `tts_start` 后 **~0.2s**（模型已预热时；未预热/首次调用会多 ~2.9s）。
+  `--no-tts-stream` 退回"整句合成完再发"。
+  ⚠️ 若本机该句的生成 RTF **<1**（首句常见），流式下发会在设备侧欠载（断续）；
+  想要稳定优先用 `--no-tts-stream`（先整句合成，再按实时节奏下发，设备端 buffer 充足）。
+- mock 侧日志：`[ASR] 识别结果` → `[TTS] 首帧 x.xx s` → `[TTS] 合成完成：N.NNs 音频` →
+  `tts 下发完成 frames=N mode=mp3`。
+- 可调：`--tts-model`、`--tts-voice`（默认 serena）、`--tts-lang`、`--tts-instruct`、
+  `--tts-stream-interval`（默认 0.5s）、`--tts-pace-pct`（默认 100=实时）。
+- **离线实测（2026-11-04，假客户端、无开发板）**：`--asr none --tts-qwen --tts-text "今天天气不错，适合出门散步。"`
+  → `tts_start` 后 **2.9s** 首帧、共 **126 帧 / 24,192B / 3.02s 音频**、`tts_end` 在 **6.5s**；
+  mock `--self-test` 仍 **19/19 PASS**（自测不加载模型）。
 
 ## 一轮语音的下发时序（`--scenario normal`）
 
@@ -1219,9 +1404,14 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 | `--asr-threads N` | 2 | ONNX 推理线程数 |
 | `--asr-language L` | `auto` | `auto/zh/en/yue/ja/ko` |
 | `--asr-max-seconds S` | 30 | 单轮最多送 ASR 的音频秒数（超出部分不参与识别） |
-| `--tts-piper` | 关 | **回声测试**：ASR 识别文本 → 本地 Piper 合成后下发（与 `--tts-mp3` 互斥，需 `--asr`） |
-| `--tts-piper-voice` / `--tts-piper-speed` | `zh_CN-huayan-medium` / 1.0 | Piper 音色与语速（length_scale，>1 更慢） |
-| `--tts-piper-model-dir` / `--tts-piper-download` | 空 / 关 | Piper 音色目录 / 缺失时下载（约 60MB） |
+| `--llm` | 关 | **大模型回答**：ASR 文本 → OpenAI 兼容流式 LLM → 回答交给 TTS（替换"复读"）；需 `LLM_API_KEY` 环境变量 |
+| `--llm-model` / `--llm-base-url` | 空（`LLM_MODEL` / 内置代理地址） | 模型名 / 接口 base URL |
+| `--llm-system` / `--llm-max-tokens` | 空 / 0 | 系统提示 / 最大输出 token（0=环境变量，默认 256） |
+| `--tts-qwen` | 关 | **回声测试**：ASR 识别文本 → 本地 Qwen3-TTS（MLX）合成后下发（与 `--tts-mp3` 互斥；不强制 `--asr`，无 ASR 时用 `--tts-text`） |
+| `--tts-model` | 空（默认 0.6B CustomVoice） | Qwen3-TTS 本地 snapshot 或 HF repo id |
+| `--tts-voice` / `--tts-lang` | `serena` / `auto` | 预置音色 / 语言提示（serena/vivian/…） |
+| `--tts-instruct` | 空 | 风格指令（自然语言，如"用温柔的语气说"） |
+| `--tts-stream-interval` / `--no-tts-stream` | 0.5s / 关 | 流式块时长 / 关流式（整句合成完再发，排查用） |
 | `--error-code N` | 1 | **T3.6**：`--scenario error` 下发的 `error.code`（3001/3002 映射 tts-fail 提示音） |
 | `--error-stage S` | `after-audio-end` | **T3.6**：报错时机 `after-audio-end`（现状）/ `after-asr`（先 asr_final）/ `after-tts-start`（先 tts_start + 3~5 帧真实 MP3，测 SPEAKING 中报错） |
 | `--tts-bad-codec` | 关 | **T3.6**：`tts_start` 用 `codec:"pcm"` 后发 `tts_end`、**不发音频帧**（触发设备侧 TTS 无法播放 → tts-fail 提示音）；与 `--scenario error` 互斥 |
@@ -1231,19 +1421,18 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 ### 回声测试（你说什么 → 它复读什么）的实战注意（2026-11-02）
 
 ```bash
-uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc \
-  tools/ws_mock_server.py --asr sensevoice --tts-piper \
-  --asr-download --tts-piper-download
+uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+  tools/ws_mock_server.py --asr sensevoice --tts-qwen
 ```
 
 - **默认（不加 `--asr`）听到的永远是固定文案**：`--tts-text` 默认"今天天气不错…"；
-  用 `--tts-mp3 <file>` 则永远是那个文件的内容。要复读**你自己说的话**必须 `--asr sensevoice --tts-piper`。
+  用 `--tts-mp3 <file>` 则永远是那个文件的内容。要复读**你自己说的话**必须 `--asr sensevoice --tts-qwen`。
 - **`[ASR] 识别结果: '.'` = 那 2~3 秒音频里没有语音**（纯静音/噪声）。常见原因：
   ① 在提示音期间说话（R1 门控，麦克风被关掉，说的话不会上行）；
   ② 离设备太远/太轻（设备端 `mic stat` 看说话时 RMS 应在数百~数千，<300 基本识别不到）；
   ③ 环境噪声触发 VAD 起了轮，但你还没开口。
   → 现在会 WARN 并回退 `--tts-text`，**不再拿标点去合成**。
-- **踩过的坑（已修）**：ASR 返回 `"."` 时 Piper 生成 0 帧音频并抛 `wave.Error: # channels not specified`，
+- **踩过的坑（已修）**：ASR 返回 `"."` 时 TTS 引擎生成 0 帧音频并抛 `wave.Error: # channels not specified`，
   当时以 `SystemExit` 穿出线程 → **整个 mock 进程退出**。现在 `mock_tts` 统一抛 `RuntimeError`，
   mock 侧 `except BaseException` 兜底 + 统计 `复读合成失败 N 次`，单轮合成失败只降级不影响协议链路。
 - 验证"链路是否听懂"最快的方法：**先别用自己的嗓子**，在 `VS: prompt done, feed resumed` 之后
@@ -1270,4 +1459,4 @@ uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc
 - HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求），P4（T4.1/T4.2）前补。
 - `wss` + 自签证书（T1.4 决定证书策略后）。
 - 上行 Opus 帧解码校验 → **已交付 `opus_enc_test.py`**（PyAV 独立解码 + 频谱/码率/泄漏断言，见上）；真机联调在 T2.2 固件就绪后由 Lead 通知。
-- 本地 TTS 扩展（Kokoro-82M / MeloTTS / CosyVoice 等更高自然度方案）→ **2026-11-01 暂缓**，先用 `mock_tts.py`（Piper）；以后需要再加。
+- 本地 TTS：**2026-11-04 起统一为 Qwen3-TTS（MLX）**；Piper/say 已移除。更高自然度或更低时延的方案（Qwen3-TTS 1.7B、CosyVoice 等）后续按需再评估。

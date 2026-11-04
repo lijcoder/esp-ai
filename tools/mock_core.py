@@ -216,12 +216,21 @@ class Config:
     asr_threads: int = 2         # ONNX 推理线程数
     asr_language: str = "auto"   # SenseVoice 语言提示
     asr_max_seconds: float = 30.0  # 单轮最多送 ASR 的音频时长（超出截断）
-    # ---- T3.1 测试：ASR 文本 → 本地 TTS（Piper）复读（回声测试） ----
-    tts_piper: bool = False          # True：把 ASR 识别文本用 Piper 合成后下发（需 --asr）
-    tts_piper_voice: str = "zh_CN-huayan-medium"
-    tts_piper_speed: float = 1.0     # Piper length_scale：>1 更慢
-    tts_piper_model_dir: str = ""    # Piper 音色目录（空=自动找缓存）
-    tts_piper_download: bool = False # 音色缺失时下载（约 60MB）
+    # ---- 2026-11-04：ASR 文本 → 本地 TTS（Qwen3-TTS / MLX）复读（回声测试） ----
+    tts_qwen: bool = False             # True：把 ASR 识别文本用 Qwen3-TTS 合成后下发（需 --asr）
+    tts_model: str = ""                # 本地 snapshot / HF repo id（空=mlx-community/...-0.6B）
+    tts_voice: str = "serena"          # 预置音色（serena/vivian/uncle_fu/ryan/…）
+    tts_lang: str = "auto"             # 语言提示（auto/chinese/english/…）
+    tts_instruct: str = ""             # 风格指令（自然语言，如"用温柔的语气说"）
+    tts_stream_interval: float = 0.5   # 流式块时长（秒）：越小首帧越早、块越多
+    tts_stream: bool = True            # True=边合成边下发；False=整句合成后再发
+    # ---- 2026-11-04：ASR 文本 → LLM（OpenAI 兼容流式）→ 回答（替代复读） ----
+    llm: bool = False              # True：把 ASR 文本交给大模型，回答再交给 TTS
+    llm_base_url: str = ""         # 空=LLM_BASE_URL 环境变量（地址不写进文件）
+    llm_api_key: str = ""          # 空=LLM_API_KEY 环境变量（不要把 token 写进仓库）
+    llm_model: str = ""            # 空=LLM_MODEL 环境变量（模型名不写进文件）
+    llm_system: str = ""           # 空=LLM_SYSTEM_PROMPT（语音助手口径）
+    llm_max_tokens: int = 0        # 0=LLM_MAX_TOKENS（默认 256）
     # ---- T3.6：错误提示（云端错误码/报错时机/坏 codec 注入；error_prompt_test.py 用） ----
     error_code: int = 1                   # --scenario error 下发的 error.code（默认 1=通用）
     error_stage: str = "after-audio-end"  # audio_end 后 / asr_final 后 / tts_start+真实 MP3 帧后
@@ -256,7 +265,11 @@ class Stats:
     asr_errors: int = 0
     asr_audio_ms: int = 0
     asr_infer_ms: int = 0
-    tts_piper_errors: int = 0  # 复读合成失败次数（回退合成帧，不中断协议链路）
+    tts_qwen_errors: int = 0   # 复读合成失败次数（本轮提前 tts_end，不中断协议链路）
+    llm_rounds: int = 0        # --llm：成功的 LLM 轮数
+    llm_errors: int = 0        # --llm：失败轮数（回退复读文本）
+    llm_first_ms: int = 0      # --llm：最近一轮首包时延（ms）
+    llm_chars: int = 0         # --llm：累计回答字数
 
     def summary(self) -> str:
         duration = time.monotonic() - self.started_at
@@ -265,8 +278,13 @@ class Stats:
             extra += f" 窗口外注入 {self.late_bins} 帧"
         if self.tts_stalls:
             extra += f" stall {self.tts_stalls} 次"
-        if self.tts_piper_errors:
-            extra += f" 复读合成失败 {self.tts_piper_errors} 次"
+        if self.tts_qwen_errors:
+            extra += f" 复读合成失败 {self.tts_qwen_errors} 次"
+        if self.llm_rounds or self.llm_errors:
+            extra += (
+                f" | LLM {self.llm_rounds} 轮/{self.llm_errors} 失败"
+                f"（首包 {self.llm_first_ms}ms，共 {self.llm_chars} 字）"
+            )
         if self.asr_rounds or self.asr_errors:
             extra += (
                 f" | ASR {self.asr_rounds} 轮成功/{self.asr_errors} 失败"

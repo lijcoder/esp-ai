@@ -82,3 +82,9 @@ Desktop.ini
 
 # other
 dependencies.lock
+
+# 本地密钥/网关配置（LLM token、地址、模型名等，绝不入库）
+.env
+.env.local
+.llm.env
+llm.env

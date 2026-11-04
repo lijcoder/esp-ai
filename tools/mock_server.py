@@ -335,11 +335,11 @@ def _process_request(connection: Any, request: Any) -> None:
     return None
 
 class MockServer:
-    def __init__(self, cfg: Config, asr: Any = None, tts_piper_module: Any = None) -> None:
+    def __init__(self, cfg: Config, asr: Any = None, tts_qwen_module: Any = None) -> None:
         self.cfg = cfg
         self.port = cfg.port
         self.asr = asr  # mock_asr.MockAsr 实例（--asr）；None = 固定文案假 ASR
-        self.tts_piper_module = tts_piper_module  # tools/mock_tts.py 模块（--tts-piper）
+        self.tts_qwen_module = tts_qwen_module  # tools/mock_tts.py 模块（--tts-qwen，Qwen3-TTS）
         self._server: Any = None
         self._next_conn = 1
         self.active: dict[int, Session] = {}
@@ -488,8 +488,9 @@ def _print_banner(server: MockServer) -> None:
             else "ASR 模式: 关闭（asr_final 固定用 --tts-text 文案）"
         ),
         (
-            f"TTS 复读: 开（ASR 文本 → Piper {cfg.tts_piper_voice} 合成；失败回退合成帧）"
-            if server.tts_piper_module is not None
+            f"TTS {'回答' if cfg.llm else '复读'}: 开（{'LLM 回答' if cfg.llm else 'ASR 文本'} → Qwen3-TTS {cfg.tts_voice} 合成；"
+            f"{'流式' if cfg.tts_stream else '整句'}下发）"
+            if server.tts_qwen_module is not None
             else "TTS 复读: 关"
         ),
         "传输: 每条 accept 连接 TCP_NODELAY=1（关 Nagle；避免 delayed ACK 攒批造成端侧假欠载）",
@@ -524,9 +525,9 @@ def _tts_mode_line(server: MockServer) -> str:
                 else ""
             )
         )
-    if server.tts_piper_module is not None:
+    if server.tts_qwen_module is not None:
         mode = (
-            f"TTS 模式: 回声（ASR 识别文本 → Piper {cfg.tts_piper_voice} → 24k MP3，"
+            f"TTS 模式: 回声（ASR 识别文本 → Qwen3-TTS {cfg.tts_voice} → 24k MP3，"
             f"按帧下发，节奏={cfg.tts_pace_pct}%）"
         )
     elif frames is None:

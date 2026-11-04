@@ -45,11 +45,11 @@ T3.1 测试用的「真 ASR」（可选，独立实现见 tools/mock_asr.py，�
   离线验证识别效果：uv run tools/mock_asr.py --test tools/今天天气如何.wav
 
 T3.1 回声测试（ASR 识别文本 → 本地 Piper 复读，不要固定文案）：
-  uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc \
-    tools/ws_mock_server.py --asr sensevoice --tts-piper
+  uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+    tools/ws_mock_server.py --asr sensevoice --tts-qwen
   设备说的话先被识别，再用 Piper 把识别文本合成 24k MP3 下发给设备复读；
   识别文本会走 asr_partial/asr_final，合成失败只 WARN 并回退合成帧。
-  （--tts-piper 与 --tts-mp3 互斥；需先准备 Piper 音色：uv run tools/mock_tts.py --download）
+  （--tts-qwen 与 --tts-mp3 互斥；模型默认 mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16）
 
 传输说明：本地 mock 是 ws://（不加密）；线上契约是 wss://（ARCH §6.1）。
 TLS/证书策略在 T1.4 决定，见 docs/PRODUCT_IDEAS.md §8 X2。
@@ -71,7 +71,7 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from mock_cli import config_from_args, load_asr_backend, load_tts_piper, parse_args
+from mock_cli import config_from_args, load_asr_backend, load_tts_qwen, parse_args
 from mock_core import LOG, TTS_BAD_CODEC, setup_logging
 from mock_self_test import run_self_test
 from mock_server import MockServer, serve_forever
@@ -90,9 +90,9 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(run_self_test())
 
     asr_backend = load_asr_backend(args)
-    tts_piper_module = load_tts_piper(args)
+    tts_qwen_module = load_tts_qwen(args)
 
-    server = MockServer(cfg, asr_backend, tts_piper_module)
+    server = MockServer(cfg, asr_backend, tts_qwen_module)
     try:
         return asyncio.run(serve_forever(server))
     except KeyboardInterrupt:

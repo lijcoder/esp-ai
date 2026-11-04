@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from mock_core import (
@@ -56,17 +57,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="SenseVoice 语言提示",
     )
     parser.add_argument("--asr-max-seconds", type=float, default=30.0, help="单轮最多送 ASR 的音频秒数")
-    # ---- T3.1 测试：ASR 文本 → 本地 Piper 复读（回声测试） ----
+    # ---- 2026-11-04：ASR 文本 → 本地 Qwen3-TTS 复读（回声测试） ----
     parser.add_argument(
-        "--tts-piper",
+        "--tts-qwen",
         action="store_true",
-        help="回声测试：把 --asr 识别出的文本用本地 Piper 合成后下发（需 --asr，依赖 piper-tts/lameenc）",
+        help="回声测试：把 --asr 识别出的文本用本地 Qwen3-TTS（MLX）合成后下发"
+             "（不强制 --asr：没开 ASR 时用 --tts-text 当文本；依赖 mlx-audio/lameenc；"
+             "模型约 2.3GB，启动加载约 15s）",
     )
-    parser.add_argument("--tts-piper-voice", default="zh_CN-huayan-medium", help="Piper 音色名")
-    parser.add_argument("--tts-piper-speed", type=float, default=1.0,
-                        help="Piper 语速（length_scale：>1 更慢）")
-    parser.add_argument("--tts-piper-model-dir", default="", help="Piper 音色目录（空=自动找缓存）")
-    parser.add_argument("--tts-piper-download", action="store_true", help="Piper 音色缺失时下载（约 60MB）")
+    parser.add_argument("--tts-model", default="",
+                        help="Qwen3-TTS 本地 snapshot 目录或 HF repo id"
+                             "（空=mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16）")
+    parser.add_argument("--tts-voice", default="serena",
+                        help="预置音色：serena/vivian/uncle_fu/ryan/aiden/ono_anna/sohee/eric/dylan")
+    parser.add_argument("--tts-lang", default="auto",
+                        help="语言提示：auto/chinese/english/…")
+    parser.add_argument("--tts-instruct", default="",
+                        help="风格指令（自然语言，如 '用温柔的语气说'）")
+    parser.add_argument("--tts-stream-interval", type=float, default=0.32,
+                        help="流式块时长（秒）：越小首帧越早、块越多")
+    parser.add_argument("--no-tts-stream", action="store_true",
+                        help="关掉流式：整句合成完再发（排查用；默认流式）")
+    # ---- 2026-11-04：ASR 文本 → LLM（OpenAI 兼容流式）→ 回答 → Qwen3-TTS ----
+    parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="把 ASR 文本交给大模型（OpenAI 兼容 /chat/completions 流式），回答再交给 TTS；"
+             "需 LLM_API_KEY 环境变量（token 不要写进仓库）",
+    )
+    parser.add_argument("--llm-model", default="", help="模型名（空=LLM_MODEL，必填）")
+    parser.add_argument("--llm-base-url", default="", help="接口 base URL（空=LLM_BASE_URL，必填）")
+    parser.add_argument("--llm-api-key", default="", help="Bearer token（空=LLM_API_KEY；不建议写进命令行）")
+    parser.add_argument("--llm-system", default="", help="系统提示（空=LLM_SYSTEM_PROMPT）")
+    parser.add_argument("--llm-max-tokens", type=int, default=0, help="最大输出 token（0=LLM_MAX_TOKENS/256）")
     # ---- T2.4：真实 MP3 下发（契约 §6） ----
     parser.add_argument(
         "--tts-mp3",
@@ -124,10 +147,31 @@ def _validate_args(args: argparse.Namespace) -> int:
         raise SystemExit(f"--tts-stall-at 必须 >= 0（当前 {args.tts_stall_at}）")
     if not 1 <= args.tts_pace_pct <= 400:
         raise SystemExit(f"--tts-pace-pct 必须在 1~400（当前 {args.tts_pace_pct}）")
-    if args.tts_piper and args.tts_mp3:
-        raise SystemExit("--tts-piper（回声测试）与 --tts-mp3（固定音频）互斥，二选一")
-    if args.tts_piper and args.asr == "none":
-        raise SystemExit("--tts-piper 是回声测试：需要同时开 --asr sensevoice 才有识别文本可复读")
+    if args.tts_qwen and args.tts_mp3:
+        raise SystemExit("--tts-qwen（回声测试）与 --tts-mp3（固定音频）互斥，二选一")
+    if args.llm and args.tts_mp3:
+        raise SystemExit("--llm（大模型回答→TTS）与 --tts-mp3（固定音频）互斥，二选一")
+    if args.llm:
+        missing = [
+            name
+            for name, value in (
+                ("LLM_BASE_URL", args.llm_base_url or os.environ.get("LLM_BASE_URL")),
+                ("LLM_MODEL", args.llm_model or os.environ.get("LLM_MODEL")),
+                ("LLM_API_KEY", args.llm_api_key or os.environ.get("LLM_API_KEY")),
+            )
+            if not value
+        ]
+        if missing:
+            raise SystemExit(
+                "--llm 缺少配置：" + "、".join(missing)
+                + "。请先 export（地址/模型/token 不要写进仓库）"
+            )
+    # --tts-qwen 不强制开 --asr：没有 ASR 时用 --tts-text 当"识别文本"，
+    # 便于**不接设备/不说话**地离线验证 TTS 下发链路（2026-11-04）。
+    if args.tts_qwen and args.asr == "none":
+        LOG.info("--tts-qwen 未开 --asr：用 --tts-text 作为复读文本（离线验证 TTS 链路）")
+    if args.tts_stream_interval <= 0:
+        raise SystemExit(f"--tts-stream-interval 必须 > 0（当前 {args.tts_stream_interval}）")
     if args.tts_bad_codec and args.scenario == "error":
         raise SystemExit(
             "--tts-bad-codec（设备侧 TTS 失败路径）与 --scenario error（云端 error 事件）互斥，"
@@ -138,7 +182,7 @@ def _validate_args(args: argparse.Namespace) -> int:
     max_tts_frames = args.max_tts_frames
     if max_tts_frames is None:
         # 真实音频（固定 MP3 / 回声合成）默认全发；合成帧默认 100 帧 ≈ 2s
-        max_tts_frames = 0 if (args.tts_mp3 or args.tts_piper) else 100
+        max_tts_frames = 0 if (args.tts_mp3 or args.tts_qwen) else 100
     if args.asr_max_seconds <= 0:
         raise SystemExit(f"--asr-max-seconds 必须 > 0（当前 {args.asr_max_seconds}）")
     if args.asr_threads < 1:
@@ -176,11 +220,19 @@ def config_from_args(args: argparse.Namespace) -> Config:
         asr_threads=args.asr_threads,
         asr_language=args.asr_language,
         asr_max_seconds=args.asr_max_seconds,
-        tts_piper=args.tts_piper,
-        tts_piper_voice=args.tts_piper_voice,
-        tts_piper_speed=args.tts_piper_speed,
-        tts_piper_model_dir=args.tts_piper_model_dir,
-        tts_piper_download=args.tts_piper_download,
+        tts_qwen=args.tts_qwen,
+        tts_model=args.tts_model,
+        tts_voice=args.tts_voice,
+        tts_lang=args.tts_lang,
+        tts_instruct=args.tts_instruct,
+        tts_stream_interval=args.tts_stream_interval,
+        tts_stream=not args.no_tts_stream,
+        llm=args.llm,
+        llm_base_url=args.llm_base_url,
+        llm_api_key=args.llm_api_key,
+        llm_model=args.llm_model,
+        llm_system=args.llm_system,
+        llm_max_tokens=args.llm_max_tokens,
         error_code=args.error_code,
         error_stage=args.error_stage,
         tts_bad_codec=args.tts_bad_codec,
@@ -216,27 +268,41 @@ def load_asr_backend(args: argparse.Namespace) -> object | None:
     return backend
 
 
-def load_tts_piper(args: argparse.Namespace) -> object | None:
-    """--tts-piper：加载 tools/mock_tts.py（ASR 文本 → Piper 合成 24k MP3 复读）。"""
-    if not args.tts_piper:
+def load_tts_qwen(args: argparse.Namespace) -> object | None:
+    """--tts-qwen：加载 tools/mock_tts.py 并**预热** Qwen3-TTS（ASR 文本 → 24k MP3 复读）。
+
+    预热是必须的：模型加载约 15s，若等到第一轮 TTS 才加载，设备 THINKING 10s 会先超时。
+    """
+    if not args.tts_qwen:
         return None
     try:
-        import mock_tts  # 同目录模块：自带 PEP 723 依赖（piper-tts/lameenc/numpy）
+        import mock_tts  # 同目录模块：自带 PEP 723 依赖（mlx-audio/lameenc/numpy）
     except ImportError as exc:
         raise SystemExit(
-            f"--tts-piper 需要额外依赖（{exc}）。请改用：\n"
-            "  uv run --with av --with numpy --with sherpa-onnx --with piper-tts --with lameenc \\\n"
-            "    tools/ws_mock_server.py --asr sensevoice --tts-piper ...\n"
-            "首次使用可先准备音色：uv run tools/mock_tts.py --download（约 60MB）"
+            f"--tts-qwen 需要额外依赖（{exc}）。请改用：\n"
+            "  uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \\\n"
+            "    tools/ws_mock_server.py --asr sensevoice --tts-qwen ...\n"
+            "模型缺失时先准备：uv run tools/mock_tts.py --text 你好 --out /tmp/x.mp3（自动查缓存/下载）"
         ) from exc
     try:
-        mock_tts.ensure_voice(
-            args.tts_piper_voice,
-            args.tts_piper_model_dir or None,
-            download=args.tts_piper_download,
+        mock_tts.preload(
+            model=args.tts_model or mock_tts.DEFAULT_MODEL,
+            voice=args.tts_voice or None,
+            lang_code=args.tts_lang,
+            instruct=args.tts_instruct,
+            stream_interval=args.tts_stream_interval,
             log=lambda message: LOG.info("%s", message),
         )
-    except SystemExit as exc:
-        raise SystemExit(f"Piper 音色未就绪：{exc}") from exc
-    LOG.info("TTS 复读已启用：ASR 文本 → Piper %s 合成后下发", args.tts_piper_voice)
+    except BaseException as exc:  # noqa: BLE001 - 模型加载失败要给人话，不要裸露堆栈
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        raise SystemExit(f"Qwen3-TTS 加载失败：{exc}") from exc
+    mode = "流式" if not args.no_tts_stream else "整句"
+    if args.llm:
+        LOG.info("TTS 回答已启用：LLM 回答 → Qwen3-TTS %s（%s下发；模型 %s）",
+                 args.tts_voice, mode, args.llm_model or os.environ.get("LLM_MODEL", ""))
+    else:
+        LOG.info("TTS 复读已启用：ASR 文本 → Qwen3-TTS %s（%s下发）", args.tts_voice, mode)
+        LOG.info("提示：当前是【复读模式】（回答 = 识别文本）。要大模型回答请加 --llm "
+                 "并配置 LLM_BASE_URL/LLM_MODEL/LLM_API_KEY 环境变量")
     return mock_tts

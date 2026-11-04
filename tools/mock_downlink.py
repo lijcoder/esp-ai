@@ -1,7 +1,7 @@
 """mock_downlink —— 一轮语音的「下行」：ASR 文本 → TTS 音频帧，以及错误注入。
 
 从 Session 拆出的混入类 DownlinkMixin：只负责 audio_end 之后云端该做的事——
-ASR 文本（固定文案 / 本地 SenseVoice）、TTS 音频（合成帧 / 真实 MP3 / Piper 复读）、
+ASR 文本（固定文案 / 本地 SenseVoice）、TTS 音频（合成帧 / 真实 MP3 / Qwen3-TTS 复读）、
 发送节奏与欠载注入、云端错误码注入。连接与上行仍由 Session 负责，继承后行为与拆分前一致。
 
 DownlinkMixin 依赖宿主（tools/mock_server.py 的 Session）提供：
@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 
 from websockets.exceptions import ConnectionClosed
 
+import llm_client
 from mock_core import (
     ERROR_TTS_FRAMES,
     FRAME_HEADER_LEN,
@@ -52,32 +54,136 @@ class DownlinkMixin:
         head = b"\xff\xfb\x90\x64" + (index & 0xFFFF).to_bytes(2, "big")
         return (head + b"\x00" * size)[:size]
 
-    def _synthesize_echo_frames(self, text: str) -> list[Mp3Frame]:
-        """把 ASR 文本用 Piper 合成为 24k 单声道 MP3，再按 MP3 帧切分（回声测试用）。
+    async def _llm_answer(self, text: str) -> str:
+        """ASR 文本 → LLM（OpenAI 兼容流式）→ 回答；边收边发 `llm_delta`。
 
-        同步阻塞（piper CLI + 编码，约 1~2s/句），调用方用 asyncio.to_thread 执行。
+        阻塞的 SSE 读取放独立线程，增量经 asyncio 队列回主循环（不能堵 WS 收包/心跳）。
+        失败抛异常，由 `_tts_flow` 回退成"复读"（answer = ASR 文本）。
         """
-        module = self.server.tts_piper_module
-        assert module is not None
         cfg = self.cfg
-        started = time.monotonic()
-        audio, duration = module.synthesize_mp3(
-            text,
-            voice=cfg.tts_piper_voice,
-            model_dir=cfg.tts_piper_model_dir or None,
-            speed=cfg.tts_piper_speed,
-            download=cfg.tts_piper_download,
-            log=lambda message: LOG.info("%s", message),
+        lcfg = llm_client.LlmConfig.from_env(
+            base_url=cfg.llm_base_url or None,
+            api_key=cfg.llm_api_key or None,
+            model=cfg.llm_model or None,
+            system=cfg.llm_system or None,
+            max_tokens=cfg.llm_max_tokens or None,
         )
-        frames = parse_mp3_frames(audio, source="<asr-echo>")
-        if not frames:
-            raise RuntimeError("Piper 合成结果不是可解析的 MP3")
+        started = time.monotonic()
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        sentinel = object()
+
+        def producer() -> None:
+            try:
+                for delta in llm_client.stream_chat(text, lcfg):
+                    loop.call_soon_threadsafe(queue.put_nowait, delta)
+            except BaseException as exc:  # noqa: BLE001 - 异常回传主线程
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+        threading.Thread(target=producer, name="llm", daemon=True).start()
+        parts: list[str] = []
+        first_delta_ms = 0
+        while True:
+            item = await queue.get()
+            if item is sentinel:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            if not first_delta_ms:
+                first_delta_ms = int((time.monotonic() - started) * 1000)
+            parts.append(item)
+            await self._send_json({"t": "llm_delta", "sid": self.sid, "text": item})
+        answer = "".join(parts).strip()
+        self.stats.llm_rounds += 1
+        self.stats.llm_first_ms = first_delta_ms
+        self.stats.llm_chars += len(answer)
         self._log(
             logging.INFO,
-            f"[TTS] 复读合成：{text!r} → {len(frames)} 帧 / {duration:.2f}s 音频 "
+            f"[LLM] {lcfg.model} 回答 {len(answer)} 字（首包 {first_delta_ms}ms / "
+            f"总 {(time.monotonic() - started) * 1000:.0f}ms）：{answer[:40]!r}",
+        )
+        return answer
+
+    def _echo_frame_source(self, text: str):
+        """回声测试的帧来源：默认**流式生成器**（边合成边下发），`--no-tts-stream` 时是整句帧列表。
+
+        流式生成器由 `_send_echo_frames()` 放到独立线程里消费（MLX 生成不能占事件循环）；
+        整句模式在这里同步合成完，便于排查/对比。
+        """
+        module = self.server.tts_qwen_module
+        assert module is not None
+        cfg = self.cfg
+        common = {
+            "model": cfg.tts_model or module.DEFAULT_MODEL,
+            "voice": cfg.tts_voice or None,
+            "lang_code": cfg.tts_lang,
+            "instruct": cfg.tts_instruct,
+            "stream_interval": cfg.tts_stream_interval,
+        }
+        log = lambda message: LOG.info("%s", message)  # noqa: E731
+        if cfg.tts_stream:
+            return module.stream_frames(text, **common, log=log)
+        started = time.monotonic()
+        audio, duration = module.synthesize_mp3(text, **common, log=log)
+        frames = parse_mp3_frames(audio, source="<asr-echo>")
+        if not frames:
+            raise RuntimeError("Qwen3-TTS 合成结果不是可解析的 MP3")
+        self._log(
+            logging.INFO,
+            f"[TTS] 复读合成：{text!r} → {len(frames)} 帧 / {duration:.2f}s 音频"
             f"（耗时 {time.monotonic() - started:.2f}s）",
         )
         return frames
+
+    async def _send_echo_frames(self, sid: int | None, source) -> tuple[int, int]:
+        """把回声帧来源发出去：列表直接发；生成器放线程里跑，边生成边按实时节奏发。"""
+        limit = self.cfg.max_tts_frames
+        sent_frames = 0
+        sent_bytes = 0
+
+        if isinstance(source, list):
+            total = len(source) if limit <= 0 else min(len(source), limit)
+            for index in range(total):
+                frame = source[index]
+                await self._send_bin(frame.payload)
+                sent_frames += 1
+                sent_bytes += len(frame.payload)
+                await self._pace_after_frame(index, frame.duration_ms)
+            return sent_frames, sent_bytes
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        sentinel = object()
+
+        def producer() -> None:
+            try:
+                for payload, duration_ms in source:
+                    loop.call_soon_threadsafe(queue.put_nowait, (payload, duration_ms))
+            except BaseException as exc:  # noqa: BLE001 - 异常要回传主线程，不能吞
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+        thread = threading.Thread(target=producer, name="tts-qwen", daemon=True)
+        thread.start()
+        index = 0
+        while True:
+            item = await queue.get()
+            if item is sentinel:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            payload, duration_ms = item
+            await self._send_bin(payload)
+            sent_frames += 1
+            sent_bytes += len(payload)
+            await self._pace_after_frame(index, duration_ms)
+            index += 1
+            if limit > 0 and index >= limit:
+                break
+        return sent_frames, sent_bytes
 
     def _late_bin_payload(self) -> bytes:
         """窗口外注入用的 0x02 payload：优先用真实 MP3 首帧，否则合成帧。"""
@@ -86,8 +192,17 @@ class DownlinkMixin:
             return frames[0].payload
         return self._synth_tts_payload(0)
 
+    def _reset_pacing(self) -> None:
+        """每一轮 TTS 下发开始时重置节奏基准（绝对时刻调度）。"""
+        self._pace_due: float | None = None
+
     async def _pace_after_frame(self, index: int, frame_ms: float) -> None:
-        """一帧发完后的节奏：默认按帧时长（真实 MP3 秒级实时）；stall 点改为停发。"""
+        """一帧发完后的节奏：**按绝对时刻调度**，平均速率严格等于帧时长。
+
+        以前的实现是"发完再 sleep(帧时长)"，于是每帧实际周期 = 帧时长 + 发送/处理开销
+        （实测 24ms 的帧变成 25.6ms → 比实时慢 6%）。短句看不出来，长句播放会越积越少，
+        声卡中途开始欠载 → 听感"呲呲"。stall 点仍然按毫秒停发。
+        """
         cfg = self.cfg
         if index == cfg.tts_stall_at and cfg.tts_stall_ms > 0:
             self.stats.tts_stalls += 1
@@ -96,10 +211,21 @@ class DownlinkMixin:
                 f"stall {cfg.tts_stall_ms} ms（第 {index} 帧后停发，制造端侧欠载）",
             )
             await asyncio.sleep(cfg.tts_stall_ms / 1000)
+            self._pace_due = None  # stall 之后重新对齐
             return
         gap_ms = frame_ms * cfg.tts_pace_pct / 100.0 if cfg.tts_pace_pct > 0 else 0.0
-        if gap_ms > 0:
-            await asyncio.sleep(gap_ms / 1000)
+        if gap_ms <= 0:
+            return
+        now = time.monotonic()
+        if getattr(self, "_pace_due", None) is None:
+            self._pace_due = now
+        self._pace_due += gap_ms / 1000.0
+        delay = self._pace_due - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        else:
+            # 已经落后（生成慢/宿主抖动）：不要回头补发，重新对齐到当前时刻
+            self._pace_due = time.monotonic()
 
     async def _asr_text(self, asr_packets: list[bytes] | None) -> str:
         """本轮 asr 文本：--asr 时用本地 SenseVoice 真识别，否则用 --tts-text 固定文案。
@@ -214,30 +340,45 @@ class DownlinkMixin:
                 return
 
             text = await self._asr_text(asr_packets)
+            await self._send_json({"t": "asr_partial", "sid": sid, "text": text[: max(1, len(text) // 2)]})
+            await self._send_json({"t": "asr_final", "sid": sid, "text": text})
 
-            # 回声测试：把识别文本用本地 Piper 合成为 TTS 音频（失败回退合成帧）
-            echo_frames: list[Mp3Frame] | None = None
-            if self.server.tts_piper_module is not None:
-                if not module_speakable(text):
+            # 回答来源：--llm（大模型流式）或复读（默认，llm_delta 是识别文本切片）
+            answer = text
+            if self.cfg.llm:
+                try:
+                    answer = await self._llm_answer(text) or text
+                except BaseException as exc:  # noqa: BLE001 - 单轮失败不能拖垮 mock
+                    if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+                        raise
+                    self.stats.llm_errors += 1
+                    answer = text
+                    self._log(logging.WARNING, f"[LLM] 失败（回退复读 ASR 文本）：{exc}")
+                    await self._send_json({"t": "llm_delta", "sid": sid, "text": text})
+            else:
+                for offset in range(0, len(text), 5):
+                    await self._send_json(
+                        {"t": "llm_delta", "sid": sid, "text": text[offset : offset + 5]}
+                    )
+
+            # TTS：把回答（--llm 时是模型回答，否则是识别文本）用本地 Qwen3-TTS 合成
+            echo_source = None
+            if self.server.tts_qwen_module is not None:
+                if not module_speakable(answer):
                     self._log(
                         logging.WARNING,
-                        f"[TTS] 文本没有可念内容（{text!r}），跳过复读合成 → 回退合成帧",
+                        f"[TTS] 文本没有可念内容（{answer!r}），跳过合成 → 回退合成帧",
                     )
                 else:
                     try:
-                        echo_frames = await asyncio.to_thread(self._synthesize_echo_frames, text)
+                        echo_source = self._echo_frame_source(answer)
                     except BaseException as exc:  # noqa: BLE001
-                        # 必须是 BaseException：piper/编码链路可能抛 SystemExit，
-                        # `except Exception` 抓不住它，会让整个 mock 进程退出（2026-11-02 实测踩到）。
+                        # 必须是 BaseException：合成链路可能抛 SystemExit，`except Exception`
+                        # 抓不住它，会让整个 mock 进程退出（2026-11-02 实测踩到）。
                         if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
                             raise
-                        self.stats.tts_piper_errors += 1
+                        self.stats.tts_qwen_errors += 1
                         self._log(logging.WARNING, f"[TTS] 复读合成失败（回退合成帧）：{exc}")
-
-            await self._send_json({"t": "asr_partial", "sid": sid, "text": text[: max(1, len(text) // 2)]})
-            await self._send_json({"t": "asr_final", "sid": sid, "text": text})
-            for offset in range(0, len(text), 5):
-                await self._send_json({"t": "llm_delta", "sid": sid, "text": text[offset : offset + 5]})
 
             sent_frames = 0
             sent_bytes = 0
@@ -254,6 +395,7 @@ class DownlinkMixin:
                 self._log(logging.INFO, "tts 下发完成 frames=0 bytes=0 mode=bad-codec")
                 return
 
+            self._reset_pacing()
             if self.cfg.no_tts:
                 await self._send_tts_start(sid, TTS_CODEC)
                 self._log(logging.INFO, "（--no-tts：跳过二进制帧，仅验证 JSON 链路）")
@@ -262,8 +404,15 @@ class DownlinkMixin:
                     # tts_start 之前：端侧还没开 0x02 接收窗口，必须丢弃（T2.4 契约 §2.3）
                     await self._send_bin(self._late_bin_payload(), note="late-pre")
                 await self._send_tts_start(sid, TTS_CODEC)
-                frames = echo_frames if echo_frames is not None else self.server.tts_mp3_frames
-                if frames is None:
+                if echo_source is not None:
+                    try:
+                        sent_frames, sent_bytes = await self._send_echo_frames(sid, echo_source)
+                    except BaseException as exc:  # noqa: BLE001
+                        if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+                            raise
+                        self.stats.tts_qwen_errors += 1
+                        self._log(logging.WARNING, f"[TTS] 复读合成中断（本轮提前 tts_end）：{exc}")
+                elif self.server.tts_mp3_frames is None:
                     total = max(1, self.cfg.max_tts_frames)
                     for index in range(total):
                         payload = self._synth_tts_payload(index)
@@ -272,6 +421,7 @@ class DownlinkMixin:
                         sent_bytes += len(payload)
                         await self._pace_after_frame(index, self.cfg.chunk_ms)
                 else:
+                    frames = self.server.tts_mp3_frames
                     total = len(frames) if self.cfg.max_tts_frames <= 0 else min(
                         len(frames), self.cfg.max_tts_frames
                     )
@@ -290,7 +440,7 @@ class DownlinkMixin:
             if not self.cfg.no_tts and self.cfg.tts_late_bin:
                 # tts_end 之后：端侧窗口已关闭，必须丢弃（不计数、不播放）
                 await self._send_bin(self._late_bin_payload(), note="late-post")
-            mode = "mp3" if (echo_frames is not None or self.server.tts_mp3_frames is not None) else "synth"
+            mode = "mp3" if (echo_source is not None or self.server.tts_mp3_frames is not None) else "synth"
             if not self.cfg.no_tts:
                 self.stats.tts_frames += sent_frames
                 self.stats.tts_bytes += sent_bytes

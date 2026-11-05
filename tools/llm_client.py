@@ -16,6 +16,8 @@
   LLM_MAX_TOKENS  默认 256
   LLM_TEMPERATURE 默认 0.6
   LLM_TIMEOUT_S   默认 20（首包超时/整体读超时）
+  LLM_SESSION_ID  可选：网关会话追踪头 `X-Hermes-Session-Id`（空=不带该头），
+                  便于在网关侧把 mock/真机的一轮轮请求串成同一个会话
 
 接口：
   cfg = LlmConfig.from_env()
@@ -42,6 +44,8 @@ DEFAULT_SYSTEM = (
     "不要输出思考过程，只给最终回答。"
 )
 
+SESSION_HEADER = "X-Hermes-Session-Id"
+
 
 @dataclass
 class LlmConfig:
@@ -52,6 +56,7 @@ class LlmConfig:
     max_tokens: int = 256
     temperature: float = 0.6
     timeout_s: float = 20.0
+    session_id: str = ""  # 非空 → 请求头带 X-Hermes-Session-Id
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -64,6 +69,7 @@ class LlmConfig:
             max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "256")),
             temperature=float(os.environ.get("LLM_TEMPERATURE", "0.6")),
             timeout_s=float(os.environ.get("LLM_TIMEOUT_S", "20")),
+            session_id=os.environ.get("LLM_SESSION_ID", "").strip(),
         )
         for key, value in overrides.items():
             if value is not None:
@@ -113,14 +119,17 @@ def _request_body(messages: list[dict], cfg: LlmConfig, stream: bool) -> bytes:
 
 def _build_request(messages: list[dict], cfg: LlmConfig, stream: bool) -> urllib.request.Request:
     cfg.require_ready()
+    headers = {
+        "Authorization": "Bearer " + cfg.api_key,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream" if stream else "application/json",
+    }
+    if cfg.session_id:  # 网关会话追踪（LLM_SESSION_ID，空则不带头）
+        headers[SESSION_HEADER] = cfg.session_id
     return urllib.request.Request(
         cfg.endpoint,
         data=_request_body(messages, cfg, stream),
-        headers={
-            "Authorization": "Bearer " + cfg.api_key,
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream" if stream else "application/json",
-        },
+        headers=headers,
         method="POST",
     )
 

@@ -39,6 +39,11 @@
   - 收到 asr_final 且非空；
   - 收到 tts_start、至少 1 个 0x02 帧、tts_end；
   - `--expect-llm`：回答文本（llm_delta 拼接）**不等于** ASR 文本（证明是 LLM 回答，不是复读）。
+
+超时口径：`--timeout` 是**空闲超时**（默认 60s，每收到一条下行消息就重置；0=不因空闲失败），
+`--max-total` 是总等待上限（默认 900s，0=不限）。读长文时音频按实时节奏下发，几十秒到几分钟
+都算正常——旧版"固定 60s 总时长"会在长文上误判成"没收到 tts_end"并掐断播放（2026-11-05 修）；
+长音频期间脚本每 10s 打印一行 `已收 N 帧 / 已等 Xs`。
 """
 
 from __future__ import annotations
@@ -128,16 +133,23 @@ def build_bin_frame(frame_type: int, seq: int, payload: bytes) -> bytes:
 
 
 def decode_mp3(payloads: list[bytes]) -> np.ndarray:
-    """把下行 0x02 帧拼起来解码成 float32 PCM（24k 单声道）。"""
+    """把下行 0x02 帧拼起来解码成 float32 PCM（24k 单声道）。
+
+    只用于统计/试听：mock 的 `--tts-mp3` 关闭时下行的是**合成帧**（不是真实 MP3），
+    解码失败不算链路错误（否则会盖掉真正的失败原因，例如空闲超时），返回空 PCM 即可。
+    """
     import av
     import io
 
     data = b"".join(payloads)
     if not data:
         return np.zeros(0, dtype=np.float32)
-    with av.open(io.BytesIO(data), format="mp3") as container:
-        stream = container.streams.audio[0]
-        chunks = [f.to_ndarray().reshape(-1) for f in container.decode(stream)]
+    try:
+        with av.open(io.BytesIO(data), format="mp3") as container:
+            stream = container.streams.audio[0]
+            chunks = [f.to_ndarray().reshape(-1) for f in container.decode(stream)]
+    except Exception:  # noqa: BLE001 - 合成帧/半帧：解不出来不影响断言
+        return np.zeros(0, dtype=np.float32)
     return np.concatenate(chunks).astype(np.float32) if chunks else np.zeros(0, dtype=np.float32)
 
 
@@ -278,13 +290,38 @@ async def run(args) -> int:
         await ws.send(json.dumps({"t": "audio_end", "sid": 1}))
         t_send_done = time.monotonic()
 
-        deadline = time.monotonic() + args.timeout
-        while time.monotonic() < deadline:
-            try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=max(0.1, deadline - time.monotonic()))
-            except asyncio.TimeoutError:
-                break
+        # 超时口径 = **空闲超时**（每收到一条下行消息就重置），不是总时长：
+        # 长文本（几百字 → 几十秒~几分钟音频）按实时节奏下发，固定 60s 总超时会把它拦腰砍断。
+        last_rx = time.monotonic()
+        hard_deadline = last_rx + args.max_total if args.max_total > 0 else None
+        next_progress = last_rx + 10.0
+        timeout_reason = ""
+        while True:
             now = time.monotonic()
+            idle_left = args.timeout - (now - last_rx) if args.timeout > 0 else float("inf")
+            if idle_left <= 0:
+                timeout_reason = f"连续 {args.timeout:.0f}s 没有下行数据"
+                break
+            if hard_deadline is not None and now >= hard_deadline:
+                timeout_reason = f"总等待超过 --max-total {args.max_total:.0f}s"
+                break
+            wait = min(idle_left, 1.0)
+            if hard_deadline is not None:
+                wait = max(0.1, min(wait, hard_deadline - now))
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=wait)
+            except asyncio.TimeoutError:
+                continue
+            now = time.monotonic()
+            gap = now - last_rx
+            last_rx = now
+            if now >= next_progress:
+                next_progress = now + 10.0
+                print(
+                    f"[TEST] ... 已收 {len(down)} 帧 / 已等 {now - t0:.0f}s"
+                    f"（上一条数据 {gap:.2f}s 前，仍在实时下发）",
+                    flush=True,
+                )
             if isinstance(msg, (bytes, bytearray)):
                 raw = bytes(msg)
                 if raw[:2] != MAGIC:
@@ -361,7 +398,11 @@ async def run(args) -> int:
     if t_tts_start is None:
         failures.append("没收到 tts_start")
     if t_end is None and not error:
-        failures.append("没收到 tts_end（超时？）")
+        why = f"：{timeout_reason}" if timeout_reason else ""
+        failures.append(
+            f"没收到 tts_end（{len(down)} 帧 / {duration:.1f}s 音频{why}）"
+            "；回答很长时属于等待不够，放大 --timeout（空闲超时）即可"
+        )
     if error is not None:
         failures.append(f"mock 返回 error：{error}")
     if args.expect_llm and answer and asr_final and answer == asr_final:
@@ -402,7 +443,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="实时播放先攒多少秒再开播（防声卡欠载；0=立即）")
     p.add_argument("--gain-db", type=float, default=6.0,
                    help="播放增益（dB，默认 +6：TTS 峰值约 -10~-13 dBFS，比提示音轻）")
-    p.add_argument("--timeout", type=float, default=60.0, help="等 tts_end 的超时（秒）")
+    p.add_argument("--timeout", type=float, default=60.0,
+                   help="等 tts_end 的**空闲**超时（秒）：每收到一条下行消息就重置，长音频不会被打断；"
+                        "0=不因空闲失败")
+    p.add_argument("--max-total", type=float, default=900.0,
+                   help="总等待上限（秒）：防「一直有数据但永不 tts_end」；0=不限")
     p.add_argument("--expect-llm", action="store_true", help="断言回答 != ASR 文本（证明走的是 LLM）")
     return p
 

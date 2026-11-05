@@ -1197,11 +1197,16 @@ export LLM_MODEL=<模型名>                    # 必填
 export LLM_API_KEY=sk-...                    # 必填
 export LLM_SYSTEM_PROMPT="..."               # 可选：覆盖默认语音助手口径
 export LLM_MAX_TOKENS=256 LLM_TEMPERATURE=0.6 LLM_TIMEOUT_S=20 LLM_RETRIES=2
+export LLM_SESSION_ID=curl-test-001          # 可选：请求头 X-Hermes-Session-Id（空=不带）
 ```
+
+`LLM_SESSION_ID` 会作为 `X-Hermes-Session-Id` 请求头发给网关（mock `--llm` 与 `llm_test.py` 共用），
+用于在网关侧把同一会话的多轮请求串起来；`llm_test.py --session-id <id>` 可按次覆盖。
 
 ```bash
 uv run tools/llm_test.py --text "今天天气怎么样？"
 uv run tools/llm_test.py --text "用一句话介绍你自己" --model <另一个模型名>
+uv run tools/llm_test.py --text "今天天气怎么样？" --session-id curl-test-001
 uv run tools/llm_test.py --text "..." --no-stream --max-tokens 120
 printf '明天适合跑步吗？' | uv run tools/llm_test.py
 ```
@@ -1252,6 +1257,15 @@ uv run tools/mock_offline_test.py --wav tools/今天吃了什么.wav --play
 
 **判定**（退出码 0/1）：收到非空 `asr_final`、`tts_start`、≥1 个 0x02 帧、`tts_end`；
 `--expect-llm` 额外断言"回答 ≠ ASR 文本"（证明是 LLM 回答而不是复读）。
+
+**超时口径（2026-11-05 修）**：`--timeout` 是**空闲超时**（每收到一条下行消息就重置，默认 60s），
+`--max-total` 是总等待上限（默认 900s，0=不限）。旧版是"固定 60s 总时长"，读长文
+（如 700+ 字 → 200s+ 音频）会在 60s 被拦腰砍断、报"没收到 tts_end"——那是测试客户端等不及，
+不是 TTS/播放中断。长音频期间每 10s 打印一行 `... 已收 N 帧 / 已等 Xs` 表示仍在实时下发。
+
+**实测（2026-11-05，长音频回归）**：mock 合成 2800 帧 / 89.66s 音频的整轮，
+客户端 67.5s 收齐 `tts_end` → **PASS**（旧版 60s 必 FAIL）；mock 侧 `--tts-stall-ms 5000`
+制造断流时，`--timeout 2` 在 2s 判空闲超时、`--max-total 2` 在 2s 判总时长超限，两种都给出明确原因。
 
 **实测（2026-11-04，mock 带 `--llm`）**：
 - `--wav tools/今天天气如何.wav` → `asr_final='今天天气如何？'` → LLM 回答 53 字 →

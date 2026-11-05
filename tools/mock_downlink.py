@@ -72,29 +72,45 @@ class DownlinkMixin:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
         sentinel = object()
+        stop = threading.Event()
+
+        def emit(item) -> bool:
+            """线程安全入队；已取消/事件循环关闭时返回 False（让 SSE 线程尽快收手）。"""
+            if stop.is_set():
+                return False
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+            except RuntimeError:  # 事件循环已关闭（断连/进程退出）
+                return False
+            return True
 
         def producer() -> None:
             try:
                 for delta in llm_client.stream_chat(text, lcfg):
-                    loop.call_soon_threadsafe(queue.put_nowait, delta)
+                    if not emit(delta):
+                        return
             except BaseException as exc:  # noqa: BLE001 - 异常回传主线程
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
+                if not emit(exc):
+                    return
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+                emit(sentinel)
 
         threading.Thread(target=producer, name="llm", daemon=True).start()
         parts: list[str] = []
         first_delta_ms = 0
-        while True:
-            item = await queue.get()
-            if item is sentinel:
-                break
-            if isinstance(item, BaseException):
-                raise item
-            if not first_delta_ms:
-                first_delta_ms = int((time.monotonic() - started) * 1000)
-            parts.append(item)
-            await self._send_json({"t": "llm_delta", "sid": self.sid, "text": item})
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                if not first_delta_ms:
+                    first_delta_ms = int((time.monotonic() - started) * 1000)
+                parts.append(item)
+                await self._send_json({"t": "llm_delta", "sid": self.sid, "text": item})
+        finally:
+            stop.set()  # 本轮取消/断连：让后台 SSE 线程停止继续读
         answer = "".join(parts).strip()
         self.stats.llm_rounds += 1
         self.stats.llm_first_ms = first_delta_ms
@@ -150,39 +166,59 @@ class DownlinkMixin:
                 await self._send_bin(frame.payload)
                 sent_frames += 1
                 sent_bytes += len(frame.payload)
+                self.stats.tts_frames += 1  # 逐帧记账：长 TTS 中途被取消时 stats 不再显示 0
+                self.stats.tts_bytes += len(frame.payload)
                 await self._pace_after_frame(index, frame.duration_ms)
             return sent_frames, sent_bytes
 
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
         sentinel = object()
+        stop = threading.Event()
+
+        def emit(item) -> bool:
+            """线程安全入队；已取消/事件循环关闭时返回 False，让合成线程停止继续生成。"""
+            if stop.is_set():
+                return False
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+            except RuntimeError:  # 事件循环已关闭（断连/进程退出）
+                return False
+            return True
 
         def producer() -> None:
             try:
                 for payload, duration_ms in source:
-                    loop.call_soon_threadsafe(queue.put_nowait, (payload, duration_ms))
+                    if not emit((payload, duration_ms)):
+                        return
             except BaseException as exc:  # noqa: BLE001 - 异常要回传主线程，不能吞
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
+                if not emit(exc):
+                    return
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+                emit(sentinel)
 
         thread = threading.Thread(target=producer, name="tts-qwen", daemon=True)
         thread.start()
         index = 0
-        while True:
-            item = await queue.get()
-            if item is sentinel:
-                break
-            if isinstance(item, BaseException):
-                raise item
-            payload, duration_ms = item
-            await self._send_bin(payload)
-            sent_frames += 1
-            sent_bytes += len(payload)
-            await self._pace_after_frame(index, duration_ms)
-            index += 1
-            if limit > 0 and index >= limit:
-                break
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                payload, duration_ms = item
+                await self._send_bin(payload)
+                sent_frames += 1
+                sent_bytes += len(payload)
+                self.stats.tts_frames += 1
+                self.stats.tts_bytes += len(payload)
+                await self._pace_after_frame(index, duration_ms)
+                index += 1
+                if limit > 0 and index >= limit:
+                    break
+        finally:
+            stop.set()  # 取消/断连时停止后台合成（MLX 生成很贵，别白跑几十秒）
         return sent_frames, sent_bytes
 
     def _late_bin_payload(self) -> bytes:
@@ -419,6 +455,8 @@ class DownlinkMixin:
                         await self._send_bin(payload)
                         sent_frames += 1
                         sent_bytes += len(payload)
+                        self.stats.tts_frames += 1
+                        self.stats.tts_bytes += len(payload)
                         await self._pace_after_frame(index, self.cfg.chunk_ms)
                 else:
                     frames = self.server.tts_mp3_frames
@@ -430,6 +468,8 @@ class DownlinkMixin:
                         await self._send_bin(frame.payload)
                         sent_frames += 1
                         sent_bytes += len(frame.payload)
+                        self.stats.tts_frames += 1
+                        self.stats.tts_bytes += len(frame.payload)
                         await self._pace_after_frame(index, frame.duration_ms)
                     if self.cfg.tts_stall_ms > 0 and self.cfg.tts_stall_at >= total:
                         self._log(
@@ -442,8 +482,7 @@ class DownlinkMixin:
                 await self._send_bin(self._late_bin_payload(), note="late-post")
             mode = "mp3" if (echo_source is not None or self.server.tts_mp3_frames is not None) else "synth"
             if not self.cfg.no_tts:
-                self.stats.tts_frames += sent_frames
-                self.stats.tts_bytes += sent_bytes
+                # tts_frames/tts_bytes 已在逐帧下发时记账（取消时也能看到真实进度）
                 self._log(
                     logging.INFO,
                     f"tts 下发完成 frames={sent_frames} bytes={sent_bytes} mode={mode}",

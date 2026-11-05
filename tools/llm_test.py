@@ -13,6 +13,7 @@
   export LLM_BASE_URL=https://<你的网关>/v1
   export LLM_MODEL=<模型名>
   export LLM_API_KEY=sk-...
+  export LLM_SESSION_ID=curl-test-001    # 可选：网关会话追踪头 X-Hermes-Session-Id
 
 用法：
   uv run tools/llm_test.py --text "今天天气怎么样？"
@@ -48,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--system", default=None, help="系统提示（默认取 LLM_SYSTEM_PROMPT）")
     p.add_argument("--max-tokens", type=int, default=None, help="最大输出 token（默认 256）")
     p.add_argument("--temperature", type=float, default=None, help="采样温度（默认 0.6）")
+    p.add_argument(
+        "--session-id",
+        default=None,
+        help="会话追踪（请求头 X-Hermes-Session-Id，默认取 LLM_SESSION_ID；空=不带）",
+    )
     p.add_argument("--no-stream", action="store_true", help="不用流式（一次性取完整答案）")
     return p
 
@@ -71,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         system=args.system,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        session_id=args.session_id,
     )
     try:
         cfg.require_ready()
@@ -78,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(str(exc)) from exc
 
     print(f"[LLM] {cfg.model} @ {cfg.endpoint}", flush=True)
+    if cfg.session_id:
+        print(f"[LLM] {llm_client.SESSION_HEADER}: {cfg.session_id}", flush=True)
     print(f"[LLM] 用户：{text}", flush=True)
     print("[LLM] 回答：", end="", flush=True)
 

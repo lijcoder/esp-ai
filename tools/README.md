@@ -19,6 +19,7 @@
 | `llm_client.py` | LLM 流式客户端（OpenAI 兼容 `/chat/completions`，纯标准库；mock `--llm` 与 `llm_test.py` 共用） | — |
 | `llm_test.py` | **离线 LLM 模块测试**（2026-11-04）：文字 → 大模型（流式）→ 文字，不需要开发板 | `LLM_API_KEY=sk-... uv run tools/llm_test.py --text "今天天气怎么样"`，见下文 |
 | `tts_test.py` | **离线 TTS 模块测试**（2026-11-04）：文字 → Qwen3-TTS（MLX）→ 本机扬声器流式播放/存盘，不需要开发板 | `uv run tools/tts_test.py --text "你好"`，见下文 |
+| `tts_console.py` | **控制台 TTS 播放**（2026-11-09）：连续输入文字 → Qwen3-TTS → 队列顺序播放，边输入边排队 | `uv run tools/tts_console.py`，见下文 |
 | `asr_test.py` | **离线 ASR 模块测试**（2026-11-04）：麦克风/音频文件 → SenseVoice → 文字，不需要开发板 | `uv run tools/asr_test.py --seconds 5`，见下文 |
 | `mock_tts.py` | mock 的本地 TTS 后端（Qwen3-TTS / MLX）：文字 → 24kHz MP3（可流式） | `uv run tools/mock_tts.py --text "你好" --out /tmp/x.mp3`，见下文 |
 | `prompt_gen.py` | **T3.5 提示音源生成**：可复现生成 4 条错误提示音源 WAV（`say`/`afconvert`，仅 macOS）；`--check` 复用 audio_pack 口径；**不再写 C 数组** | `uv run tools/prompt_gen.py`，见下文 |
@@ -1182,6 +1183,37 @@ uv run tools/tts_test.py --play-wav /tmp/reply.wav                      # 只播
 （假客户端）与真机测试的范围。
 
 **依赖**：`mlx-audio`/`numpy`/`sounddevice`/`soundfile`/`lameenc`/`huggingface_hub`/`av`（PEP 723）。
+
+## tts_console.py —— 控制台连续输入 → TTS → 排队播放
+
+**作用**：交互式"打字朗读"工具。输入一行文字就入队，**合成线程和播放线程解耦**：
+可以一边听当前一条、一边继续输入下一条；播放线程严格按入队顺序写声卡，不叠音。
+模型加载/合成/prompt 仍全部来自 `tools/mock_tts.py`（与 mock、`tts_test.py` 同一实现），
+本脚本只负责输入、队列、播放和统计，不复制 TTS 实现。
+
+```bash
+uv run tools/tts_console.py                          # 交互模式
+uv run tools/tts_console.py --voice ryan --instruct '用温柔的语气说'
+printf '你好。\n第二句。\n' | uv run tools/tts_console.py   # 管道/脚本模式
+uv run tools/tts_console.py --no-play                # 只合成不出声（自检）
+```
+
+**交互命令**：`/help`（或 `/h`）、`/clear`（或 `/c`，只丢尚未播放的排队）、`/quit`（或 `/q`，立即退出）；
+Ctrl+D = 读完输入、等队列播完再退出；Ctrl+C = 立即退出。以 `/` 开头但不是上述命令的文本按普通文字朗读。
+
+**实现/行为**：
+
+- 启动即后台加载 + 预热 Qwen3-TTS（约 3~15s，视缓存命中），**加载期间就可以先输入**，文字会排队；
+- 合成速度约 3x 实时；`audio_q` 最多缓存 3 条形成背压，播放线程常驻一个输出流，两条之间默认 120ms 静音（`--gap-ms`）；
+- 单条合成失败只跳过该条，不中断后续队列；声卡失败会收掉整条流水线并退出，避免队列永久卡住；
+- 复用 `mock_tts` 的 `MOCK_TTS_LOWPASS_HZ` / `MOCK_TTS_GAIN_DB` / `MOCK_TTS_PEAK_DBFS`，音色/语气同 mock；
+- 默认音色 `serena`；模型解析 `--model` → `QWEN_TTS_MODEL` → 本地 HF 缓存 → 默认 0.6B CustomVoice。
+
+**参数**：`--voice`、`--model`、`--lang`、`--instruct`、`--stream-interval`、`--gap-ms`、`--no-warmup`、`--no-play`。
+
+**验证（2026-11-09，M 系列 Mac）**：`printf` 两行 → 顺序合成/播放；pty 模拟“第一条播放中再输入第二条” →
+第二条在第一条 `[完成 #1]` 之后才 `[播放 #2]`（`播放#1 → 完成#1 → 播放#2 → 完成#2`）；`--no-play` 两条合成成功；
+`/clear` 丢弃 2 条排队；`/help` / `/quit` 正常。单条实测：加载 2.5s + 预热 3.0s + 合成 1.1s（2.96s 音频）。
 
 ## llm_client.py + llm_test.py —— LLM 模块测试（OpenAI 兼容流式，不需要开发板）
 

@@ -30,6 +30,7 @@ from mock_core import (
     Mp3Frame,
     parse_mp3_frames,
 )
+from mock_pipeline import LlmTtsPipeline, PipelineConfig, SegmenterConfig
 
 
 def module_speakable(text: str) -> bool:
@@ -54,20 +55,27 @@ class DownlinkMixin:
         head = b"\xff\xfb\x90\x64" + (index & 0xFFFF).to_bytes(2, "big")
         return (head + b"\x00" * size)[:size]
 
-    async def _llm_answer(self, text: str) -> str:
-        """ASR 文本 → LLM（OpenAI 兼容流式）→ 回答；边收边发 `llm_delta`。
-
-        阻塞的 SSE 读取放独立线程，增量经 asyncio 队列回主循环（不能堵 WS 收包/心跳）。
-        失败抛异常，由 `_tts_flow` 回退成"复读"（answer = ASR 文本）。
-        """
+    def _llm_config(self) -> llm_client.LlmConfig:
+        """--llm 的配置（地址/模型/token 只来自 CLI 或环境变量，不落文件）。"""
         cfg = self.cfg
-        lcfg = llm_client.LlmConfig.from_env(
+        return llm_client.LlmConfig.from_env(
             base_url=cfg.llm_base_url or None,
             api_key=cfg.llm_api_key or None,
             model=cfg.llm_model or None,
             system=cfg.llm_system or None,
             max_tokens=cfg.llm_max_tokens or None,
         )
+
+    async def _llm_answer(self, text: str) -> str:
+        """ASR 文本 → LLM（OpenAI 兼容流式）→ 回答；边收边发 `llm_delta`。
+
+        阻塞的 SSE 读取放独立线程，增量经 asyncio 队列回主循环（不能堵 WS 收包/心跳）。
+        失败抛异常，由 `_tts_flow` 回退成"复读"（answer = ASR 文本）。
+
+        注意：这是**非流水线**路径（等整段回答再交给 TTS）。`--llm --tts-qwen` 默认走
+        `_llm_tts_stream_flow()`：边出字边分句合成，首声更早。
+        """
+        lcfg = self._llm_config()
         started = time.monotonic()
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
@@ -121,6 +129,225 @@ class DownlinkMixin:
             f"总 {(time.monotonic() - started) * 1000:.0f}ms）：{answer[:40]!r}",
         )
         return answer
+
+    def _open_tts_stream(self):
+        """为流水线开一个多段连续 MP3 编码器（同一个编码器，段间无接缝）。"""
+        module = self.server.tts_qwen_module
+        assert module is not None
+        cfg = self.cfg
+        return module.Mp3SpeechStream(
+            model=cfg.tts_model or module.DEFAULT_MODEL,
+            voice=cfg.tts_voice or None,
+            lang_code=cfg.tts_lang,
+            instruct=cfg.tts_instruct,
+            stream_interval=cfg.tts_stream_interval,
+            log=lambda message: self._log(logging.INFO, message),
+        )
+
+    async def _begin_stream(self, sid: int | None, frames: list[tuple[bytes, float]],
+                            prebuffer_ms: float) -> tuple[float, int, int]:
+        """发 tts_start + 预缓冲帧（一次性灌给设备），之后由调用方按实时节奏发。
+
+        预缓冲的目的：设备起播只攒 4 帧（96ms），而 TTS 段与段之间会有首块延迟；
+        先给 800ms 音频，设备就有足够余量扛住段间抖动，不会一上来就 underrun。
+        返回 (首声时刻, 预缓冲帧数, 预缓冲字节数)。
+        """
+        cfg = self.cfg
+        if cfg.tts_late_bin:
+            # tts_start 之前：端侧还没开 0x02 接收窗口，必须丢弃（T2.4 契约 §2.3）
+            await self._send_bin(self._late_bin_payload(), note="late-pre")
+        await self._send_tts_start(sid, TTS_CODEC)
+        self._reset_pacing()
+        total_bytes = 0
+        for payload, _duration_ms in frames:
+            await self._send_bin(payload)
+            total_bytes += len(payload)
+            self.stats.tts_frames += 1
+            self.stats.tts_bytes += len(payload)
+        # 预缓冲帧已经一次发完，后面第一帧从这里开始按帧时长节流
+        self._pace_due = time.monotonic()
+        now = time.monotonic()
+        started_at = getattr(self, "_round_started_at", now)
+        self.stats.tts_first_audio_ms = int((now - started_at) * 1000)
+        self.stats.tts_prebuffer_ms = int(prebuffer_ms)
+        self._log(
+            logging.INFO,
+            f"[TTS] 首声 +{now - started_at:.2f}s（预缓冲 {prebuffer_ms:.0f}ms / "
+            f"{len(frames)} 帧；之后按实时节奏）",
+        )
+        return now, len(frames), total_bytes
+
+    async def _llm_tts_stream_flow(self, sid: int | None, text: str) -> None:
+        """LLM 流式输出 → 自然分句 → Qwen3-TTS 流式合成（边出字边播，2026-11-10）。
+
+        旧路径 `_llm_answer()` 要等 LLM **整段**回答写完，才把整段交给 TTS；长回答时设备在
+        THINKING 里干等。这里把 LLM 增量按标点切成语义段，第一段一到就交给 TTS；攒够
+        `tts_prebuffer_ms` 音频就 `tts_start`，LLM 还在出后续句子时设备已经在说话。
+
+        失败策略：LLM 没吐过内容 → 回退复读 ASR 文本（与旧行为一致）；TTS 中途失败 →
+        已下发的音频保留，提前 `tts_end`，不拖垮协议链路。
+        """
+        cfg = self.cfg
+        lcfg = self._llm_config()
+        module = self.server.tts_qwen_module
+        assert module is not None
+        log = lambda message: self._log(logging.INFO, message)  # noqa: E731
+
+        pipeline = LlmTtsPipeline(
+            text=text,
+            stream_llm=lambda: llm_client.stream_chat(text, lcfg),
+            open_tts=self._open_tts_stream,
+            config=PipelineConfig(
+                prebuffer_ms=cfg.tts_prebuffer_ms,
+                segmenter=SegmenterConfig(
+                    first_min_chars=cfg.tts_seg_first_chars,
+                    min_chars=cfg.tts_seg_min_chars,
+                    max_chars=cfg.tts_seg_max_chars,
+                    first_max_chars=cfg.tts_seg_first_max_chars,
+                    idle_ms=cfg.tts_seg_idle_ms,
+                    first_idle_ms=max(600, cfg.tts_seg_idle_ms + 150),
+                ),
+            ),
+            log=log,
+        )
+        pipeline.start(asyncio.get_running_loop())
+        self.stats.llm_stream_rounds += 1
+
+        prebuffer: list[tuple[bytes, float]] = []
+        prebuffer_ms = 0.0
+        started = False
+        sent_frames = 0
+        sent_bytes = 0
+        pace_index = 0
+        first_audio_at: float | None = None
+        llm_done_at: float | None = None
+        first_delta_logged = False
+        finished_answer = ""
+
+        try:
+            while True:
+                event = await pipeline.events.get()
+                kind = event[0]
+
+                if kind == "delta":
+                    if not first_delta_logged:
+                        first_delta_logged = True
+                        started_at = getattr(self, "_round_started_at", time.monotonic())
+                        self._log(
+                            logging.INFO,
+                            f"[LLM] 首包 +{time.monotonic() - started_at:.2f}s（首个 llm_delta）",
+                        )
+                    await self._send_json({"t": "llm_delta", "sid": sid, "text": event[1]})
+
+                elif kind == "llm_done":
+                    finished_answer, first_ms, ok = event[1], event[2], event[3]
+                    llm_done_at = time.monotonic()
+                    self.stats.llm_first_ms = first_ms
+                    self.stats.llm_chars += len(finished_answer)
+                    if ok:
+                        self.stats.llm_rounds += 1
+                    started_at = getattr(self, "_round_started_at", llm_done_at)
+                    self._log(
+                        logging.INFO,
+                        f"[LLM] {lcfg.model} 回答 {len(finished_answer)} 字"
+                        f"（首包 {first_ms}ms / 总 {(llm_done_at - started_at) * 1000:.0f}ms）："
+                        f"{finished_answer[:40]!r}",
+                    )
+
+                elif kind == "llm_error":
+                    self.stats.llm_errors += 1
+                    self._log(logging.WARNING, f"[LLM] 失败（回退/保留已生成部分）：{event[1]}")
+
+                elif kind == "segment":
+                    self.stats.tts_segments += 1
+                    age = event[2] if len(event) > 2 else 0.0
+                    self._log(
+                        logging.INFO,
+                        f"[TTS] 切段（{len(event[1])} 字，LLM 出字 +{age:.2f}s）：{event[1]!r}",
+                    )
+                    if not started and age > 8.0:
+                        self._log(
+                            logging.WARNING,
+                            f"[TTS] 首段等了 {age:.1f}s，接近端侧 THINKING 10s 超时；"
+                            "若真机先报 timeout，让 LLM 更快出首句或调小 --tts-seg-first-max-chars",
+                        )
+
+                elif kind == "tts_error":
+                    self.stats.tts_qwen_errors += 1
+                    self._log(logging.WARNING, f"[TTS] 合成失败（提前收尾）：{event[1]}")
+
+                elif kind == "frame":
+                    payload, duration_ms = event[1], event[2]
+                    if not started:
+                        prebuffer.append((payload, duration_ms))
+                        prebuffer_ms += duration_ms
+                        if prebuffer_ms + 1e-6 >= cfg.tts_prebuffer_ms:
+                            first_audio_at, count, nbytes = await self._begin_stream(
+                                sid, prebuffer, prebuffer_ms
+                            )
+                            sent_frames += count
+                            sent_bytes += nbytes
+                            prebuffer = []
+                            prebuffer_ms = 0.0
+                            started = True
+                    else:
+                        await self._send_bin(payload)
+                        sent_frames += 1
+                        sent_bytes += len(payload)
+                        self.stats.tts_frames += 1
+                        self.stats.tts_bytes += len(payload)
+                        await self._pace_after_frame(pace_index, duration_ms)
+                        pace_index += 1
+                        if cfg.max_tts_frames > 0 and sent_frames >= cfg.max_tts_frames:
+                            self._log(
+                                logging.INFO,
+                                f"达到 --max-tts-frames={cfg.max_tts_frames}，提前收尾",
+                            )
+                            break
+
+                elif kind == "tts_done":
+                    if not started:
+                        first_audio_at, count, nbytes = await self._begin_stream(
+                            sid, prebuffer, prebuffer_ms
+                        )
+                        sent_frames += count
+                        sent_bytes += nbytes
+                        prebuffer = []
+                        prebuffer_ms = 0.0
+                        started = True
+                    break
+
+        except asyncio.CancelledError:
+            pipeline.stop()
+            raise
+        finally:
+            pipeline.stop()
+
+        if not started:
+            # 没有任何音频帧（TTS 失败/文本为空）：也要让端侧走完 tts_start→tts_end，
+            # 否则设备会一直停在 THINKING 等云端响应超时。
+            first_audio_at, _, _ = await self._begin_stream(sid, [], 0.0)
+        await self._send_json({"t": "tts_end", "sid": sid})
+        if cfg.tts_late_bin:
+            await self._send_bin(self._late_bin_payload(), note="late-post")
+
+        if llm_done_at is not None and first_audio_at is not None:
+            overlap_ms = int((llm_done_at - first_audio_at) * 1000)
+            self.stats.tts_llm_overlap_ms = overlap_ms
+            if overlap_ms > 0:
+                self._log(
+                    logging.INFO,
+                    f"[TTS] 首声早于 LLM 完成 {overlap_ms}ms（流水线生效：LLM 还在出字，设备已开口）",
+                )
+            else:
+                self._log(
+                    logging.INFO,
+                    f"[TTS] 首声晚于 LLM 完成 {-overlap_ms}ms（回答较短/LLM 很快）",
+                )
+        self._log(
+            logging.INFO,
+            f"tts 下发完成 frames={sent_frames} bytes={sent_bytes} mode=pipeline",
+        )
 
     def _echo_frame_source(self, text: str):
         """回声测试的帧来源：默认**流式生成器**（边合成边下发），`--no-tts-stream` 时是整句帧列表。
@@ -356,6 +583,7 @@ class DownlinkMixin:
 
     async def _tts_flow(self, asr_packets: list[bytes] | None = None) -> None:
         sid = self.sid
+        self._round_started_at = time.monotonic()
         try:
             if self.cfg.think_ms > 0:
                 await asyncio.sleep(self.cfg.think_ms / 1000)
@@ -378,6 +606,20 @@ class DownlinkMixin:
             text = await self._asr_text(asr_packets)
             await self._send_json({"t": "asr_partial", "sid": sid, "text": text[: max(1, len(text) // 2)]})
             await self._send_json({"t": "asr_final", "sid": sid, "text": text})
+
+            # LLM 流式 → TTS 流水线（2026-11-10，默认路径）：
+            # 不等 LLM 整段回答，切出第一段就开始合成/下发；回答较长时首声明显提前。
+            # 默认走旧路径（整段回答后合成，语音更连贯）；`--llm-tts-stream` 才启用流水线。
+            if (
+                self.cfg.llm
+                and self.cfg.llm_tts_stream
+                and self.server.tts_qwen_module is not None
+                and self.cfg.tts_stream
+                and not self.cfg.no_tts
+                and not self.cfg.tts_bad_codec
+            ):
+                await self._llm_tts_stream_flow(sid, text)
+                return
 
             # 回答来源：--llm（大模型流式）或复读（默认，llm_delta 是识别文本切片）
             answer = text

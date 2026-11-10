@@ -40,8 +40,8 @@ from dataclasses import dataclass, field
 
 DEFAULT_SYSTEM = (
     "你是桌面语音助手，回答会被直接朗读出来。"
-    "要求：口语化、简洁（一般不超过 60 字）；不要用列表、代码、表情符号、markdown；"
-    "不要输出思考过程，只给最终回答。"
+    "要求：像跟朋友聊天一样自然、口语化，用完整的短句和正常标点；"
+    "一般不超过 60 字；不要用列表、代码、表情符号、markdown，也不要输出思考过程，只给最终回答。"
 )
 
 SESSION_HEADER = "X-Hermes-Session-Id"

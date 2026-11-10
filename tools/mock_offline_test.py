@@ -38,7 +38,9 @@
 判定（退出码 0/1）：
   - 收到 asr_final 且非空；
   - 收到 tts_start、至少 1 个 0x02 帧、tts_end；
-  - `--expect-llm`：回答文本（llm_delta 拼接）**不等于** ASR 文本（证明是 LLM 回答，不是复读）。
+  - `--expect-llm`：回答文本（llm_delta 拼接）**不等于** ASR 文本（证明是 LLM 回答，不是复读）；
+  - `--expect-pipeline`：首声早于 LLM 文本结束（要求 mock 启动时加 `--llm-tts-stream`）；
+  - `--expect-no-pipeline`：反过来断言（默认整段回答后合成）。
 
 超时口径：`--timeout` 是**空闲超时**（默认 60s，每收到一条下行消息就重置；0=不因空闲失败），
 `--max-total` 是总等待上限（默认 900s，0=不限）。读长文时音频按实时节奏下发，几十秒到几分钟
@@ -385,8 +387,20 @@ async def run(args) -> int:
         ),
         flush=True,
     )
-    if t_llm_last and t_tts_start and t_tts_start < t_llm_last:
-        print("[TEST] ⚠️ 发现 tts_start 早于 LLM 完成（顺序不对）", flush=True)
+    if t_llm_last and t_first_frame:
+        overlap_ms = (t_llm_last - t_first_frame) * 1000
+        if overlap_ms > 50:
+            print(
+                f"[TEST] 流水线：首声比 LLM 完成早 {overlap_ms:.0f}ms"
+                "（LLM 还在出字，设备已经开始播放）",
+                flush=True,
+            )
+        else:
+            print(
+                f"[TEST] 首声比 LLM 完成晚 {-overlap_ms:.0f}ms"
+                "（回答较短/LLM 很快；用 --expect-pipeline 可强制要求流水线）",
+                flush=True,
+            )
 
     failures: list[str] = []
     if not asr_final:
@@ -407,6 +421,15 @@ async def run(args) -> int:
         failures.append(f"mock 返回 error：{error}")
     if args.expect_llm and answer and asr_final and answer == asr_final:
         failures.append("回答与 ASR 文本完全相同 → 这是复读，不是 LLM 回答（检查 mock 是否带 --llm）")
+    if args.expect_pipeline:
+        if not (t_first_frame and t_llm_last and t_first_frame < t_llm_last):
+            failures.append(
+                "--expect-pipeline：首声没有早于 LLM 完成"
+                "（mock 未开流水线，或回答太短/LLM 太快；看上面时间线）"
+            )
+    if args.expect_no_pipeline:
+        if t_first_frame and t_llm_last and t_first_frame < t_llm_last:
+            failures.append("--expect-no-pipeline：首声早于 LLM 完成（mock 意外开启了流水线）")
 
     if args.out and down:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -449,6 +472,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-total", type=float, default=900.0,
                    help="总等待上限（秒）：防「一直有数据但永不 tts_end」；0=不限")
     p.add_argument("--expect-llm", action="store_true", help="断言回答 != ASR 文本（证明走的是 LLM）")
+    p.add_argument(
+        "--expect-pipeline",
+        action="store_true",
+        help="断言首声早于 LLM 文本结束（证明 mock 的 LLM→TTS 流水线生效）",
+    )
+    p.add_argument(
+        "--expect-no-pipeline",
+        action="store_true",
+        help="断言首声不早于 LLM 完成（默认整段合成路径；mock 未加 --llm-tts-stream 时用）",
+    )
     return p
 
 

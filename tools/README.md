@@ -5,6 +5,9 @@
 | 文件 | 用途 | 用法 |
 |---|---|---|
 | `ws_mock_server.py` | 本地「云端」WS 模拟服务（T1.5 / T2.4），设备联调不用等后端 | 见下文 |
+| `mock_pipeline.py` | **LLM→TTS 流水线**（2026-11-10）：LLM 流式增量 → 自然分句 → Qwen3-TTS 边合成边下发（纯标准库、可单测） | 被 `ws_mock_server.py --llm --tts-qwen` 使用 |
+| `mock_pipeline_test.py` | 流水线/分句离线自测（22 项，不需要设备/模型） | `uv run tools/mock_pipeline_test.py` |
+| `fake_llm_server.py` | 本地假 OpenAI 兼容流式 LLM（无 token 也能验证 mock 流水线） | `uv run tools/fake_llm_server.py --port 8799` |
 | `voice_test.py` | 语音链路真机自动自测：唤醒 + 交互语音回放 + 串口断言 | `uv run tools/voice_test.py --volume 50`，见下文 |
 | `lexin.wav` | 唤醒词"嗨，乐鑫"测试音频，**替代人工喊话** | `afplay tools/lexin.wav`，见下文 |
 | `今天天气如何.wav` | 交互语音素材（模拟用户提问），**替代人工说话** | `afplay tools/今天天气如何.wav`，见下文 |
@@ -26,10 +29,11 @@
 | `prompts_src/` | T3.5 提示音**唯一源**：5 条 16 kHz/16 bit/mono 源 WAV + `manifest.json`（PCM sha256/样本数），提交 git | 见「提示音资源」 |
 | `record_wav.py` | 串口采集 WAV，用于唤醒/AEC 实测（**T5.2 计划，尚未实现**） | — |
 
-### `ws_mock_server.py` 的实现结构（2026-11-03 拆分，行为不变）
+### `ws_mock_server.py` 的实现结构（2026-11-03 拆分；2026-11-10 增流水线模块）
 
-入口只做 CLI 分发；实现拆到同目录 6 个模块，`uv run tools/ws_mock_server.py ...` 的用法、参数、
-日志格式、`--self-test` 全部不变（拆分前后逐函数 AST 比对 78/78 一致）：
+入口只做 CLI 分发；实现拆到同目录模块，`uv run tools/ws_mock_server.py ...` 的用法、参数、
+日志格式、`--self-test` 保持兼容（2026-11-03 拆分前后逐函数 AST 比对 78/78 一致；2026-11-10
+只新增 `mock_pipeline.py` 与流水线参数，未改原有协议路径）：
 
 | 模块 | 职责 |
 |---|---|
@@ -37,7 +41,8 @@
 | `mock_cli.py` | 命令行参数、启动校验、`Config` 装配、ASR/Qwen3-TTS 后端加载（含模型预热） |
 | `mock_core.py` | 协议帧编解码 / MP3 帧解析 / `Config` / `Stats` / 日志 |
 | `mock_server.py` | `Session`（握手/心跳/上行/事件分派/music 骨架）+ `MockServer`（accept、TCP_NODELAY、启动横幅） |
-| `mock_downlink.py` | `DownlinkMixin`：ASR 文本、TTS 音频（合成帧 / 真实 MP3 / Qwen3-TTS 流式复读）、节奏与欠载注入、错误注入 |
+| `mock_downlink.py` | `DownlinkMixin`：ASR 文本、TTS 音频（合成帧 / 真实 MP3 / Qwen3-TTS 流式复读 / **LLM→TTS 流水线**）、节奏与欠载注入、错误注入 |
+| `mock_pipeline.py` | LLM 增量→分句→TTS 的线程编排（`SpeechSegmenter` + `LlmTtsPipeline`），只依赖标准库 |
 | `mock_self_test.py` | 19 项进程内自测（`--self-test`；也可 `uv run tools/mock_self_test.py` 单独跑） |
 | `mock_fixtures.py` | 自测/错误注入共用的内嵌真实 MP3（22 帧 / 528 ms） |
 
@@ -1261,6 +1266,54 @@ uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc
 一轮变成：`audio_end → asr_final（识别文本）→ llm_delta ×N（真增量）→ tts_start → 0x02 帧 → tts_end`。
 失败（网络/超时/5xx）自动回退"复读 ASR 文本"，不打断协议链路，`stats` 里记 `LLM n 轮/m 失败`。
 
+### LLM 边出字边播（流水线，2026-11-10 可选；默认关闭）
+
+> **默认不启用**：实测按标点分句会让语音在句间不够连贯（用户 2026-11-10 反馈），所以
+> `--llm --tts-qwen` 默认仍是"LLM 整段回答写完再合成"。需要更早首声时再加 `--llm-tts-stream`。
+
+加 `--llm-tts-stream` 后不再等 LLM **整段**回答写完才合成：LLM 的每个 SSE 增量都会进入
+`mock_pipeline.SpeechSegmenter`，按标点切成语义段（句末标点优先；首段可在逗号处提前断；
+超长/LLM 停顿时兜底断并补逗号表示未说完），第一段一到就交给 Qwen3-TTS。多段共用**同一个
+MP3 编码器**（`mock_tts.Mp3SpeechStream`），不是拼接多段 MP3，因此没有比特池重置/接缝爆音。
+攒够 `--tts-prebuffer-ms`（默认 800ms）音频后发 `tts_start`，之后按帧时长实时下发——
+**LLM 还在出后面的字，设备已经开始说话**。
+
+```bash
+# 默认：LLM 整段回答写完再合成（语音更连贯）
+uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+  tools/ws_mock_server.py --asr sensevoice --tts-qwen --llm
+
+# 可选：边出字边合成（首声更早，但句间可能不够连贯）
+uv run ... tools/ws_mock_server.py --asr sensevoice --tts-qwen --llm --llm-tts-stream
+```
+
+**自然度**：分句保留标点（段末语调由 TTS 自己处理）；右引号/括号并入本段；首段优先上限
+`--tts-seg-first-max-chars`（默认 48，允许再等 12 字找标点），只有超过 60 字仍无标点才硬断并补逗号；
+想更早出声可调到 24~32，但长句可能被断开（听感会打折）。`--tts-instruct` 默认
+"用清晰、爽朗、像聊天一样自然的语气说"，要别的语气直接覆盖（如 `--tts-instruct "用温柔的语气说"`）。
+
+**可调参数**（仅 `--llm-tts-stream` 时生效）：`--tts-prebuffer-ms`（800）、
+`--tts-seg-first-chars`（8）、`--tts-seg-min-chars`（6）、`--tts-seg-max-chars`（48）、
+`--tts-seg-first-max-chars`（48）、`--tts-seg-idle-ms`（450）。
+
+**离线实测（2026-11-10，`--llm-tts-stream`，本机 Qwen3-TTS 已预热，假 LLM 出 45 字/约 4.9s）**：
+`asr_final +0.30s → LLM 首包 +1.44s → tts_start/首声 +2.41s → LLM 完成 +4.90s`，
+**首声比 LLM 完成早 2.50s**；389 帧 / 112,032 B / 9.34s 音频，`tts_end` 后无欠载。
+默认路径（不加 `--llm-tts-stream`）：同一假 LLM 下 `tts_start` 在 LLM 完成后约 +0.06s、
+首帧 255ms、首声 +1.74s，`--expect-no-pipeline` PASS（语音整段合成，句间更连贯）。
+
+**日志怎么读（2026-11-10 修）**：`[LLM] 首包 +X` → `[TTS] 切段（N 字，LLM 出字 +X）`
+→ `[TTS] 首段到达 +X（等 LLM 出完第一段）` → `[TTS] 首帧 X（本段合成，从段开始计）`
+→ `[TTS] 首声 +X` → `[TTS] 首声早于 LLM 完成 Xms`。
+`首段到达`/`切段` 是**等 LLM** 的时间，`首帧` 才是 **TTS 合成时延**；旧版日志把等 LLM
+的时间也算进"首帧"，所以慢模型会看到 `[TTS] 首帧 7s+`，但 TTS 实际首帧仍约 0.2~0.7s。
+首段优先上限默认 48 字（`--tts-seg-first-max-chars`，另允许 12 字 lookback），只有超过 60 字
+仍无标点才硬断，避免为了追首声把句子从词中间切开。
+
+**限制**：TTS 生成速度必须快于实时（本机预热后约 2.3~3x）；若 LLM 在段间停顿超过已缓冲音频，
+设备仍会欠载（这是"边出字边播"的固有取舍，加大 `--tts-prebuffer-ms` 可缓解）。多设备同时连
+同一个 mock 会共用同一个 Qwen3-TTS 单例，不建议并发。
+
 ## mock_offline_test.py —— 不接开发板，验证 mock 的 ASR→LLM→TTS 整轮
 
 **作用**：扮演"假设备"连上正在跑的 mock：`hello → audio_start → 上行 Opus 帧（从 WAV 编码）→ audio_end`，
@@ -1278,17 +1331,23 @@ uv run tools/mock_offline_test.py --text "今天天气怎么样？" --expect-llm
 uv run tools/mock_offline_test.py --text "帮我讲个笑话" --voice vivian
 uv run tools/mock_offline_test.py --expect-llm                                  # 默认 WAV
 uv run tools/mock_offline_test.py --wav tools/今天吃了什么.wav --play
+uv run tools/mock_offline_test.py --wav tools/今天天气如何.wav --expect-llm   # 默认整段合成
+uv run tools/mock_offline_test.py --wav tools/今天天气如何.wav --expect-llm --expect-pipeline
+  # ↑ 要求 mock 启动时加了 --llm-tts-stream
+uv run tools/mock_offline_test.py --expect-no-pipeline   # mock 默认（未加 --llm-tts-stream）时
 ```
 
 `--text` 的意思是：**把你写的文字先用本地 Qwen3-TTS 合成成"用户说的话"，再走 Opus 上行**——
 所以整条链路是 `你的文字 →（本地 TTS）→ 设备上行音频 → mock ASR → LLM → Qwen3-TTS → 回答音频`，
 想测什么话就写什么话，不需要录音、不需要开发板。
 
-**阶段时间线**：脚本会打印 `上行结束 → asr_final → LLM 首包 → LLM 完成 → tts_start → 首个音频帧/开始播放`，
-用来确认顺序正确：**ASR 出文本、LLM 出完整回答之后，才 tts_start，然后边收 TTS 帧边播**（`tts_start` 早于 LLM 完成会告警）。
+**阶段时间线**：脚本会打印 `上行结束 → asr_final → LLM 首包 → LLM 完成 → tts_start → 首个音频帧/开始播放`。
+加了 `--llm-tts-stream` 时 `tts_start` 早于 LLM 完成是正常的（脚本会打印"首声比 LLM 完成早 Xms"）；
+`--expect-pipeline` 强制断言这一点，`--expect-no-pipeline` 反过来断言（默认整段合成路径用）。
 
 **判定**（退出码 0/1）：收到非空 `asr_final`、`tts_start`、≥1 个 0x02 帧、`tts_end`；
-`--expect-llm` 额外断言"回答 ≠ ASR 文本"（证明是 LLM 回答而不是复读）。
+`--expect-llm` 额外断言"回答 ≠ ASR 文本"（证明是 LLM 回答而不是复读）；
+`--expect-pipeline` 断言首声早于 LLM 文本结束。
 
 **超时口径（2026-11-05 修）**：`--timeout` 是**空闲超时**（每收到一条下行消息就重置，默认 60s），
 `--max-total` 是总等待上限（默认 900s，0=不限）。旧版是"固定 60s 总时长"，读长文
@@ -1299,13 +1358,48 @@ uv run tools/mock_offline_test.py --wav tools/今天吃了什么.wav --play
 客户端 67.5s 收齐 `tts_end` → **PASS**（旧版 60s 必 FAIL）；mock 侧 `--tts-stall-ms 5000`
 制造断流时，`--timeout 2` 在 2s 判空闲超时、`--max-total 2` 在 2s 判总时长超限，两种都给出明确原因。
 
-**实测（2026-11-04，mock 带 `--llm`）**：
+**实测（2026-11-10，mock `--llm --tts-qwen` + 本地假 LLM，流水线默认）**：
+`asr_final +0.30s → LLM 首包 +1.44s → tts_start/首声 +2.41s → LLM 完成 +4.90s`，
+首声比 LLM 完成早 **2,499ms**；389 帧 / 112,032 B / 9.34s 音频 → `--expect-pipeline` PASS。
+复跑命令见 `fake_llm_server.py` 章节。
+
+**实测（2026-11-04，mock 带 `--llm`，旧路径：等整段回答）**：
 - `--wav tools/今天天气如何.wav` → `asr_final='今天天气如何？'` → LLM 回答 53 字 →
   `tts_start→首帧 353ms`、349 帧 / 8.38s 音频、总 17.15s；
 - `--text "今天天气怎么样？"`（本地合成 1.60s 语音）→ `asr_final='今天天气怎么样？'` →
   LLM 回答 45 字 → 首帧 **427ms**、399 帧 / **9.58s 音频**、总 12.21s；均 **PASS**。
 - `--text "你好，给我讲一个很短的笑话" --play`（**实时播放**）→ ASR 一致 → 回答 9.65s 音频、
   首帧 405ms、总 12.28s（边收边播，播放与接收重叠，不再等整段收完）。
+
+## fake_llm_server.py —— 本地假 LLM：没有 token / 外网也能测流水线
+
+**作用**：起一个只实现 `/v1/chat/completions`（SSE 流式）的本地 HTTP 服务，回答固定、出字节奏可控，
+让 `ws_mock_server.py --llm` 的**真实 SSE 路径**（`llm_client`）和 LLM→TTS 流水线可以被确定性验证，
+不需要 `LLM_API_KEY`，也不会因为网关抖动让测试忽快忽慢。
+
+```bash
+# 终端 A：假 LLM（--answer 里带标点，便于验证分句；--first-delay-ms 模拟首包慢）
+uv run tools/fake_llm_server.py --port 8799 \
+  --answer "今天天气不错，适合出门散步。傍晚可能会有点风，记得带件外套。要不要我帮你查一下具体的温度？" \
+  --first-delay-ms 800 --chunk-chars 2 --chunk-delay-ms 80
+
+# 终端 B：mock 指向假 LLM（token/model 随便填；用 --asr none 时 --tts-text 就是"识别文本"）
+uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+  tools/ws_mock_server.py --llm --llm-base-url http://127.0.0.1:8799/v1 \
+  --llm-model fake --llm-api-key fake --tts-qwen --asr none \
+  --tts-text "今天天气怎么样？"
+
+# 终端 C：假设备验证"边出字边播"
+uv run tools/mock_offline_test.py --wav tools/今天天气如何.wav --expect-llm --expect-pipeline
+```
+
+**参数**：`--host`（127.0.0.1）、`--port`（8799）、`--answer`、`--chunk-chars`（3）、
+`--chunk-delay-ms`（70）、`--first-delay-ms`（600）、`--echo-user`（回答前复述问题）。
+启动会打印 `FAKE_LLM_LISTENING http://127.0.0.1:<port>/v1`；`/health` 返回 `{"ok":true}`。
+它同时支持 `stream:false`，所以也可直接 `llm_test.py` 连它做连通性测试。
+
+**实测（2026-11-10）**：上面三条命令跑通，`mock_offline_test --expect-pipeline` PASS
+（首声比 LLM 完成早 2.5s）；`llm_test.py` 连它首包 0.14s / 20 字总 0.31s。
 
 ## asr_test.py —— 离线 ASR 模块测试（SenseVoice，不需要开发板）
 
@@ -1355,6 +1449,11 @@ uv run tools/ws_mock_server.py --tts-mp3 /tmp/reply.mp3 --tts-pace-pct 80
 
 **参数**：`--text`/`--text-file`/stdin、`--out`、`--model`、`--voice`、`--lang`、`--instruct`、`--bitrate`。
 
+**两个对外复用点（2026-11-10）**：
+`stream_pcm(text)` 只产 float32 PCM（电平/低通/增益已处理），`Mp3SpeechStream` 把**多段文本**喂进
+**同一个 MP3 编码器**（`add(text)` / `flush()`），段间不重置比特池、没有拼接接缝——
+mock 的 LLM→TTS 流水线（`mock_pipeline.py`）就用它；`stream_frames(text)` 保持原来的单段流式接口。
+
 **实测（2026-11-04，M 系列 Mac，冷启动）**：模型 `load()` 1.4~2.1s（页缓存命中）~15.7s（首次下载后）；
 **第一次 `generate()` 还要付 ~2.9s 的 MLX kernel 预热**——所以 `preload()` 会在加载后跑一句「嗯。」把预热做掉
 （mock 启动总耗时 ~4.8s），**之后每次首块只要 ~0.2s**。
@@ -1374,8 +1473,9 @@ RBJ 低通（默认 `0`=关；常用 `7000` 或 `5500`；跨块保持滤波器�
 觉得有编码噪声/颗粒时先设 `128`。码率越高，下行 0x02 帧每帧字节越多（24ms/帧 → 128kbps≈384B/帧），
 设备侧 ring 足够（64KB ≈ 4s）。
 
-**限制**：需要 Apple Silicon + MLX；模型 2.3GB、常驻约 1.2GB 内存；单句首次合成要等 prefill ≈3s；
-长文本仍整段生成（不做按句切分）。
+**限制**：需要 Apple Silicon + MLX；模型 2.3GB、常驻约 1.2GB 内存；单句首次合成要等 prefill ≈3s。
+单独跑 `mock_tts.py` 时仍按传入文本整段生成；**分句/边出字边合成**在 mock 的 `--llm` 路径里由
+`mock_pipeline.py` + `Mp3SpeechStream` 完成（见上文「LLM 边出字边播」）。
 
 ## 回声测试：ASR 识别文本 → Qwen3-TTS 复读（不要固定文案）
 
@@ -1394,8 +1494,9 @@ uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc
 - **流式下发（默认）**：生成器跑在独立线程，MP3 帧边生成边按 24ms/帧节奏发 `0x02`；
   首帧约在 `tts_start` 后 **~0.2s**（模型已预热时；未预热/首次调用会多 ~2.9s）。
   `--no-tts-stream` 退回"整句合成完再发"。
-  ⚠️ 若本机该句的生成 RTF **<1**（首句常见），流式下发会在设备侧欠载（断续）；
-  想要稳定优先用 `--no-tts-stream`（先整句合成，再按实时节奏下发，设备端 buffer 充足）。
+  ⚠️ 若本机该句的生成 RTF **<1**（首句/冷启动常见），流式下发会在设备侧欠载（断续）；
+  预热后实测约 2.3~3x 实时。仍不稳时用 `--no-tts-stream`（先整句合成，再按实时节奏下发）；
+  LLM 路径默认的 800ms 预缓冲已能吸收大部分段间抖动。
 - mock 侧日志：`[ASR] 识别结果` → `[TTS] 首帧 x.xx s` → `[TTS] 合成完成：N.NNs 音频` →
   `tts 下发完成 frames=N mode=mp3`。
 - 可调：`--tts-model`、`--tts-voice`（默认 serena）、`--tts-lang`、`--tts-instruct`、
@@ -1409,11 +1510,15 @@ uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc
 ```
 设备 → mock:  audio_start{sid}  →  [上行 0x01 二进制帧...]  →  audio_end{sid}
 mock → 设备:  （--think-ms 延时，模拟云端思考）
-              asr_partial{sid,text} → asr_final{sid,text} → llm_delta{sid,text} × N
+              asr_partial{sid,text} → asr_final{sid,text} → llm_delta{sid,text} × k
               → tts_start{sid,codec:"mp3",sr:24000} → 0x02 二进制帧
                 （缺省合成帧 × --max-tts-frames；--tts-mp3 时 = MP3 帧数，按帧时长实时节奏）
               → tts_end{sid}
 ```
+
+> **LLM→TTS 流水线（2026-11-10 默认）**：`tts_start` 不再等 `llm_delta × N` 全部发完；
+> 第一段文本合成出 ~800ms 音频就起播，之后 **0x02 帧与剩余 llm_delta 交错**下发，
+> 直到 LLM 结束、最后一段 TTS 播完才 `tts_end`。协约字段/顺序约束不变（同一 sid、窗口内 0x02）。
 
 `--tts-late-bin` 会在 `tts_start` 前、`tts_end` 后各多注入 1 帧 0x02（窗口外，端侧应丢弃）；
 `--tts-stall-ms/--tts-stall-at` 在指定帧后停发 n ms（制造端侧欠载），两者缺省关闭、不影响既有协议测试口径。

@@ -525,7 +525,17 @@ def _tts_mode_line(server: MockServer) -> str:
                 else ""
             )
         )
-    if server.tts_qwen_module is not None:
+    if server.tts_qwen_module is not None and cfg.llm:
+        pipeline = (
+            f"LLM→TTS 流水线（边出字边合成/下发，预缓冲 {cfg.tts_prebuffer_ms}ms）"
+            if cfg.llm_tts_stream
+            else "LLM 整段回答后合成（默认；语音更连贯）"
+        )
+        mode = (
+            f"TTS 模式: {pipeline}（LLM 回答 → Qwen3-TTS {cfg.tts_voice} → 24k MP3，"
+            f"节奏={cfg.tts_pace_pct}%）"
+        )
+    elif server.tts_qwen_module is not None:
         mode = (
             f"TTS 模式: 回声（ASR 识别文本 → Qwen3-TTS {cfg.tts_voice} → 24k MP3，"
             f"按帧下发，节奏={cfg.tts_pace_pct}%）"

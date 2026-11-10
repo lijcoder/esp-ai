@@ -335,27 +335,40 @@ def encode_pcm_to_mp3(pcm: np.ndarray, *, bitrate: int | None = None) -> bytes:
     return b"".join(payloads)
 
 
+def stream_pcm(text: str, *, model: str = DEFAULT_MODEL, voice: str | None = DEFAULT_VOICE,
+               lang_code: str = "auto", instruct: str = "",
+               stream_interval: float = 0.5, log=print):
+    """流式：yield **float32 PCM 块**（已做低通/峰值归一/增益，未编码）。
+
+    `stream_frames()` 与 `Mp3SpeechStream` 共用这一层；想自己控制 MP3 编码器
+    （例如多段文本共用一条连续 MP3 流）时用它，避免重复实现电平处理。
+    """
+    if not speakable_text(text):
+        raise RuntimeError(f"没有可合成的文字（{text!r}）")
+    engine = get_engine(model=model, voice=voice, lang_code=lang_code, instruct=instruct,
+                        stream_interval=stream_interval, log=log)
+    peak_dbfs = env_peak_dbfs()
+    fc = env_lowpass_hz()
+    lowpass = [BiquadLowpass(fc), BiquadLowpass(fc)] if fc > 0 else []
+    for pcm, _sr in engine.stream(text):
+        for stage in lowpass:
+            pcm = stage.process(pcm)
+        pcm = normalize_peak(pcm, peak_dbfs)
+        pcm = apply_gain(pcm)
+        yield pcm
+
+
 def stream_frames(text: str, *, model: str = DEFAULT_MODEL, voice: str | None = DEFAULT_VOICE,
                   lang_code: str = "auto", instruct: str = "",
                   stream_interval: float = 0.5, bitrate: int | None = None, log=print):
     """流式：yield (mp3 帧 payload, 帧时长 ms)。首帧只在第一块解码完成后就吐出来。"""
     bitrate = bitrate or env_bitrate()
-    if not speakable_text(text):
-        raise RuntimeError(f"没有可合成的文字（{text!r}）")
-    engine = get_engine(model=model, voice=voice, lang_code=lang_code, instruct=instruct,
-                        stream_interval=stream_interval, log=log)
     encoder = Mp3StreamEncoder(rate=TARGET_RATE, bitrate=bitrate)
-    peak_dbfs = env_peak_dbfs()
-    fc = env_lowpass_hz()
-    lp = [BiquadLowpass(fc), BiquadLowpass(fc)] if fc > 0 else []
     total = 0.0
     first_at: float | None = None
     started = time.monotonic()
-    for pcm, _sr in engine.stream(text):
-        for stage in lp:
-            pcm = stage.process(pcm)
-        pcm = normalize_peak(pcm, peak_dbfs)
-        pcm = apply_gain(pcm)
+    for pcm in stream_pcm(text, model=model, voice=voice, lang_code=lang_code,
+                          instruct=instruct, stream_interval=stream_interval, log=log):
         for payload, duration_ms in encoder.feed(pcm):
             total += duration_ms
             if first_at is None:
@@ -366,6 +379,78 @@ def stream_frames(text: str, *, model: str = DEFAULT_MODEL, voice: str | None = 
         total += duration_ms
         yield payload, duration_ms
     log(f"[TTS] 合成完成：{total / 1000:.2f}s 音频 / {time.monotonic() - started:.2f}s 墙钟")
+
+
+class Mp3SpeechStream:
+    """多段文本 → **一条连续 MP3 流**（同一个编码器，段间没有重编码接缝）。
+
+    LLM→TTS 流水线用：每一小段合成完就 `encoder.feed()`，主循环可以立刻下发；
+    段与段之间不会重新初始化 lame/比特池，句末停顿由 Qwen3-TTS 自己生成。
+    """
+
+    def __init__(self, *, model: str = DEFAULT_MODEL, voice: str | None = DEFAULT_VOICE,
+                 lang_code: str = "auto", instruct: str = "",
+                 stream_interval: float = 0.5, bitrate: int | None = None, log=print) -> None:
+        self._encoder = Mp3StreamEncoder(rate=TARGET_RATE, bitrate=bitrate or env_bitrate())
+        self._synth = {
+            "model": model,
+            "voice": voice,
+            "lang_code": lang_code,
+            "instruct": instruct,
+            "stream_interval": stream_interval,
+        }
+        self._log = log
+        self._created = time.monotonic()
+        self._last_done_at: float | None = None
+        self._first_at: float | None = None
+        self.segments = 0
+        self.total_ms = 0.0
+
+    def add(self, text: str):
+        """合成一段并 yield 完整 MP3 帧；段间共用同一个编码器。"""
+        if not speakable_text(text):
+            return
+        self.segments += 1
+        started = time.monotonic()
+        # 这一段是不是让 TTS 线程等了一会儿？把"等 LLM 出字"与"本段合成"分开报，
+        # 否则首帧日志会把 LLM 的首包/首句延迟算进 TTS，看起来像 TTS 很慢。
+        if self._last_done_at is None:
+            wait_s = started - self._created
+            if wait_s > 0.2:
+                self._log(f"[TTS] 首段到达 +{wait_s:.2f}s（等 LLM 出完第一段，TTS 还没开始合成）")
+        else:
+            wait_s = started - self._last_done_at
+            if wait_s > 0.2:
+                self._log(f"[TTS] 段 {self.segments} 开始：距上段结束 {wait_s:.2f}s（TTS 在等 LLM）")
+        segment_ms = 0.0
+        for pcm in stream_pcm(text, **self._synth, log=self._log):
+            for payload, duration_ms in self._encoder.feed(pcm):
+                segment_ms += duration_ms
+                self.total_ms += duration_ms
+                if self._first_at is None:
+                    # 从**本段开始**算，不含等 LLM 的时间；这才是 TTS 首帧时延
+                    self._first_at = time.monotonic() - started
+                    self._log(f"[TTS] 首帧 {self._first_at:.2f}s（本段合成，从段开始计）")
+                    if self._first_at > 2.0:
+                        self._log(
+                            f"[TTS] 首帧偏慢（正常预热后约 0.2~0.7s）：检查 mock 启动时是否打印"
+                            "「预热完成」、是否多个 mock 进程抢同一块 GPU/CPU，或首段是否过长"
+                        )
+                yield payload, duration_ms
+        self._last_done_at = time.monotonic()
+        self._log(
+            f"[TTS] 段 {self.segments}：{len(text)} 字 → {segment_ms / 1000:.2f}s 音频 / "
+            f"{self._last_done_at - started:.2f}s 合成（累计 {self.total_ms / 1000:.2f}s）"
+        )
+
+    def flush(self):
+        for payload, duration_ms in self._encoder.flush():
+            self.total_ms += duration_ms
+            yield payload, duration_ms
+        self._log(
+            f"[TTS] 流水线合成完成：{self.segments} 段 / {self.total_ms / 1000:.2f}s 音频"
+            + (f" / 首帧 {self._first_at:.2f}s" if self._first_at is not None else "")
+        )
 
 
 def synthesize_mp3(text: str, *, model: str = DEFAULT_MODEL, voice: str | None = DEFAULT_VOICE,

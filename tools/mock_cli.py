@@ -72,7 +72,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="预置音色：serena/vivian/uncle_fu/ryan/aiden/ono_anna/sohee/eric/dylan")
     parser.add_argument("--tts-lang", default="auto",
                         help="语言提示：auto/chinese/english/…")
-    parser.add_argument("--tts-instruct", default="",
+    parser.add_argument("--tts-instruct", default="用清晰、爽朗、像聊天一样自然的语气说",
                         help="风格指令（自然语言，如 '用温柔的语气说'）")
     parser.add_argument("--tts-stream-interval", type=float, default=0.32,
                         help="流式块时长（秒）：越小首帧越早、块越多")
@@ -90,6 +90,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--llm-api-key", default="", help="Bearer token（空=LLM_API_KEY；不建议写进命令行）")
     parser.add_argument("--llm-system", default="", help="系统提示（空=LLM_SYSTEM_PROMPT）")
     parser.add_argument("--llm-max-tokens", type=int, default=0, help="最大输出 token（0=LLM_MAX_TOKENS/256）")
+    # ---- 2026-11-10：LLM 流式输出 → 分句 → TTS 流式合成（边出字边播） ----
+    parser.add_argument(
+        "--llm-tts-stream",
+        action="store_true",
+        help="启用 LLM→TTS 流水线：LLM 边出字、按标点分句、边合成边下发"
+             "（首声更早，但分句会让语音不够连贯；默认关）",
+    )
+    parser.add_argument(
+        "--tts-prebuffer-ms",
+        type=int,
+        default=800,
+        help="流水线起播前预缓冲音频毫秒数（抵消 TTS 首块/段间抖动；0=收到第一帧就起播）",
+    )
+    parser.add_argument("--tts-seg-first-chars", type=int, default=8,
+                        help="首段最少字数（尽早出声，但太短会不自然）")
+    parser.add_argument("--tts-seg-min-chars", type=int, default=6,
+                        help="后续段最少字数")
+    parser.add_argument("--tts-seg-max-chars", type=int, default=48,
+                        help="单段硬上限（超过强制在标点/词边界断）")
+    parser.add_argument("--tts-seg-first-max-chars", type=int, default=48,
+                        help="首段硬上限（比后续段小，保证第一声更早）")
+    parser.add_argument("--tts-seg-idle-ms", type=int, default=450,
+                        help="LLM 停顿多久后兜底断段（毫秒）")
     # ---- T2.4：真实 MP3 下发（契约 §6） ----
     parser.add_argument(
         "--tts-mp3",
@@ -179,6 +202,24 @@ def _validate_args(args: argparse.Namespace) -> int:
         )
     if args.error_code < 0:
         raise SystemExit(f"--error-code 必须 >= 0（当前 {args.error_code}）")
+    if args.tts_prebuffer_ms < 0:
+        raise SystemExit(f"--tts-prebuffer-ms 必须 >= 0（当前 {args.tts_prebuffer_ms}）")
+    if args.tts_seg_first_chars < 2:
+        raise SystemExit(f"--tts-seg-first-chars 必须 >= 2（当前 {args.tts_seg_first_chars}）")
+    if args.tts_seg_min_chars < 2:
+        raise SystemExit(f"--tts-seg-min-chars 必须 >= 2（当前 {args.tts_seg_min_chars}）")
+    if args.tts_seg_max_chars < max(args.tts_seg_first_chars, args.tts_seg_min_chars):
+        raise SystemExit(
+            f"--tts-seg-max-chars（{args.tts_seg_max_chars}）不能小于首段/后续段最少字数"
+            f"（{args.tts_seg_first_chars}/{args.tts_seg_min_chars}）"
+        )
+    if not args.tts_seg_first_chars <= args.tts_seg_first_max_chars <= args.tts_seg_max_chars:
+        raise SystemExit(
+            f"--tts-seg-first-max-chars（{args.tts_seg_first_max_chars}）必须在"
+            f"首段最少字数（{args.tts_seg_first_chars}）与单段硬上限（{args.tts_seg_max_chars}）之间"
+        )
+    if args.tts_seg_idle_ms < 50:
+        raise SystemExit(f"--tts-seg-idle-ms 必须 >= 50（当前 {args.tts_seg_idle_ms}）")
     max_tts_frames = args.max_tts_frames
     if max_tts_frames is None:
         # 真实音频（固定 MP3 / 回声合成）默认全发；合成帧默认 100 帧 ≈ 2s
@@ -233,6 +274,13 @@ def config_from_args(args: argparse.Namespace) -> Config:
         llm_model=args.llm_model,
         llm_system=args.llm_system,
         llm_max_tokens=args.llm_max_tokens,
+        llm_tts_stream=args.llm_tts_stream,
+        tts_prebuffer_ms=args.tts_prebuffer_ms,
+        tts_seg_first_chars=args.tts_seg_first_chars,
+        tts_seg_min_chars=args.tts_seg_min_chars,
+        tts_seg_max_chars=args.tts_seg_max_chars,
+        tts_seg_first_max_chars=args.tts_seg_first_max_chars,
+        tts_seg_idle_ms=args.tts_seg_idle_ms,
         error_code=args.error_code,
         error_stage=args.error_stage,
         tts_bad_codec=args.tts_bad_codec,
@@ -299,8 +347,9 @@ def load_tts_qwen(args: argparse.Namespace) -> object | None:
         raise SystemExit(f"Qwen3-TTS 加载失败：{exc}") from exc
     mode = "流式" if not args.no_tts_stream else "整句"
     if args.llm:
-        LOG.info("TTS 回答已启用：LLM 回答 → Qwen3-TTS %s（%s下发；模型 %s）",
-                 args.tts_voice, mode, args.llm_model or os.environ.get("LLM_MODEL", ""))
+        pipeline = "流水线（边出字边合成/下发）" if args.llm_tts_stream else "整段回答后合成（默认，语音更连贯）"
+        LOG.info("TTS 回答已启用：LLM 回答 → Qwen3-TTS %s（%s；%s；模型 %s）",
+                 args.tts_voice, mode, pipeline, args.llm_model or os.environ.get("LLM_MODEL", ""))
     else:
         LOG.info("TTS 复读已启用：ASR 文本 → Qwen3-TTS %s（%s下发）", args.tts_voice, mode)
         LOG.info("提示：当前是【复读模式】（回答 = 识别文本）。要大模型回答请加 --llm "

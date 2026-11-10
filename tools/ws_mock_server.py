@@ -44,12 +44,21 @@ T3.1 测试用的「真 ASR」（可选，独立实现见 tools/mock_asr.py，�
   用真实识别结果；识别失败/无声时回退 `--tts-text`（只 WARN，不打断协议链路）。
   离线验证识别效果：uv run tools/mock_asr.py --test tools/今天天气如何.wav
 
-T3.1 回声测试（ASR 识别文本 → 本地 Piper 复读，不要固定文案）：
+T3.1 回声测试（ASR 识别文本 → 本地 Qwen3-TTS 复读，不要固定文案）：
   uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
     tools/ws_mock_server.py --asr sensevoice --tts-qwen
-  设备说的话先被识别，再用 Piper 把识别文本合成 24k MP3 下发给设备复读；
+  设备说的话先被识别，再用 Qwen3-TTS 把识别文本合成 24k MP3 下发给设备复读；
   识别文本会走 asr_partial/asr_final，合成失败只 WARN 并回退合成帧。
   （--tts-qwen 与 --tts-mp3 互斥；模型默认 mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16）
+
+LLM 边出字边播（2026-11-10，可选；默认仍是整段回答后合成）：
+  # 默认：等 LLM 整段回答写完再合成（语音更连贯）
+  uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+    tools/ws_mock_server.py --asr sensevoice --tts-qwen --llm
+  # 可选：边出字边合成（首声更早，但分句会让语音不够连贯）
+  uv run ... tools/ws_mock_server.py --asr sensevoice --tts-qwen --llm --llm-tts-stream
+  流水线开启后：增量按标点切成语义段 → 第一段交给 Qwen3-TTS → 攒够
+  --tts-prebuffer-ms（默认 800ms）就 tts_start，LLM 还在出字设备已开口。
 
 传输说明：本地 mock 是 ws://（不加密）；线上契约是 wss://（ARCH §6.1）。
 TLS/证书策略在 T1.4 决定，见 docs/PRODUCT_IDEAS.md §8 X2。
@@ -57,11 +66,12 @@ TLS/证书策略在 T1.4 决定，见 docs/PRODUCT_IDEAS.md §8 X2。
 TTS 帧攒成 ~200ms 一批，造成「mock 均匀发、端侧却 underrun」的假欠载（T2.4-C2）。
 
 
-实现位置（2026-11-03 拆分，行为不变；本文件只保留入口）：
+实现位置（2026-11-03 拆分；本文件只保留入口）：
   mock_core.py      协议帧 / MP3 帧解析 / Config / Stats / 日志
-  mock_downlink.py  下行 TTS 流（合成帧 / 真实 MP3 / Piper 复读）、ASR 文本、错误注入
+  mock_downlink.py  下行 TTS 流（合成帧 / 真实 MP3 / Qwen3-TTS 复读 / LLM→TTS 流水线）、ASR 文本、错误注入
+  mock_pipeline.py  LLM 增量 → 自然分句 → TTS 的线程编排（仅标准库，可单测）
   mock_server.py    Session + MockServer + TCP_NODELAY + 启动横幅
-  mock_cli.py       命令行参数、校验、Config 装配、ASR/Piper 后端加载
+  mock_cli.py       命令行参数、校验、Config 装配、ASR/Qwen3-TTS 后端加载
   mock_self_test.py 19 项进程内自测（`--self-test`）
   mock_fixtures.py  自测/错误注入共用的内嵌真实 MP3
 """

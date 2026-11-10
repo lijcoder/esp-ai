@@ -109,6 +109,16 @@
 
 ---
 
+### PV-010 · mock LLM→TTS 流水线在真机上的首声/欠载/打断回归
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-10 11:30（采样）**，工具优化收尾时登记 |
+| 来源 | mock 新增可选流水线 `--llm-tts-stream`（2026-11-10，默认关闭）：开启后 LLM 边出字、按标点分句、Qwen3-TTS 边合成边下发，`tts_start` 可能早于 LLM 完成，0x02 与剩余 `llm_delta` 交错 |
+| 现象/问题 | 离线假设备（`mock_offline_test --expect-pipeline`）已验证首声早于 LLM 完成 2.2~2.5s、9s 音频无欠载；但**未在 ESP32 真机**验证设备端 `THINKING→SPEAKING` 时序、R1/R2、播放连续性、按键打断/断网收尾。端侧代码按 sid/窗口处理事件，理论上兼容，但真机 ring/解码/节奏仍需实测 |
+| 验收方法 | 回板后跑 `uv run tools/voice_cloud_test.py`（单轮 + `--followup --followup-rounds 2`）、`uv run tools/e2e_voice_test.py`、`uv run tools/tts_stream_test.py`；观察 `VS` 迁移、`PLAYER: stream ... underrun=0`、`round done`、R2、无 ERROR；再默认（不加 `--llm-tts-stream`）做一次 A/B |
+| 关闭条件 | 真机 ≥2 轮：首声早于 LLM 完成、`underrun=0`、R2 正常、无 ERROR/断流；按键打断与中途断网各 1 次正常回 IDLE |
+| 关联 | `tools/mock_pipeline.py`、`tools/README.md`「LLM 边出字边播」、STATUS §3 2026-11-10 行、PROTOCOL §3.2 |
+
 ## 3. 待决定 / 已被暂缓（PD）
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）

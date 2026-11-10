@@ -231,6 +231,14 @@ class Config:
     llm_model: str = ""            # 空=LLM_MODEL 环境变量（模型名不写进文件）
     llm_system: str = ""           # 空=LLM_SYSTEM_PROMPT（语音助手口径）
     llm_max_tokens: int = 0        # 0=LLM_MAX_TOKENS（默认 256）
+    # ---- 2026-11-10：LLM 流式输出 → 分句 → TTS 流式合成（边出字边播） ----
+    llm_tts_stream: bool = False   # False=默认整段回答后合成（语音更连贯）；True=边出字边合成（--llm-tts-stream）
+    tts_prebuffer_ms: int = 800     # 起播前预缓冲音频毫秒数（抵消 TTS 首块/段间抖动）
+    tts_seg_first_chars: int = 8    # 首段最少字数（尽早出声）
+    tts_seg_min_chars: int = 6      # 后续段最少字数
+    tts_seg_max_chars: int = 48     # 单段硬上限
+    tts_seg_first_max_chars: int = 48  # 首段硬上限（更小 = 首声更早）
+    tts_seg_idle_ms: int = 450      # LLM 停顿多久后兜底断段
     # ---- T3.6：错误提示（云端错误码/报错时机/坏 codec 注入；error_prompt_test.py 用） ----
     error_code: int = 1                   # --scenario error 下发的 error.code（默认 1=通用）
     error_stage: str = "after-audio-end"  # audio_end 后 / asr_final 后 / tts_start+真实 MP3 帧后
@@ -270,6 +278,11 @@ class Stats:
     llm_errors: int = 0        # --llm：失败轮数（回退复读文本）
     llm_first_ms: int = 0      # --llm：最近一轮首包时延（ms）
     llm_chars: int = 0         # --llm：累计回答字数
+    llm_stream_rounds: int = 0 # 流水线轮数（LLM 未结束就开始 TTS）
+    tts_segments: int = 0      # 流水线切出的语音段数
+    tts_first_audio_ms: int = 0  # 从 audio_end 到首声的毫秒数
+    tts_llm_overlap_ms: int = 0  # 首声比 LLM 完成早多少 ms（>0 = 流水线生效）
+    tts_prebuffer_ms: int = 0    # 实际预缓冲毫秒数
 
     def summary(self) -> str:
         duration = time.monotonic() - self.started_at
@@ -284,6 +297,12 @@ class Stats:
             extra += (
                 f" | LLM {self.llm_rounds} 轮/{self.llm_errors} 失败"
                 f"（首包 {self.llm_first_ms}ms，共 {self.llm_chars} 字）"
+            )
+        if self.llm_stream_rounds:
+            extra += (
+                f" | 流水线 {self.llm_stream_rounds} 轮/{self.tts_segments} 段"
+                f"（首声 {self.tts_first_audio_ms}ms，预缓冲 {self.tts_prebuffer_ms}ms，"
+                f"早于 LLM 完成 {self.tts_llm_overlap_ms}ms）"
             )
         if self.asr_rounds or self.asr_errors:
             extra += (

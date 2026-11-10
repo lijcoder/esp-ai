@@ -156,10 +156,12 @@
 | 编号 | 任务 | 产出 |
 |---|---|---|
 | T4.1 | 源抽象：`source_http`（流式拉取、超时/重试；**只做远端 URL，不做 `source_file`**，2026-11-10 用户决定） | 远端 URL 可播放 |
-| T4.2 | `music_cloud`：`music_request` 请求、`music_track` 解析、`music_status` 每 5s 上报 | 音乐协议闭环 |
-| T4.3 | `music_session`：播放/暂停/继续/停止/切歌、状态机、与语音抢占 | 音乐控制完整 |
+| T4.2 | **`music_cloud`（2026-11-10 完成，构建口径）**：`music_track`/`music_control` 解析、`mid` 过滤、`music_status` 每 5s 上报；**`music_request`（端侧主动点歌）与 `pause/resume` 执行移入 T4.3**（ARCH §6.3 边界） | 音乐协议闭环（真机待板 PV-013） |
+| T4.3 | `music_session`：播放/暂停/继续/停止/切歌、状态机、与语音抢占；**含 T4.2 移入的 `music_request` 与 `pause/resume` 执行（需给 `source_http` 加暂停能力）** | 音乐控制完整 |
 | T4.4 | 音乐 ducking（-12dB）与"音乐播放中唤醒"流程 | 语音优先体验 |
 | T4.5 | 播放稳定性：预缓冲 200ms、断流重试、错误恢复 | 长播不中断 |
+
+> **T4.2 完成（2026-11-10，构建通过、真机待板 PV-013）**：新增 `music_cloud`（L3，不建任务）——WS 附加订阅槽解析 `music_track`/`music_control`，按连接内 `mid` 过滤（track 只收更新的、control 允许等于当前曲目），起播/切歌在 `esp_timer` 串行执行（切歌先 stop 再 play，120ms×15 重试），播放中每 5s 上行 `music_status{state,mid,progress_ms}` + 状态变化立即一次，周期定时器兼任 EOF/失败探测；`pause/resume` 只解析计数（执行归 T4.3）；`voice_cloud` 对音乐事件静默跳过；`diag` 增 `mc status|report|reset`。构建：bin 1,982,880 B / 总镜像 1,982,760 B / 静态 DIRAM 201,046 B（+784 B），无新任务。数据见 [STATUS.md](STATUS.md) §5。
 
 **验收**：连续播放 30 分钟无卡顿；起播 < 1.5s；唤醒时音乐 duck 正常、会话后恢复。
 

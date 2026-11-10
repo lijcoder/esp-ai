@@ -22,7 +22,7 @@ PROTOCOL §3）。这样既不需要网关支持 tool calling，也不会出现�
 
 纯标准库（不依赖 websockets），可单独单测；HTTP 服务用守护线程，mock 退出即结束。
 
-## 契约（2026-11-10 提议，T4.2 定稿）
+## 契约（2026-11-10 提议，T4.2 端侧已实现）
 
 下行：
   {"t":"music_track","mid":1,"url":"http://…/x.mp3","codec":"mp3","duration_ms":…,"title":"…"}

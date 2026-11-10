@@ -245,7 +245,7 @@ class Session(DownlinkMixin):
                 self._log(
                     logging.WARNING,
                     "music_track 的 url 不可播放：T1.5 不提供 HTTP 音频服务（P4 前补），"
-                    "且音乐事件 mid 归属契约待 T4.2 定稿（见 PROTOCOL.md 待确认项 P-3）",
+                    "（音乐事件 mid 归属已定稿：PROTOCOL P-3，端侧 music_cloud 自 T4.2 起实现）",
                 )
             else:
                 self._log(logging.WARNING, "scenario 非 music，不回 music_track（--scenario music 可测）")

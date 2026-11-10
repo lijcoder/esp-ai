@@ -94,14 +94,14 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 | `audio_end` | VAD 静音 800ms 或累计 8s（或调试 `vc stop`） | `sid`(uint16) | `{"t":"audio_end","sid":1}` |
 | `interrupt` | 用户打断（R4：T3.2 已实现，`voice_session`→`vc_interrupt()`；发后立即本地作废本轮，不等应答） | `sid`(uint16) | `{"t":"interrupt","sid":1}` |
 | `ping` | 每 20s | 无 | `{"t":"ping"}` |
-| `music_request` | 音乐控制（P4） | `action`(str)、`id`/`index`(int) | `{"t":"music_request","action":"play","id":"a1","index":0}` |
-| `music_status` | 播放状态上报（P4） | `state`(str)、`progress_ms`(int) | `{"t":"music_status","state":"playing","progress_ms":12000}` |
+| `music_request` | 音乐控制（端侧主动点歌，T4.3 实现；当前仅 mock 支持） | `action`(str)、`id`/`index`(int) | `{"t":"music_request","action":"play","id":"a1","index":0}` |
+| `music_status` | 播放状态上报（T4.2 已实现）：播放中每 5s + 每次状态变化立即一次 | `state`(str，`playing`/`stopped`/`error`)、`mid`(uint16)、`progress_ms`(int) | `{"t":"music_status","state":"playing","mid":1,"progress_ms":12000}` |
 
 `audio_end` 的收尾原因由端侧日志区分（`vad-silence` / `max-duration` / `stop-request`），**不上报文**（避免与服务端字段耦合）。
 
 ### 3.2 下行事件
 
-| `t` | 字段 | 示例 | 端侧处理（T2.5） |
+| `t` | 字段 | 示例 | 端侧处理（T2.5/T4.2） |
 |---|---|---|---|
 | `hello_ack` | `ver`(int) | `{"t":"hello_ack","ver":1}` | 传输层消费，进入 READY |
 | `asr_partial` | `sid`(uint16)、`text`(str) | `{"t":"asr_partial","sid":1,"text":"今天天气"}` | 投 `APP_EVT_ASR_PARTIAL` + 回调 |
@@ -111,8 +111,8 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 | `tts_end` | `sid` | `{"t":"tts_end","sid":1}` | 投 `APP_EVT_TTS_END` + 回调；关闭窗口、本轮结束 |
 | `error` | `sid`、`code`(int)、`msg`(str) | `{"t":"error","sid":1,"code":3001,"msg":"TTS failed"}` | ERROR 日志 + 回调；结束本轮，不自动重试 |
 | `pong` | 无 | `{"t":"pong"}` | 传输层消费（RTT 用端侧 tick 计算） |
-| `music_track` | `mid`(uint16)、`url`、`codec`、`duration_ms`（**0 = 直播流/时长未知**）、`title`（可选 `artist`） | `{"t":"music_track","mid":1,"url":"http://192.168.1.5:9000/x.mp3","codec":"mp3","duration_ms":269000,"title":"晴天"}` | T4.2 实现；当前端侧记 WARN 后忽略 |
-| `music_control` | `mid`(uint16)、`action`(`pause`/`resume`/`stop`) | `{"t":"music_control","mid":1,"action":"pause"}` | T4.2 实现；下一首/上一首不发它，改用新的 `music_track` |
+| `music_track` | `mid`(uint16)、`url`、`codec`、`duration_ms`（**0 = 直播流/时长未知**）、`title`（可选 `artist`） | `{"t":"music_track","mid":1,"url":"http://192.168.1.5:9000/x.mp3","codec":"mp3","duration_ms":269000,"title":"晴天"}` | **T4.2 已实现（`music_cloud`）**：`url` 只接受 `http(s)` 且 ≤ 320B，`codec` 必须是 `mp3`；`mid` 必须比当前新（同 mid 视为重复、不重复起播），否则丢弃计数；接受后 `audio_player_music_play_url(url)` |
+| `music_control` | `mid`(uint16)、`action`(`pause`/`resume`/`stop`) | `{"t":"music_control","mid":1,"action":"pause"}` | **T4.2 已实现（`music_cloud`）**：`stop` → `audio_player_music_stop_url()`；`pause`/`resume` 只计数 + WARN（执行归 T4.3）；允许 `mid == 当前曲目`、只丢弃更旧的；下一首/上一首不发它，改用新的 `music_track` |
 
 ### 3.3 `sid` 规则与迟到帧过滤
 
@@ -120,11 +120,12 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 - 服务端下发语音事件时必须原样回填 `sid`；
 - 端侧规则：**无 `sid`、`sid` 非法、或与当前轮次不一致的事件一律丢弃**，计入 `vc status` 的「sid 丢弃」；不报错、不结束本轮。
 - 迟到帧过滤已用 mock `--inject-late`（每轮注入一个 `sid+1` 的 `asr_final`）做真机验证；T3.1 回归仍 50/50 PASS。
-- **音乐事件不吃 `sid`**（P-3）：`music_track` / `music_control` 用连接内自增的 `mid`，因为音乐可以跨语音轮次、也可在没有会话时开始；端侧按 `t` 分流，`voice_cloud` 的 `sid` 过滤只作用于语音事件。
+- **音乐事件不吃 `sid`**（P-3）：`music_track` / `music_control` 用连接内自增的 `mid`，因为音乐可以跨语音轮次、也可在没有会话时开始；端侧按 `t` 分流，`voice_cloud` 的 `sid` 过滤只作用于语音事件（音乐事件在 `voice_cloud` 里静默跳过，不 WARN、不计入 sid 丢弃）。
+- **`mid` 过滤（T4.2 落地）**：`music_track` 只接受比当前**更新**的 `mid`（同 `mid` 丢弃为重复）；`music_control` 允许 `mid == 当前曲目`（暂停/停止本就指向这首），只丢弃更旧的；WS 断链后清比较基准（新连接内 `mid` 重新计数，音乐本身可继续播）。
 
 ### 3.4 未知事件 / 非法文本
 
-- 未定义的 `t`（如音乐事件在 T2.5 阶段）：WARN 一次后忽略，不影响当前轮次；
+- 未定义的 `t`：WARN 一次后忽略，不影响当前轮次（音乐事件自 T4.2 起由 `music_cloud` 处理，不在本行范围内）；
 - 非 JSON 文本帧或缺少 `t`：计入「解析失败」，WARN 后丢弃（服务端契约违例）。
 
 ## 4. 错误码表（定稿 P-4）
@@ -177,7 +178,7 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 |---|---|---|
 | P-1 | `hello` 是否有应答 | ✅ T1.4：服务端必须回 `hello_ack`（5s 超时） |
 | P-2 | 二进制帧如何关联 `sid` | ✅ T2.5：帧头不加 `sid`，按 `audio_start → tts_end` 顺序归属（§2.3） |
-| P-3 | 音乐事件 `sid` 生成方/作用域 | 🟡 **方案已定（2026-11-10）**：音乐事件用**独立 `mid`**（连接内自增，不复用语音 `sid`；理由见 §3.3）。mock 已按此实现（`--music`）；端侧 `music_cloud` 在 T4.2 落地后转 ✅ |
+| P-3 | 音乐事件 `sid` 生成方/作用域 | ✅ **已定稿（2026-11-10，T4.2 端侧落地）**：音乐事件用**独立 `mid`**（连接内自增，不复用语音 `sid`；理由与过滤规则见 §3.3）。mock 的 `--music` 与端侧 `music_cloud` 均已按此实现 |
 | P-4 | `error` 错误码表 | ✅ T2.5：码表见 §4 |
 | P-5 | 鉴权失败关闭码 | ✅ T1.4：应用关闭码 4001/4002 |
 | P-6 | `pong` 字段与 RTT 口径 | ✅ T1.4：固定 `{"t":"pong"}`，RTT 端侧 tick |

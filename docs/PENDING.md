@@ -139,6 +139,16 @@
 | 关闭条件 | 脚本全 PASS：首声 <1500ms、稳态 underruns=0、stop ≤3s 且任务消失、内部堆停止后回落（≤4KB 残留）、无 ERROR/panic；电台流连续 60s 无欠载；结果回写 STATUS §5 并关闭本项 |
 | 关联 | `components/audio_player/source_http.c`、`include/audio_player.h`（music API）、`components/diag/diag.c`（`music`）、`tools/music_play_test.py`、STATUS §3 2026-11-10 T4.1 行、ARCH §3.7/§9.3 |
 
+### PV-013 · T4.2 `music_cloud` 真机验证（板子未连接）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-10 18:4x（采样）**，T4.2 固件构建通过后登记 |
+| 来源 | T4.2（`music_cloud`：`music_track`/`music_control` 解析、`mid` 过滤、5s `music_status`）实现完成；本机仍只有 Bluetooth/debug console，无 USB 串口，无法烧录 |
+| 现象/问题 | 构建通过不等于链路通，需验证：① mock `--music` 点歌 → 设备拉到 mock 内置 HTTP 的示例曲目并出声；② `mc status` 的 state/mid/progress/URL 与 `music stat` 一致；③ `music_status` 每 ~5s 一条、字段正确，stop 后有一条 `stopped`；④ `music_control stop` 能让音乐 ≤1s 内淡出停止；⑤ `pause`/`resume` 按设计**只 WARN + 计数、不改变状态、不误停**；⑥ `mid` 过滤：重复 `music_track`（同 mid）不重复起播、过期 mid 丢弃（可用 `ws send` 注入）；⑦ 切歌：新 `music_track` 到达时先停旧流再起新流（重试窗口内不报错）；⑧ 错误路径：非 http(s) URL、404、`codec:"pcm"` 只 WARN/ERROR 计数、不崩 |
+| 验收方法 | 回板后：`uv run tools/ws_mock_server.py --music` + 设备 `CONFIG_AI_WS_URL` 指向 mock → 说「嗨，乐鑫 → 放首歌」→ `mc status` 看 state=playing/mid/progress 递增、mock 日志出现 `music_status`；再说「停止」看设备 `MC state playing → stopped`；用 `ws send` 注入同 mid/旧 mid 的 `music_track` 验重复与过期丢弃；注入非 http(s) URL 与 `codec:"pcm"` 验拒绝路径；最后 `sys heap`/`sys tasks` 采播放期与停止后数值 |
+| 关闭条件 | 真机 ≥1 轮点歌出声（设备拉流成功、`mc status` 显示 playing、mock 收到 ≥2 条 `music_status`）；stop 1 次生效且上报 stopped；pause/resume 各 1 次按"忽略且不误停"验收；重复/过期 mid 各丢弃 1 次；无 ERROR/panic；结果回写 STATUS §5 并关闭本项 |
+| 关联 | `components/music_cloud/`、`components/diag/diag.c`（`mc`）、`components/voice_cloud/voice_cloud.c`（音乐事件跳过）、`tools/ws_mock_server.py --music`、PROTOCOL §3.1/§3.2/§7（P-3）、STATUS §3 2026-11-10 T4.2 行、ARCH §6.3/§8.3 |
+
 ## 3. 待决定 / 已被暂缓（PD）
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）
@@ -223,6 +233,7 @@
 
 - **2026-11-10 16:2x（采样）**：新增 PV-011（M1 音乐链路真机验证）；同日 P-3 按「音乐事件用独立 `mid`」定稿建议落地到 mock 与 PROTOCOL。
 - **2026-11-10 18:1x（采样）**：新增 PV-012（T4.1 真机验证）；T4.1 固件构建通过，但本机无 USB 串口，未烧录。
+- **2026-11-10 18:4x（采样）**：新增 PV-013（T4.2 `music_cloud` 真机验证）；T4.2 固件构建通过（bin 1,982,880 B / DIRAM 201,046 B），仍无 USB 串口。
 
 | 时间（Asia/Shanghai） | 事件 |
 |---|---|

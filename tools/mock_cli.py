@@ -156,6 +156,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help='tts_start 用 codec="pcm" 后发 tts_end、不发音频帧（触发设备侧 TTS 无法播放 → 失败提示音）',
     )
+    # ---- 2026-11-10：M1 音乐（mock 侧意图/曲库/内置 HTTP；不需要 Hermes 支持 tools） ----
+    parser.add_argument(
+        "--music",
+        action="store_true",
+        help="启用音乐意图：ASR 文本命中控制/点歌规则时下发 music_track / music_control（不进 LLM）",
+    )
+    parser.add_argument(
+        "--music-url",
+        default="",
+        help="固定曲目 URL（真机联调）；缺省用内置 HTTP 服务下发示例曲目",
+    )
+    parser.add_argument(
+        "--music-title",
+        default="",
+        help="--music-url 的显示名（电台/直播流用；缺省取 URL 文件名）",
+    )
+    parser.add_argument(
+        "--music-catalog",
+        default="",
+        help='JSON 曲库：{"tracks":[{"title","artist","url","duration_ms","keywords"}]}',
+    )
+    parser.add_argument(
+        "--music-http-port",
+        type=int,
+        default=0,
+        help="内置音乐 HTTP 端口（0=随机；仅 --music 且无 --music-url 时启用）",
+    )
+    parser.add_argument(
+        "--music-search-url",
+        default="",
+        help="通用搜索端点：GET 返回 {\"tracks\":[{\"title\",\"url\",\"duration_ms\"}]}；"
+             "用 {query} 占位（缺省自动补 ?q=）",
+    )
+    parser.add_argument(
+        "--music-search-timeout-ms",
+        type=int,
+        default=3000,
+        help="搜索超时毫秒（超时/失败回退本地曲库）",
+    )
     parser.add_argument("--self-test", action="store_true", help="进程内自测，不需要硬件")
     return parser.parse_args(argv)
 
@@ -224,6 +263,24 @@ def _validate_args(args: argparse.Namespace) -> int:
     if max_tts_frames is None:
         # 真实音频（固定 MP3 / 回声合成）默认全发；合成帧默认 100 帧 ≈ 2s
         max_tts_frames = 0 if (args.tts_mp3 or args.tts_qwen) else 100
+    if (args.music_url or args.music_catalog) and not args.music:
+        raise SystemExit("--music-url / --music-catalog 需要配合 --music 一起用")
+    if args.music_title and not args.music_url:
+        raise SystemExit("--music-title 只对 --music-url 生效（曲库里的标题请写在 JSON 里）")
+    if args.music_search_url and not args.music:
+        raise SystemExit("--music-search-url 需要配合 --music 一起用")
+    if args.music_search_url and not args.music_search_url.startswith(("http://", "https://")):
+        raise SystemExit(f"--music-search-url 只支持 http/https（当前 {args.music_search_url!r}）")
+    if not 200 <= args.music_search_timeout_ms <= 30000:
+        raise SystemExit(f"--music-search-timeout-ms 必须在 200~30000（当前 {args.music_search_timeout_ms}）")
+    if args.music_catalog and not Path(args.music_catalog).is_file():
+        raise SystemExit(f"--music-catalog 文件不存在：{args.music_catalog}")
+    if args.music_url and not args.music_url.startswith(("http://", "https://")):
+        raise SystemExit(f"--music-url 只支持 http/https（当前 {args.music_url!r}）")
+    if not 0 <= args.music_http_port <= 65535:
+        raise SystemExit(f"--music-http-port 必须在 0~65535（当前 {args.music_http_port}）")
+    if args.music and args.scenario == "error":
+        LOG.warning("--music 与 --scenario error 同开：error 分支在 ASR 之前返回，音乐意图不会触发")
     if args.asr_max_seconds <= 0:
         raise SystemExit(f"--asr-max-seconds 必须 > 0（当前 {args.asr_max_seconds}）")
     if args.asr_threads < 1:
@@ -284,6 +341,13 @@ def config_from_args(args: argparse.Namespace) -> Config:
         error_code=args.error_code,
         error_stage=args.error_stage,
         tts_bad_codec=args.tts_bad_codec,
+        music=args.music,
+        music_url=args.music_url,
+        music_title=args.music_title,
+        music_catalog=args.music_catalog,
+        music_http_port=args.music_http_port,
+        music_search_url=args.music_search_url,
+        music_search_timeout_ms=args.music_search_timeout_ms,
         quiet=args.self_test,
         verbose=args.verbose,
     )

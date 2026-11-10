@@ -243,6 +243,14 @@ class Config:
     error_code: int = 1                   # --scenario error 下发的 error.code（默认 1=通用）
     error_stage: str = "after-audio-end"  # audio_end 后 / asr_final 后 / tts_start+真实 MP3 帧后
     tts_bad_codec: bool = False           # tts_start 用 codec="pcm" 且不发音频帧（设备侧 TTS 失败）
+    # ---- 2026-11-10：M1 音乐（mock 侧意图/曲库/内置 HTTP；见 tools/mock_music.py） ----
+    music: bool = False            # --music：ASR 文本识别音乐意图 → music_track / music_control
+    music_url: str = ""            # 固定曲目 URL（真机联调）；空则用内置 HTTP 示例曲目
+    music_title: str = ""          # --music-url 的显示名（电台/直播流用，确认语里会念）
+    music_catalog: str = ""        # JSON 曲库文件（track 列表）
+    music_http_port: int = 0       # 内置 HTTP 端口（0=随机；--music 且无 --music-url 时启用）
+    music_search_url: str = ""     # 通用搜索端点（{query} 占位符；返回 JSON tracks）
+    music_search_timeout_ms: int = 3000  # 搜索超时（ms），失败回退本地曲库
     quiet: bool = False          # 自测用：只打 WARN 及以上
     verbose: bool = False        # 打印上行 payload 前 16 字节
 
@@ -283,6 +291,10 @@ class Stats:
     tts_first_audio_ms: int = 0  # 从 audio_end 到首声的毫秒数
     tts_llm_overlap_ms: int = 0  # 首声比 LLM 完成早多少 ms（>0 = 流水线生效）
     tts_prebuffer_ms: int = 0    # 实际预缓冲毫秒数
+    # ---- 2026-11-10：M1 音乐（mock 侧意图/曲库） ----
+    music_intents: int = 0       # 命中的音乐意图数（含控制）
+    music_tracks: int = 0        # 下发的 music_track 数
+    music_controls: int = 0      # 下发的 music_control 数
 
     def summary(self) -> str:
         duration = time.monotonic() - self.started_at
@@ -309,6 +321,10 @@ class Stats:
                 f" | ASR {self.asr_rounds} 轮成功/{self.asr_errors} 失败"
                 f"（音频 {self.asr_audio_ms}ms / 推理 {self.asr_infer_ms}ms）"
             )
+        if self.music_intents:
+            extra += (
+                f" | 音乐 {self.music_intents} 意图（曲目 {self.music_tracks} / 控制 {self.music_controls}）"
+            )
         return (
             f"时长 {duration:.1f}s | 上行 {self.frames_up} 帧/{self.bytes_up}B | "
             f"下行 {self.frames_down} 帧/{self.bytes_down}B{extra} | "
@@ -317,6 +333,13 @@ class Stats:
         )
 
 def lan_ips() -> list[str]:
+    """本机非回环 IPv4（横幅里给设备填的地址）。
+
+    优先用 UDP connect 探测出口网卡（不发包，瞬时）；**只有拿不到时**才回退到
+    `getaddrinfo(hostname)`。后者在 macOS + VPN/内网 DNS 下会卡满 5s 超时再失败
+    （2026-11-10 实测：`nodename nor servname provided` 耗时 5.01s），会把 mock 横幅
+    和 `--music` 示例曲目 URL 一起拖慢，所以放在兜底分支里。
+    """
     ips: set[str] = set()
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -327,11 +350,12 @@ def lan_ips() -> list[str]:
             sock.close()
     except OSError:
         pass
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.add(info[4][0])
-    except OSError:
-        pass
+    if not ips:
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ips.add(info[4][0])
+        except OSError:
+            pass
     return sorted(ip for ip in ips if not ip.startswith("127."))
 
 def setup_logging(cfg: Config) -> None:

@@ -261,6 +261,8 @@ async def run(args) -> int:
 
     asr_partial = ""
     asr_final = ""
+    music_tracks: list[dict] = []
+    music_controls: list[dict] = []
     answer_parts: list[str] = []
     down: list[bytes] = []
     t_tts_start = None
@@ -354,6 +356,17 @@ async def run(args) -> int:
             elif kind == "tts_start":
                 t_tts_start = now
                 print(f"[TEST] <- tts_start  codec={evt.get('codec')} sr={evt.get('sr')}", flush=True)
+            elif kind == "music_track":
+                music_tracks.append(evt)
+                print(
+                    f"[TEST] <- music_track   {evt.get('title')!r}"
+                    f"（{evt.get('artist') or '未知歌手'}，{evt.get('duration_ms', 0)}ms）"
+                    f"\n         url={evt.get('url')}",
+                    flush=True,
+                )
+            elif kind == "music_control":
+                music_controls.append(evt)
+                print(f"[TEST] <- music_control action={evt.get('action')}", flush=True)
             elif kind == "tts_end":
                 t_end = now
                 break
@@ -370,6 +383,14 @@ async def run(args) -> int:
     total = (t_end or time.monotonic()) - t0
 
     print(f"[TEST] 回答（llm_delta 拼接）：{answer!r}", flush=True)
+    if music_tracks or music_controls:
+        print(
+            f"[TEST] 音乐：曲目 {len(music_tracks)} 首 / 控制 {len(music_controls)} 条"
+            "（music_track 是设备要拉流的 URL，不是 TTS 音频）",
+            flush=True,
+        )
+        for track in music_tracks:
+            print(f"[TEST]   曲目：{track.get('title')!r} → {track.get('url')}", flush=True)
     print(
         f"[TEST] 下行：{len(down)} 帧 / {sum(len(p) for p in down)} B / 解码 {duration:.2f}s 音频；"
         f"tts_start→首帧 {(t_first_frame - t_tts_start) * 1000 if t_tts_start and t_first_frame else -1:.0f}ms",
@@ -419,6 +440,10 @@ async def run(args) -> int:
         )
     if error is not None:
         failures.append(f"mock 返回 error：{error}")
+    if args.expect_music and not music_tracks:
+        failures.append("--expect-music：本轮没有收到 music_track（检查 mock 是否 --music、说法是否命中）")
+    if args.expect_llm and music_tracks:
+        failures.append("--expect-llm 不适用于音乐轮：命中音乐意图时 mock 不进 LLM（请用 --expect-music）")
     if args.expect_llm and answer and asr_final and answer == asr_final:
         failures.append("回答与 ASR 文本完全相同 → 这是复读，不是 LLM 回答（检查 mock 是否带 --llm）")
     if args.expect_pipeline:
@@ -472,6 +497,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-total", type=float, default=900.0,
                    help="总等待上限（秒）：防「一直有数据但永不 tts_end」；0=不限")
     p.add_argument("--expect-llm", action="store_true", help="断言回答 != ASR 文本（证明走的是 LLM）")
+    p.add_argument("--expect-music", action="store_true",
+                   help="断言本轮收到 music_track（音乐意图，mock 需 --music）")
     p.add_argument(
         "--expect-pipeline",
         action="store_true",

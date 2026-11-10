@@ -40,6 +40,7 @@ from mock_core import (
 )
 from mock_downlink import DownlinkMixin
 from mock_fixtures import embedded_real_mp3_frames
+from mock_music import MusicService
 
 
 class Session(DownlinkMixin):
@@ -52,7 +53,9 @@ class Session(DownlinkMixin):
         self.conn_id = conn_id
         self.stats = Stats()
         self.sid: int | None = None          # 当前轮 sid（端侧生成，mock 原样回填）
-        self.music_sid = 0                    # 音乐事件独立计数（契约未定义归属）
+        self.music_mid = 0                    # 音乐事件独立计数（契约 P-3：不复用语音 sid）
+        self.music_queue: list[Any] = []      # 搜索源返回的结果列表（next/prev 用）
+        self.music_index = -1
         self.seq_out = 0                      # 下行二进制帧 seq
         self.up_seq_expected: int | None = None
         self.up_round_frames = 0              # 本轮（audio_start 起）上行帧数
@@ -217,12 +220,22 @@ class Session(DownlinkMixin):
                 logging.INFO,
                 f"<-- music_request action={msg.get('action')} id={msg.get('id')} index={msg.get('index')}",
             )
-            if self.cfg.scenario == "music":
-                self.music_sid = (self.music_sid + 1) & 0xFFFF
+            # 端侧主动点歌（T4.3 起用）：有曲库就回真实曲目，否则保持旧骨架。
+            if self.server.music is not None:
+                track = self.server.music.catalog.next_track()
+                if track is not None:
+                    self.music_mid = (self.music_mid + 1) & 0xFFFF
+                    await self._send_json(track.as_event(self.music_mid))
+                    self.stats.music_tracks += 1
+                    self._log(logging.INFO, f"music_request → 曲目《{track.title}》{track.url}")
+                else:
+                    self._log(logging.WARNING, "music_request：曲库为空，未回 music_track")
+            elif self.cfg.scenario == "music":
+                self.music_mid = (self.music_mid + 1) & 0xFFFF
                 await self._send_json(
                     {
                         "t": "music_track",
-                        "sid": self.music_sid,
+                        "mid": self.music_mid,
                         "url": self._music_url(),
                         "codec": "mp3",
                         "duration_ms": 30000,
@@ -232,7 +245,7 @@ class Session(DownlinkMixin):
                 self._log(
                     logging.WARNING,
                     "music_track 的 url 不可播放：T1.5 不提供 HTTP 音频服务（P4 前补），"
-                    "且音乐事件 sid 归属契约未定义（见 PROTOCOL.md 待确认项）",
+                    "且音乐事件 mid 归属契约待 T4.2 定稿（见 PROTOCOL.md 待确认项 P-3）",
                 )
             else:
                 self._log(logging.WARNING, "scenario 非 music，不回 music_track（--scenario music 可测）")
@@ -284,6 +297,9 @@ class Session(DownlinkMixin):
         )
 
     def _music_url(self) -> str:
+        """--scenario music 旧骨架的占位 URL；真实曲目走 MusicService 的内置 HTTP。"""
+        if self.server.music is not None and self.server.music.demo_url:
+            return self.server.music.demo_url
         return f"http://{self.server.banner_host()}:{self.server.port}/media/mock.mp3"
 
     async def _stop_tts(self, reason: str) -> None:
@@ -348,6 +364,8 @@ class MockServer:
         self.tts_mp3_frames: list[Mp3Frame] | None = None
         # T3.6：--error-stage after-tts-start 用的真实 MP3 帧（--tts-mp3 优先，否则用内嵌段）
         self._embedded_mp3_frames: list[Mp3Frame] | None = None
+        # 2026-11-10：M1 音乐（--music / --scenario music）；None = 未启用
+        self.music: MusicService | None = MusicService.from_config(cfg)
 
     async def start(self) -> int:
         if self.cfg.tts_mp3 and self.tts_mp3_frames is None:
@@ -364,6 +382,10 @@ class MockServer:
             process_request=_process_request,
         )
         self.port = self._server.sockets[0].getsockname()[1]
+        # 音乐示例曲目依赖端口/局域网 IP，所以要在 WS 起来之后再启动 HTTP
+        if self.music is not None:
+            bind_host = self.cfg.host if self.cfg.host not in ("", "0.0.0.0", "::") else "0.0.0.0"
+            self.music.start(self.banner_host(), bind_host=bind_host)
         return self.port
 
     def _load_tts_mp3(self) -> list[Mp3Frame]:
@@ -396,6 +418,8 @@ class MockServer:
         return frames
 
     async def stop(self) -> None:
+        if self.music is not None:
+            self.music.stop()
         if self._server is None:
             return
         self._server.close()
@@ -494,6 +518,10 @@ def _print_banner(server: MockServer) -> None:
             else "TTS 复读: 关"
         ),
         "传输: 每条 accept 连接 TCP_NODELAY=1（关 Nagle；避免 delayed ACK 攒批造成端侧假欠载）",
+    ]
+    if server.music is not None:
+        lines.append(server.music.banner_line())
+    lines += [
         "直连 URL（设备端填 CONFIG_AI_WS_URL）：",
     ]
     for host in hosts:

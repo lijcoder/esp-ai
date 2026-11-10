@@ -1566,8 +1566,96 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 | `--error-code N` | 1 | **T3.6**：`--scenario error` 下发的 `error.code`（3001/3002 映射 tts-fail 提示音） |
 | `--error-stage S` | `after-audio-end` | **T3.6**：报错时机 `after-audio-end`（现状）/ `after-asr`（先 asr_final）/ `after-tts-start`（先 tts_start + 3~5 帧真实 MP3，测 SPEAKING 中报错） |
 | `--tts-bad-codec` | 关 | **T3.6**：`tts_start` 用 `codec:"pcm"` 后发 `tts_end`、**不发音频帧**（触发设备侧 TTS 无法播放 → tts-fail 提示音）；与 `--scenario error` 互斥 |
+| `--music` | 关 | **M1（2026-11-10）**：ASR 文本先过确定性音乐意图表，命中就下发 `music_track` / `music_control`，**不进 LLM**（见下节） |
+| `--music-url URL` | 空 | 固定曲目/电台流 URL（真机联调，**不用准备 MP3**）；缺省时 mock 自带 HTTP 服务下发示例 MP3 |
+| `--music-title T` | 空 | `--music-url` 的显示名（电台/直播流用；缺省取 URL 文件名） |
+| `--music-catalog FILE` | 空 | JSON 曲库：`{"tracks":[{"title","artist","url","duration_ms","keywords"}]}` |
+| `--music-search-url URL` | 空 | **通用搜索端点**：`{query}` 占位（缺省自动补 `?q=`），返回 `{"tracks":[{title,url,duration_ms,artist}]}`；超时/失败回退本地曲库 |
+| `--music-search-timeout-ms N` | 3000 | 搜索超时（200~30000ms） |
+| `--music-http-port P` | 0（随机） | 内置音乐 HTTP 端口（仅 `--music` 且无 `--music-url` 时启用） |
 | `--verbose` | 关 | 打印上行 payload 前 16 字节（库自身的握手 DEBUG 已压到 WARNING） |
 | `--self-test` | — | 进程内自测，不需要硬件 |
+
+## M1 音乐（mock 侧，2026-11-10）—— 不接 Hermes 工具也能"说暂停就暂停"
+
+**为什么这样做**：端侧 ESP32 不做 NLU；「暂停/下一首」必须在云端被识别成结构化事件。
+Hermes 网关不支持 tool calling，而 LLM 文本里塞 URL 会被 TTS 念出来、也挡不住 prompt 注入。
+所以 mock（代表后端）加一张**确定性规则表**：控制指令不过 LLM，点歌的 URL 由曲库给，
+LLM 只负责"说话"。端侧 P4 只依赖 `music_track` / `music_control` 两个事件，后续换成
+Hermes 工具/意图路由都不返工。
+
+```bash
+# 内置示例曲目（自动起 HTTP，真机可直接拉流；横幅会打印局域网 URL）
+uv run tools/ws_mock_server.py --music --asr sensevoice --tts-qwen
+
+# 放电台（直播流，不用准备任何 MP3 文件）
+uv run tools/ws_mock_server.py --music --asr sensevoice --tts-qwen \
+  --music-url http://lhttp.qingting.fm/live/20210755/64k.mp3 --music-title 清听电台
+
+# 自带曲库（示例里就是一条电台）
+uv run tools/ws_mock_server.py --music --music-catalog tools/music_catalog.example.json
+```
+
+### 接自己的搜索服务（`--music-search-url`）
+
+mock 不内置任何站点的抓取/签名逻辑，只认一个通用 JSON 契约，源由你部署：
+
+```bash
+# 你的搜索服务：GET /search?q=晴天 → {"tracks":[{"title":"晴天","url":"http://…/x.mp3","duration_ms":269000}]}
+uv run tools/ws_mock_server.py --music \
+  --music-search-url 'http://127.0.0.1:9009/search?q={query}' \
+  --music-search-timeout-ms 3000
+```
+
+- `{query}` 会被 URL 编码后替换；没写占位符时自动补 `?q=`。
+- 超时 / 非 2xx / JSON 坏 / 没有 `http(s)` URL → WARN 并**回退本地曲库**，不打断本轮。
+- 点歌时一次取回最多 5 条结果，`下一首/上一首` 在这批结果里前后移动（不再报"曲库还没有歌"）。
+- 端侧仍是普通 `music_track`，换源不改协议、不改固件。
+
+### 本机音乐服务器（`local_music_server.py`）——自己的 MP3，说歌名就播
+
+```bash
+uv run tools/local_music_server.py --dir ~/Music --port 9009
+```
+
+启动后打印可用的两条 mock 命令：
+
+```
+本机音乐服务器：/Users/xxx/Music（12 首 .mp3）
+mock 接法（二选一）：
+  --music-search-url 'http://127.0.0.1:9009/search?q={query}'
+  curl -s http://192.168.1.23:9009/catalog > /tmp/music_catalog.json  # 再 --music-catalog
+```
+
+- **端点**：`/search?q=`（最多 `--limit` 条）、`/catalog`（整库 JSON）、`/media/<相对路径>`（支持 Range/206、HEAD）。
+- **标题**取文件名：去掉 `01.` 这类音轨号、`[myfreemp3.ink]` 这类站点标签，并按「歌手 - 歌名」拆成 `artist`/`title`（确认语只念歌名）；`duration_ms=0`（时长未知，端侧 T4.1 按持续流处理）。
+- URL 默认用**本机局域网 IP**（设备要能访问；跨网段 `--public-host` 指定）。只服务 `--dir` 下的 `.mp3`，路径穿越返回 403。
+- 自测：`uv run tools/local_music_server.py --self-test`（17/17）。
+
+> **直播流的契约口径**：`music_track.duration_ms = 0` 表示「时长未知 / 直播流」，端侧 T4.1
+> 不能等 EOF 收尾，停播只能靠 `music_control{stop}`、断流或切歌；mock 不伪造结束事件。
+> 示例曲库里的电台 URL 只是示例（公网可达性/版权自行确认），换成自己的流随时可用。
+
+**行为**（ASR 文本 → 事件）：
+
+| 说的话 | 下发 | 说明 |
+|---|---|---|
+| 放首周杰伦的晴天 / 播放孤勇者 / 来首歌 | `music_track{mid,url,codec:"mp3",duration_ms,title}` | 曲库检索；无匹配回退当前曲目并 WARN |
+| 下一首 / 上一首 / 换一首 | **新的 `music_track`** | 端侧没有播放列表，只有服务端能决定下一首；**接了搜索源时先在本次搜索结果里移动**；搜索只返回 1 条（或电台单曲库）就循环同一首 |
+| 暂停 / 先停一下 | `music_control{mid,action:"pause"}` | 控制事件沿用当前 `mid`（不加 1） |
+| 继续 / 接着放 | `music_control{action:"resume"}` | |
+| 停止播放 / 别放了 / 关掉音乐 | `music_control{action:"stop"}` | 控制词优先于「放」 |
+| 今天天气如何 | 无音乐事件 | 照旧走 LLM/复读 |
+
+- **回答**：命中音乐意图时用固定确认语（"好的，为你播放晴天。"）走 TTS 下发，
+  保证「说暂停」不再等一次 LLM 往返；`--no-tts` 下只发 `tts_start`/`tts_end`。
+- **事件字段**：`mid` 是连接内自增的音乐 id，**不复用语音 `sid`**（P-3）；端侧 T4.2
+  按 `t` 分流。URL 只出现在 `music_track`，且只接受 `http(s)`。
+- **一条命令看事件流**：`uv run tools/music_demo.py`（进程内起 mock + 假设备，打印 6 轮 JSON，不接板）；`--rounds "放首晴天" "暂停"` 只跑指定句子；加 `--search-url 'http://127.0.0.1:9009/search?q={query}'` 走本机搜索源。
+- **离线自测**：`uv run tools/mock_music_test.py`（178 项：意图/曲库/搜索适配器/HTTP Range/e2e 假设备/搜索 next-prev/LLM 流水线同开/电台 URL）。
+
+> 曲库/HTTP 都在 mock 进程内；**唯一真机依赖**是设备能访问到 `music_track.url` 的局域网地址
+> （mock 自动用 `lan_ips()` 拼 URL；跨网段请用 `--music-url` 指向可达地址）。
 
 ### 回声测试（你说什么 → 它复读什么）的实战注意（2026-11-02）
 
@@ -1597,9 +1685,9 @@ uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc
 - 服务端**不主动**发 WS 协议层 ping（`ping_interval=None`），也**不主动**发应用层 `{"t":"ping"}`：§6.1 只定义了端侧 20s 上行心跳，避免出现两份心跳互相干扰。
 - 坏帧（magic/ver/len/type 不符、非 JSON 文本帧）一律 WARN + 计数 + 丢弃，但**不断开连接**——联调时希望看到问题累积，而不是一次错误就把会话踢掉。
 - **每条 accept 连接默认开 `TCP_NODELAY`（关 Nagle）**：mock 每 ~20ms 下发一个 0x02 帧，若被 Nagle 攒批（叠加端侧 delayed ACK 的 ~200ms），设备会每 200–250ms 才集中收一批，ring 耗尽被误判成端侧 `underrun>0` 的**假欠载**（T2.4-C2 真机实测：`tts_stream_test.py` 稳态 underrun=1）。实现方式：`serve(..., process_request=...)` 在握手前对 `connection.transport` 调 `setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)`，handler 里再兜底设一次；`--self-test` 有一条用 `getsockopt` 校验。**真实云端实现同样必须关 Nagle**；这是服务端/测试环境的修复，**不放宽契约 `underrun=0` 阈值**。
-- `scenario=music` 只回 `music_track`，`url` 不可播放（T1.5 不提供 HTTP 音频服务，P4 前补）；`music_status` 只记日志。
+- **音乐（M1，2026-11-10）**：`--music` 时 mock 自带 HTTP 服务（示例曲目 `http://<局域网IP>:<port>/media/demo.mp3`，支持 `Range`/206），`music_track.url` **真机可播**；`--scenario music` 的旧骨架只在没开 `--music` 时兜底。`music_status` 仍只记日志（端侧 T4.2 起才上报）。
 - `--tts-mp3` 的帧切分/节奏是**工具行为**，不改协议：帧头 8B / seq / tts_start·tts_end 顺序与合成帧模式完全一致；`--tts-late-bin`/`--tts-stall-*` 都只影响 mock 发送时序，端侧契约不变。
-- 契约已由 T2.5 全部定稿并回填 [PROTOCOL.md](../docs/PROTOCOL.md)：`hello_ack` / 鉴权关闭码 / `pong` 口径 / 双传输 / 二进制帧 `sid` 关联（P-2）/ `error` 码表（P-4）；只剩音乐事件 `sid` 归属留 T4.2（P-3）。mock 的 `error` 默认 `code=1`（通用），**T3.6 起可用 `--error-code` 注入 3001/3002 等码表值**（用于验证端侧「语音播放失败」提示音）。
+- 契约已由 T2.5 全部定稿并回填 [PROTOCOL.md](../docs/PROTOCOL.md)：`hello_ack` / 鉴权关闭码 / `pong` 口径 / 双传输 / 二进制帧 `sid` 关联（P-2）/ `error` 码表（P-4）；音乐事件的 `mid` 归属按 P-3 定稿建议实现（连接内自增，不复用语音 `sid`），端侧 T4.2 落地。mock 的 `error` 默认 `code=1`（通用），**T3.6 起可用 `--error-code` 注入 3001/3002 等码表值**（用于验证端侧「语音播放失败」提示音）。
 - **T3.6 新增参数只影响 mock 发送时机/字段，不改协议**：`--error-stage` 只是把既有 `asr_final`/`tts_start`/二进制帧与 `error` 的先后顺序换一下；`--tts-bad-codec` 仍是合法的 `tts_start.codec` 字段（设备对未知 codec 的降级行为由端侧实现）。
 
 ## 后续（未做）
@@ -1607,7 +1695,7 @@ uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc
 - **T3.6 错误提示**由 `error_prompt_test.py` 覆盖（云端 error/超时/设备侧 TTS 失败/离线唤醒/中途断网/打断/正常轮/10 轮稳定性），mock 侧由 `--error-code/--error-stage/--tts-bad-codec` 支撑；host 纯逻辑单测见 `test/host/`。
 - `voice_cloud_test.py` 已承接 P2 端到端断言（唤醒 → 上行 Opus → ASR/LLM/TTS → 收尾/中止 + sid 过滤）；`mp3_test.py` 承接下行解码断言（T2.3 已交付）；**`tts_stream_test.py` 承接 T2.4 流式播放断言**（真实 MP3 → 首帧延迟/欠载/解码对拍/abort/排空/堆稳定）；P3 半双工：T3.1 会话状态机由 `voice_cloud_test.py` 覆盖，**T3.2 R4 按键打断 / R5 无丢弃 / R3 ducking 由 `tts_stream_test.py` 的 `--interrupt`/`--r5`/`--r3-duck` 覆盖**；**T3.4 按键/LED/静音由 `dev_ctrl_test.py` 覆盖**（真实 GPIO0 按键路径 + 停声 <100ms + LED 模式）；T5.2 用回放 + `record_wav.py` 产出唤醒率/误唤醒基线。
 - 下行流式播放断言（T2.4）→ **已交付 `tts_stream_test.py`**；mock 真实 MP3 下发 → **已交付 `--tts-mp3`**。
-- HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求），P4（T4.1/T4.2）前补。
+- ~~HTTP 音频服务（`music_track.url` 可播放、支持 Range 请求）~~ → **2026-11-10 mock 侧已交付**（`--music` 内置 HTTP；端侧 `source_http` 是 T4.1）。
 - `wss` + 自签证书（T1.4 决定证书策略后）。
 - 上行 Opus 帧解码校验 → **已交付 `opus_enc_test.py`**（PyAV 独立解码 + 频谱/码率/泄漏断言，见上）；真机联调在 T2.2 固件就绪后由 Lead 通知。
 - 本地 TTS：**2026-11-04 起统一为 Qwen3-TTS（MLX）**；Piper/say 已移除。更高自然度或更低时延的方案（Qwen3-TTS 1.7B、CosyVoice 等）后续按需再评估。

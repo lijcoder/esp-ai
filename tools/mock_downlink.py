@@ -31,6 +31,7 @@ from mock_core import (
     parse_mp3_frames,
 )
 from mock_pipeline import LlmTtsPipeline, PipelineConfig, SegmenterConfig
+from mock_music import ACTION_NEXT, ACTION_PLAY, TRACK_ACTIONS, build_control_event
 
 
 def module_speakable(text: str) -> bool:
@@ -581,6 +582,70 @@ class DownlinkMixin:
             "（码表见 PROTOCOL.md §4：3001/3002=TTS 失败，其余=通用/服务异常）",
         )
 
+    async def _music_flow(self, text: str) -> str | None:
+        """M1 双通道：ASR 文本 → 音乐意图（暂停/继续/下一首/停止/点歌）。
+
+        命中：直接下发 `music_track`（曲目，含 URL）或 `music_control`（暂停/继续/停止），
+        返回固定确认语给 TTS 播；**不进 LLM**——控制指令要快且确定，LLM 也不该看到/输出 URL。
+        未命中：返回 None，本轮照旧交给 LLM/Hermes。
+        """
+        music = getattr(self.server, "music", None)
+        if music is None:
+            return None
+        intent = music.parser.parse(text)
+        if intent is None:
+            return None
+
+        self.stats.music_intents += 1
+        if intent.action in TRACK_ACTIONS:
+            track = None
+            matched = False
+            if intent.action == ACTION_PLAY and intent.query:
+                # 点歌：搜索源优先（HTTP，放线程）；失败/无结果回退本地曲库
+                tracks = await asyncio.to_thread(music.search_tracks, intent.query, 5)
+                if tracks:
+                    self.music_queue, self.music_index = tracks, 0
+                    track, matched = tracks[0], True
+                else:
+                    track, matched = music.catalog.resolve(intent.query)
+            elif intent.action == ACTION_PLAY:      # "放首歌"（无 query）：沿用上次搜索结果
+                if self.music_queue:
+                    self.music_index = max(0, self.music_index)
+                    track, matched = self.music_queue[self.music_index], True
+                else:
+                    track, matched = music.catalog.resolve("")
+            elif self.music_queue:                  # 下一首/上一首：先在搜索结果里游标移动
+                step = 1 if intent.action == ACTION_NEXT else -1
+                self.music_index = (self.music_index + step) % len(self.music_queue)
+                track, matched = self.music_queue[self.music_index], True
+            else:
+                track, matched = music.track_for(intent)   # 回退曲库游标
+            if track is None:
+                self._log(logging.WARNING, f"[MUSIC] 意图={intent.action} 但曲库/搜索都没有结果")
+                return "抱歉，没找到这首歌。"
+            self.music_mid = (self.music_mid + 1) & 0xFFFF
+            await self._send_json(track.as_event(self.music_mid))
+            self.stats.music_tracks += 1
+            detail = (
+                f"（搜索结果 {len(self.music_queue)} 首 / 当前 {self.music_index + 1}）"
+                if self.music_queue
+                else ("" if matched else "（曲库未匹配，回退当前曲目）")
+            )
+            self._log(
+                logging.INFO,
+                f"[MUSIC] 意图={intent.action} 规则={intent.rule!r} query={intent.query!r} → "
+                f"《{track.title}》mid={self.music_mid}{detail}",
+            )
+            return music.confirm_text(intent.action, track)
+
+        await self._send_json(build_control_event(self.music_mid, intent.action))
+        self.stats.music_controls += 1
+        self._log(
+            logging.INFO,
+            f"[MUSIC] 控制 action={intent.action} 规则={intent.rule!r} mid={self.music_mid}",
+        )
+        return music.confirm_text(intent.action, None)
+
     async def _tts_flow(self, asr_packets: list[bytes] | None = None) -> None:
         sid = self.sid
         self._round_started_at = time.monotonic()
@@ -607,11 +672,16 @@ class DownlinkMixin:
             await self._send_json({"t": "asr_partial", "sid": sid, "text": text[: max(1, len(text) // 2)]})
             await self._send_json({"t": "asr_final", "sid": sid, "text": text})
 
+            # 2026-11-10 M1：ASR 文本先过确定性音乐意图表（云端双通道的"控制通道"）。
+            # 命中就不走 Hermes/LLM：曲目/控制事件直接下发，回答用固定确认语。
+            music_confirm = await self._music_flow(text)
+
             # LLM 流式 → TTS 流水线（2026-11-10，默认路径）：
             # 不等 LLM 整段回答，切出第一段就开始合成/下发；回答较长时首声明显提前。
             # 默认走旧路径（整段回答后合成，语音更连贯）；`--llm-tts-stream` 才启用流水线。
             if (
-                self.cfg.llm
+                music_confirm is None          # 音乐意图已处理：不能再走 LLM（否则会重复回答）
+                and self.cfg.llm
                 and self.cfg.llm_tts_stream
                 and self.server.tts_qwen_module is not None
                 and self.cfg.tts_stream
@@ -621,9 +691,12 @@ class DownlinkMixin:
                 await self._llm_tts_stream_flow(sid, text)
                 return
 
-            # 回答来源：--llm（大模型流式）或复读（默认，llm_delta 是识别文本切片）
+            # 回答来源：音乐确认语（M1）/ --llm（大模型流式）/ 复读（默认，llm_delta 是识别文本切片）
             answer = text
-            if self.cfg.llm:
+            if music_confirm is not None:
+                answer = music_confirm
+                await self._send_json({"t": "llm_delta", "sid": sid, "text": answer})
+            elif self.cfg.llm:
                 try:
                     answer = await self._llm_answer(text) or text
                 except BaseException as exc:  # noqa: BLE001 - 单轮失败不能拖垮 mock

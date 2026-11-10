@@ -51,6 +51,16 @@ T3.1 回声测试（ASR 识别文本 → 本地 Qwen3-TTS 复读，不要固定�
   识别文本会走 asr_partial/asr_final，合成失败只 WARN 并回退合成帧。
   （--tts-qwen 与 --tts-mp3 互斥；模型默认 mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16）
 
+M1 音乐（2026-11-10，mock 侧；不需要 Hermes 支持 tool calling）：
+  uv run tools/ws_mock_server.py --music --asr sensevoice --tts-qwen
+  说「放首周杰伦的晴天」→ 曲库检索 → music_track{mid,url,...}（内置 HTTP 给可播 URL）
+  说「暂停/继续/下一首/停止」→ music_control / 新的 music_track，且**不进 LLM**
+  说其它话 → 照旧交给 LLM/Hermes；URL 只出现在 music_track，不经过 LLM 文本
+  固定曲目/电台/自备曲库：--music-url http://…/x.mp3（--music-title 设名）或 --music-catalog tools/…json
+  接自己的搜索服务：--music-search-url 'http://127.0.0.1:9009/search?q={query}'
+    （返回 {"tracks":[{title,url,duration_ms}]}；mock 不内置任何站点抓取/签名，失败回退曲库）
+  离线自测：uv run tools/mock_music_test.py（178 项）
+
 LLM 边出字边播（2026-11-10，可选；默认仍是整段回答后合成）：
   # 默认：等 LLM 整段回答写完再合成（语音更连贯）
   uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
@@ -72,6 +82,7 @@ TTS 帧攒成 ~200ms 一批，造成「mock 均匀发、端侧却 underrun」的
   mock_pipeline.py  LLM 增量 → 自然分句 → TTS 的线程编排（仅标准库，可单测）
   mock_server.py    Session + MockServer + TCP_NODELAY + 启动横幅
   mock_cli.py       命令行参数、校验、Config 装配、ASR/Qwen3-TTS 后端加载
+  mock_music.py     M1 音乐：意图规则表 / 曲库 / 内置 HTTP（示例曲目真机可播）
   mock_self_test.py 19 项进程内自测（`--self-test`）
   mock_fixtures.py  自测/错误注入共用的内嵌真实 MP3
 """
@@ -102,7 +113,11 @@ def main(argv: list[str] | None = None) -> int:
     asr_backend = load_asr_backend(args)
     tts_qwen_module = load_tts_qwen(args)
 
-    server = MockServer(cfg, asr_backend, tts_qwen_module)
+    try:
+        server = MockServer(cfg, asr_backend, tts_qwen_module)
+    except (ValueError, OSError) as exc:  # 曲库 JSON 非法等启动期错误：给人话，不裸露堆栈
+        print(f"mock 启动失败：{exc}", file=sys.stderr, flush=True)
+        return 2
     try:
         return asyncio.run(serve_forever(server))
     except KeyboardInterrupt:

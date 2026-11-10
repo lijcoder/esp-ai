@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "event_bus.h"
 #include "feedback.h"
+#include "music_cloud.h"
 #include "net_mgr.h"
 #include "prompt_assets.h"
 #include "transport_ws.h"
@@ -88,6 +89,10 @@ void app_main(void)
     /* 语音云协议（T2.5）放在 ws 之后：vc_init 要注册 WS 主接收回调；
      * 未 READY 时按轮次跳过，不影响本地唤醒/提示音 */
     ESP_ERROR_CHECK(vc_init());
+
+    /* 音乐协议（T4.2）放在 vc 之后：mc_init 订阅 WS 附加接收槽（不抢 voice_cloud 主槽），
+     * 解析 music_track/music_control 并周期上报 music_status；不建任务（两个 esp_timer） */
+    ESP_ERROR_CHECK(mc_init());
 
     /* 会话状态机（T3.1）放在 vc 之后：订阅事件总线 + vc 回调 + 播放完成回调，不建任务 */
     ESP_ERROR_CHECK(vs_init());

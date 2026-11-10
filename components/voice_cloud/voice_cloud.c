@@ -652,6 +652,14 @@ static void vc_handle_text(const uint8_t *payload, size_t len)
         return;
     }
 
+    /* T4.2：音乐事件归 music_cloud（独立 mid，不吃语音 sid、不参与轮次窗口）；
+     * 本组件静默跳过，避免"未处理事件"WARN 把正常的音乐下行刷成噪声。 */
+    if (strcmp(t, "music_track") == 0 || strcmp(t, "music_control") == 0 ||
+        strcmp(t, "music_status") == 0) {
+        ESP_LOGD(TAG, "跳过音乐事件 t=%s（music_cloud 处理）", t);
+        return;
+    }
+
     has_sid = vc_find_key(payload, len, "sid", &v, &v_end) && vc_decode_int(v, v_end, &sid_raw);
 
     /* §6.3：所有语音下行事件都带 sid；本组件只处理本轮事件，迟到/错位一律丢弃 */

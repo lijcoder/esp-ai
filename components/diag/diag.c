@@ -31,6 +31,7 @@
 #include "feedback.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "music_cloud.h"
 #include "net_mgr.h"
 #include "nvs.h"
 #include "prompt_assets.h"
@@ -2173,6 +2174,43 @@ static int cmd_music(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
+/* T4.2：音乐协议状态（music_cloud；下行 music_track/music_control、上行 music_status） */
+static int cmd_mc(int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "status") == 0) {
+        mc_info_t info;
+        mc_stats_t st;
+        if (mc_info_read(&info) != ESP_OK || mc_stats_read(&st) != ESP_OK) {
+            printf("MC 不可用（music_cloud 未初始化）\n");
+            return ESP_ERR_INVALID_STATE;
+        }
+        printf("MC state=%s mid=%u have_mid=%d duration=%dms progress=%ums\n",
+               mc_state_name(info.state), (unsigned)info.mid, info.have_mid ? 1 : 0,
+               (int)info.duration_ms, (unsigned)info.progress_ms);
+        printf("MC title=%s\n", info.title[0] != '\0' ? info.title : "-");
+        printf("MC url=%s\n", info.url[0] != '\0' ? info.url : "-");
+        printf("MCSTAT track=%" PRIu32 " control=%" PRIu32 " dropped_mid=%" PRIu32 " dup=%" PRIu32
+               " bad=%" PRIu32 " parse_err=%" PRIu32 " play_err=%" PRIu32 " ignored=%" PRIu32
+               " status_sent=%" PRIu32 " status_failed=%" PRIu32 " eof=%" PRIu32 "\n",
+               st.rx_track, st.rx_control, st.rx_dropped_mid, st.rx_dropped_dup,
+               st.rx_dropped_bad, st.rx_parse_errors, st.play_errors, st.ignored_actions,
+               st.status_sent, st.status_failed, st.eofs);
+        return ESP_OK;
+    }
+    if (strcmp(argv[1], "report") == 0) {
+        const esp_err_t err = mc_report_status();
+        printf("MCREPORT err=%s\n", esp_err_to_name(err));
+        return err;
+    }
+    if (strcmp(argv[1], "reset") == 0) {
+        (void)mc_stats_reset();
+        printf("MCSTAT cleared\n");
+        return ESP_OK;
+    }
+    printf("用法: mc status | report | reset\n");
+    return ESP_ERR_INVALID_ARG;
+}
+
 static int cmd_player(int argc, char **argv)
 {
     if (argc < 2) {
@@ -2541,6 +2579,12 @@ static esp_err_t register_commands(void)
             .help = "语音云：vc status | start [sid] | stop | cancel | stat | reset（T2.5）",
             .hint = "status|start|stop|cancel|stat|reset",
             .func = cmd_vc,
+        },
+        {
+            .command = "mc",
+            .help = "音乐协议（T4.2）：mc status | report | reset",
+            .hint = "status|report|reset",
+            .func = cmd_mc,
         },
         {
             .command = "vs",

@@ -32,6 +32,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "music_cloud.h"
+#include "music_session.h"
 #include "net_mgr.h"
 #include "nvs.h"
 #include "prompt_assets.h"
@@ -2174,32 +2175,38 @@ static int cmd_music(int argc, char **argv)
     return ESP_ERR_INVALID_ARG;
 }
 
-/* T4.2：音乐协议状态（music_cloud；下行 music_track/music_control、上行 music_status） */
+/* T4.2/T4.3：音乐协议观测（music_cloud 纯协议：mid 基准 + 收发统计） */
 static int cmd_mc(int argc, char **argv)
 {
     if (argc < 2 || strcmp(argv[1], "status") == 0) {
-        mc_info_t info;
         mc_stats_t st;
-        if (mc_info_read(&info) != ESP_OK || mc_stats_read(&st) != ESP_OK) {
+        if (mc_stats_read(&st) != ESP_OK) {
             printf("MC 不可用（music_cloud 未初始化）\n");
             return ESP_ERR_INVALID_STATE;
         }
-        printf("MC state=%s mid=%u have_mid=%d duration=%dms progress=%ums\n",
-               mc_state_name(info.state), (unsigned)info.mid, info.have_mid ? 1 : 0,
-               (int)info.duration_ms, (unsigned)info.progress_ms);
-        printf("MC title=%s\n", info.title[0] != '\0' ? info.title : "-");
-        printf("MC url=%s\n", info.url[0] != '\0' ? info.url : "-");
-        printf("MCSTAT track=%" PRIu32 " control=%" PRIu32 " dropped_mid=%" PRIu32 " dup=%" PRIu32
-               " bad=%" PRIu32 " parse_err=%" PRIu32 " play_err=%" PRIu32 " ignored=%" PRIu32
-               " status_sent=%" PRIu32 " status_failed=%" PRIu32 " eof=%" PRIu32 "\n",
+        printf("MC mid=%u have_mid=%d（协议层：mid 过滤基准）\n", (unsigned)mc_current_mid(),
+               mc_have_mid() ? 1 : 0);
+        printf("MCSTAT track=%" PRIu32 " control=%" PRIu32 " dropped_mid=%" PRIu32
+               " dup=%" PRIu32 " bad=%" PRIu32 " parse_err=%" PRIu32 " status_sent=%" PRIu32
+               " status_failed=%" PRIu32 " request_sent=%" PRIu32 " request_failed=%" PRIu32
+               "\n",
                st.rx_track, st.rx_control, st.rx_dropped_mid, st.rx_dropped_dup,
-               st.rx_dropped_bad, st.rx_parse_errors, st.play_errors, st.ignored_actions,
-               st.status_sent, st.status_failed, st.eofs);
+               st.rx_dropped_bad, st.rx_parse_errors, st.status_sent, st.status_failed,
+               st.request_sent, st.request_failed);
         return ESP_OK;
     }
     if (strcmp(argv[1], "report") == 0) {
-        const esp_err_t err = mc_report_status();
-        printf("MCREPORT err=%s\n", esp_err_to_name(err));
+        /* 协议层不再持有播放状态：从 music_session 取当前状态/进度上报一次 */
+        mc_state_t state = MC_STATE_IDLE;
+        uint32_t progress_ms = 0;
+        ms_info_t info;
+        if (ms_info_read(&info) == ESP_OK) {
+            state = info.state;
+            progress_ms = info.progress_ms;
+        }
+        const esp_err_t err = mc_report_status(state, progress_ms);
+        printf("MCREPORT err=%s state=%s progress=%ums\n", esp_err_to_name(err),
+               mc_state_name(state), (unsigned)progress_ms);
         return err;
     }
     if (strcmp(argv[1], "reset") == 0) {
@@ -2208,6 +2215,80 @@ static int cmd_mc(int argc, char **argv)
         return ESP_OK;
     }
     printf("用法: mc status | report | reset\n");
+    return ESP_ERR_INVALID_ARG;
+}
+
+/* T4.3：音乐编排（music_session；状态机/暂停继续/抢占/兜底） */
+static int cmd_ms(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: ms status | play <http(s)://...> | pause | resume | stop | "
+               "request play [index] | reset\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(argv[1], "status") == 0) {
+        ms_info_t info;
+        ms_stats_t st;
+        if (ms_info_read(&info) != ESP_OK || ms_stats_read(&st) != ESP_OK) {
+            printf("MS 不可用（music_session 未初始化）\n");
+            return ESP_ERR_INVALID_STATE;
+        }
+        printf("MS state=%s paused=%d reason=%u mid=%u have_mid=%d duration=%dms progress=%ums\n",
+               mc_state_name(info.state), info.paused ? 1 : 0, (unsigned)info.pause_reason,
+               (unsigned)info.mid, info.have_mid ? 1 : 0, (int)info.duration_ms,
+               (unsigned)info.progress_ms);
+        printf("MS title=%s\n", info.title[0] != '\0' ? info.title : "-");
+        printf("MS url=%s\n", info.url[0] != '\0' ? info.url : "-");
+        printf("MSSTAT transitions=%" PRIu32 " tracks=%" PRIu32 " play_err=%" PRIu32
+               " pauses=%" PRIu32 " resumes=%" PRIu32 " steals=%" PRIu32 " stops=%" PRIu32
+               " eof=%" PRIu32 " controls=%" PRIu32 " dropped=%" PRIu32
+               " resume_fail=%" PRIu32 " fallback=%" PRIu32 "\n",
+               st.transitions, st.tracks, st.play_errors, st.pauses, st.resumes, st.steals,
+               st.stops, st.eofs, st.controls, st.dropped, st.resume_failures,
+               st.fallback_requests);
+        return ESP_OK;
+    }
+    if (strcmp(argv[1], "play") == 0) {
+        if (argc < 3) {
+            printf("用法: ms play <http(s)://...>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        const esp_err_t err = ms_play(argv[2]);
+        printf("MSPLAY err=%s\n", esp_err_to_name(err));
+        return err;
+    }
+    if (strcmp(argv[1], "pause") == 0) {
+        const esp_err_t err = ms_pause(0);
+        printf("MSPAUSE err=%s\n", esp_err_to_name(err));
+        return err;
+    }
+    if (strcmp(argv[1], "resume") == 0) {
+        const esp_err_t err = ms_resume();
+        printf("MSRESUME err=%s\n", esp_err_to_name(err));
+        return err;
+    }
+    if (strcmp(argv[1], "stop") == 0) {
+        const esp_err_t err = ms_stop();
+        printf("MSSTOP err=%s\n", esp_err_to_name(err));
+        return (err == ESP_ERR_INVALID_STATE) ? ESP_OK : err;
+    }
+    if (strcmp(argv[1], "request") == 0) {
+        if (argc < 3 || strcmp(argv[2], "play") != 0) {
+            printf("用法: ms request play [index]\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        const int32_t index = (argc > 3) ? (int32_t)atoi(argv[3]) : 0;
+        const esp_err_t err = ms_request(MC_REQUEST_ACTION_PLAY, index);
+        printf("MSREQUEST err=%s action=play index=%d\n", esp_err_to_name(err), (int)index);
+        return err;
+    }
+    if (strcmp(argv[1], "reset") == 0) {
+        (void)ms_stats_reset();
+        printf("MSSTAT cleared\n");
+        return ESP_OK;
+    }
+    printf("用法: ms status | play <http(s)://...> | pause | resume | stop | "
+           "request play [index] | reset\n");
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -2582,9 +2663,16 @@ static esp_err_t register_commands(void)
         },
         {
             .command = "mc",
-            .help = "音乐协议（T4.2）：mc status | report | reset",
+            .help = "音乐协议（T4.2/T4.3，纯协议）：mc status | report | reset",
             .hint = "status|report|reset",
             .func = cmd_mc,
+        },
+        {
+            .command = "ms",
+            .help = "音乐编排（T4.3）：ms status | play <url> | pause | resume | stop | "
+                    "request play [index] | reset",
+            .hint = "status|play|pause|resume|stop|request|reset",
+            .func = cmd_ms,
         },
         {
             .command = "vs",

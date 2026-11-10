@@ -14,13 +14,14 @@
 #   make -C test/host clean        # 清掉编译产物
 
 CC       ?= cc
-CPPFLAGS += -I../../components/prompt_store/include -I../../components/feedback/include
+CPPFLAGS += -I../../components/prompt_store/include -I../../components/feedback/include \
+            -I../../components/music_session/include
 CFLAGS   ?= -O2 -std=c11 -Wall -Wextra
 LDFLAGS  ?=
 
-BINS := feedback_policy_test prompt_pack_test
+BINS := feedback_policy_test music_policy_test prompt_pack_test
 
-.PHONY: all run clean feedback pack
+.PHONY: all run clean feedback music pack
 
 all: run
 
@@ -29,6 +30,8 @@ run: $(BINS)
 	./prompt_pack_test
 	@echo
 	./feedback_policy_test
+	@echo
+	./music_policy_test
 
 pack: prompt_pack_test
 	@echo
@@ -38,6 +41,10 @@ feedback: feedback_policy_test
 	@echo
 	./feedback_policy_test
 
+music: music_policy_test
+	@echo
+	./music_policy_test
+
 prompt_pack_test: prompt_pack_test.c ../../components/prompt_store/prompt_pack.c \
 		../../components/prompt_store/include/prompt_pack.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ prompt_pack_test.c \
@@ -45,6 +52,9 @@ prompt_pack_test: prompt_pack_test.c ../../components/prompt_store/prompt_pack.c
 
 feedback_policy_test: feedback_policy_test.c ../../components/feedback/include/feedback_policy.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ feedback_policy_test.c $(LDFLAGS)
+
+music_policy_test: music_policy_test.c ../../components/music_session/include/music_policy.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ music_policy_test.c $(LDFLAGS)
 
 clean:
 	rm -f $(BINS)

@@ -122,6 +122,8 @@ typedef struct {
     bool run_active;
     uint32_t run_gen;
     bool closed;         /* 源已耗尽（混完 ring 即结束） */
+    bool paused;         /* T4.3：音乐暂停态（ring/wr/rd 保留，混音跳过本通道） */
+    bool resume_req;     /* T4.3：API 请求从暂停点续播（受 s_mix_mux 保护） */
     bool fade_started;   /* 收尾 100ms 淡出已开始 */
     mix_src_t src;
     const int16_t *pcm;
@@ -313,6 +315,15 @@ static bool s_music_in_underrun;
 static portMUX_TYPE s_music_mux = portMUX_INITIALIZER_UNLOCKED;
 static audio_player_music_stats_t s_music_stats;
 
+/* T4.3 暂停/继续：对外的 s_music_paused 在请求被接受时即置位（淡出属于暂停过程）；
+ * s_music_pause_req 由 player 任务在块边界消费，实际退出 PUMP 后置 c->paused。 */
+static volatile bool s_music_paused;
+static volatile bool s_music_pause_req;
+static volatile bool s_music_resume_req;
+static volatile uint32_t s_music_pause_fade_ms;
+static volatile int64_t s_music_pause_req_us;
+static bool s_music_pause_fade_started; /* 仅 player 任务读写 */
+
 /* ---------------- 基础工具 ---------------- */
 
 /* 一次播放的公共尾巴：静音冲刷 DMA（避免余音被硬切）+ 关时钟 */
@@ -364,7 +375,7 @@ static inline int32_t tone_next(mix_ch_t *c)
 /* 每块最多补 2 个 10ms，避免长解码把单块时间拉长 */
 static void ch_pump(mix_ch_t *c)
 {
-    if (!c->run_active || c->closed) {
+    if (!c->run_active || c->closed || c->paused) {
         return;
     }
     if (c->src == MIX_SRC_STREAM) {
@@ -478,6 +489,7 @@ static void ch_sync(void)
         mix_ch_t *c = &s_ch[i];
         bool req;
         uint32_t gen;
+        bool resume;
         mix_src_t src;
         const int16_t *pcm;
         uint32_t samples;
@@ -489,6 +501,7 @@ static void ch_sync(void)
         portENTER_CRITICAL(&s_mix_mux);
         req = c->req_active;
         gen = c->req_gen;
+        resume = c->resume_req;
         src = c->req_src;
         pcm = c->req_pcm;
         samples = c->req_samples;
@@ -498,11 +511,29 @@ static void ch_sync(void)
         ta = c->req_tone_amp;
         portEXIT_CRITICAL(&s_mix_mux);
 
-        if (req && (!c->run_active || c->run_gen != gen)) {
+        if (req && resume && c->paused) {
+            /* T4.3 续播：从暂停点恢复，**不清 wr/rd/ring**；10ms 淡入由 fade_in_env 保证 */
+            portENTER_CRITICAL(&s_mix_mux);
+            c->resume_req = false;
+            portEXIT_CRITICAL(&s_mix_mux);
+            c->paused = false;
+            c->run_active = true;
+            c->closed = false;
+            c->fade_started = false;
+            c->fade_in_env = 0;
+            c->fade_out_left = 0;
+            c->fade_out_env = 65536;
+            c->fade_out_total = 0;
+        } else if (req && !c->paused && (!c->run_active || c->run_gen != gen)) {
+            /* T4.3：暂停态的 CH_MUSIC 保持 req_active（cleanup 跳过了它），**不能被下一个作业
+             * 当成"新请求"重置**——否则 ring/wr/rd 会被清零、暂停点丢失。续播只走上面的
+             * resume 分支（resume_req），切歌先 stop_url() 再 play_url()。 */
             c->wr = 0;
             c->rd = 0;
             c->run_gen = gen;
             c->closed = false;
+            c->paused = false;
+            c->resume_req = false;
             c->fade_started = false;
             c->fade_in_env = 0;
             c->fade_out_left = 0;
@@ -545,7 +576,7 @@ static void ch_update_end(void)
 {
     for (int i = 0; i < AUDIO_PLAYER_CH_NUM; i++) {
         mix_ch_t *c = &s_ch[i];
-        if (!c->run_active) {
+        if (!c->run_active || c->paused) {
             continue;
         }
         const uint32_t level = c->wr - c->rd;
@@ -652,7 +683,7 @@ static bool mix_render(int16_t *out, uint32_t frames)
         int32_t acc = 0;
         for (int ch = 0; ch < AUDIO_PLAYER_CH_NUM; ch++) {
             mix_ch_t *c = &s_ch[ch];
-            if (!c->run_active) {
+            if (!c->run_active || c->paused) {
                 continue;
             }
             if (c->wr == c->rd) {
@@ -826,6 +857,46 @@ static bool mix_loop_run(int16_t *out, play_job_kind_t kind, bool *aborted, bool
         const int64_t t0 = esp_timer_get_time();
         ch_sync();
 
+        /* T4.3 暂停：块边界给 CH_MUSIC 做 fade_ms 线性淡出，时间到就走"暂停退出"专用路径。
+         * 用墙钟而不是 ring 余量判完成：ring 欠载时淡出包络可能停在中间，不能让暂停卡住。 */
+        if (kind == PLAY_JOB_PUMP) {
+            mix_ch_t *m = &s_ch[AUDIO_PLAYER_CH_MUSIC];
+            if (s_music_pause_req && s_music_active) {
+                if (!s_music_pause_fade_started) {
+                    const uint32_t fade_frames =
+                        (s_music_pause_fade_ms * AUDIO_IO_SPK_SAMPLE_RATE / 1000u) + 1u;
+                    m->fade_started = true;
+                    m->fade_out_total = fade_frames;
+                    m->fade_out_left = fade_frames;
+                    m->fade_out_env = 65536;
+                    m->fade_out_step = (65536u + fade_frames - 1u) / fade_frames;
+                    /* 从真正开始淡出的块算满 fade_ms（请求可能落在块边界之后） */
+                    s_music_pause_req_us = esp_timer_get_time();
+                    s_music_pause_fade_started = true;
+                }
+                if (esp_timer_get_time() - s_music_pause_req_us >=
+                    (int64_t)s_music_pause_fade_ms * 1000) {
+                    /* 暂停退出：只结束本通道的混音参与，不清 wr/rd、不置 closed；
+                     * 播放器让给提示音/TTS，resume 时按保留的位置续播。 */
+                    m->paused = true;
+                    m->run_active = false;
+                    m->closed = false;
+                    s_music_pause_fade_started = false;
+                    s_music_pause_req = false;
+                    ESP_LOGI(TAG, "music paused（played_frames 冻结，ring/wr/rd 保留）");
+                    break;
+                }
+            } else if (m->fade_out_left > 0 && !m->closed && !m->paused) {
+                /* resume 抢先于暂停淡出结束：取消淡出，10ms 淡入回到原音量 */
+                m->fade_out_left = 0;
+                m->fade_out_env = 65536;
+                m->fade_in_env = 0;
+                m->resume_req = false;
+                s_music_resume_req = false;
+                s_music_pause_fade_started = false;
+            }
+        }
+
         if (kind == PLAY_JOB_STREAM) {
             /* R4：已有淡出请求时，vc_cancel 的立即 abort 不得截断淡出 */
             if (s_stream_abort_req && s_stop_total_frames == 0) {
@@ -886,10 +957,10 @@ static bool mix_loop_run(int16_t *out, play_job_kind_t kind, bool *aborted, bool
         bool pending = false;
         portENTER_CRITICAL(&s_mix_mux);
         for (int ch = 0; ch < AUDIO_PLAYER_CH_NUM; ch++) {
-            if (s_ch[ch].run_active) {
+            if (s_ch[ch].run_active && !s_ch[ch].paused) {
                 running = true;
             }
-            if (s_ch[ch].req_active) {
+            if (s_ch[ch].req_active && !s_ch[ch].paused) {
                 pending = true;
             }
         }
@@ -927,18 +998,29 @@ static bool mix_loop_run(int16_t *out, play_job_kind_t kind, bool *aborted, bool
         }
     }
 
-    /* 收尾：撤销所有请求 + 停通道（ring 丢弃） */
+    /* 收尾：撤销所有请求 + 停通道（ring 丢弃）。
+     * T4.3 例外：暂停态跳过 CH_MUSIC 的清理——保留 ring、wr/rd、floor 位置与 req_active，
+     * 让 resume 能从暂停点续播。其它通道照旧清理。 */
+    const bool music_paused = s_ch[AUDIO_PLAYER_CH_MUSIC].paused;
     portENTER_CRITICAL(&s_mix_mux);
     for (int ch = 0; ch < AUDIO_PLAYER_CH_NUM; ch++) {
+        if (ch == AUDIO_PLAYER_CH_MUSIC && music_paused) {
+            continue;
+        }
         s_ch[ch].req_active = false;
     }
     s_mix_pump_running = false;
     portEXIT_CRITICAL(&s_mix_mux);
     for (int ch = 0; ch < AUDIO_PLAYER_CH_NUM; ch++) {
+        if (ch == AUDIO_PLAYER_CH_MUSIC && music_paused) {
+            continue;
+        }
         s_ch[ch].run_active = false;
         s_ch[ch].closed = true;
         s_ch[ch].wr = 0;
         s_ch[ch].rd = 0;
+        s_ch[ch].paused = false;
+        s_ch[ch].resume_req = false;
     }
     return ok;
 }
@@ -1513,6 +1595,24 @@ static void player_task(void *arg)
             /* 探针泵没有业务回调；停止请求也在这里清掉 */
             s_mix_pump_job = false;
             s_mix_stop_req = false;
+            /* T4.3：resume 恰好发生在暂停退出瞬间（PUMP 已结束、resume 看到 pump 还在跑）
+             * 时，由播放任务补一次入队，避免"paused=false 但没有泵"的静默卡死。 */
+            if (s_music_resume_req && s_music_active) {
+                s_music_resume_req = false;
+                if (!s_mix_pump_running) {
+                    portENTER_CRITICAL(&s_mix_mux);
+                    s_mix_pump_running = true;
+                    portEXIT_CRITICAL(&s_mix_mux);
+                    const play_job_t pump = {.kind = PLAY_JOB_PUMP};
+                    if (xQueueSend(s_queue, &pump, 0) != pdTRUE) {
+                        portENTER_CRITICAL(&s_mix_mux);
+                        s_mix_pump_running = false;
+                        portEXIT_CRITICAL(&s_mix_mux);
+                        s_music_paused = true; /* 入队失败：保持诚实的暂停态 */
+                        ESP_LOGW(TAG, "music resume: queue full");
+                    }
+                }
+            }
         } else {
             notify_done(src, ok);
         }
@@ -2118,6 +2218,12 @@ esp_err_t audio_player_music_start(uint32_t sample_rate_hint)
     s_music_sound_seen = false;
     s_music_in_underrun = false;
     s_music_drop_req = false;
+    s_music_paused = false;
+    s_music_pause_req = false;
+    s_music_resume_req = false;
+    s_music_pause_fade_started = false;
+    c->paused = false;
+    c->resume_req = false;
     s_music_start_us = esp_timer_get_time();
     s_music_first_us = 0;
     portENTER_CRITICAL(&s_music_mux);
@@ -2156,9 +2262,14 @@ size_t audio_player_music_write(const int16_t *pcm48, size_t frames, uint32_t ti
     if (!pcm48 || frames == 0 || !s_music_ring) {
         return 0;
     }
+    /* T4.3：暂停期间生产者立即返回 0（不计 write_timeouts、不计 underrun），
+     * source_http 据此阻塞等待，不读 socket。 */
+    if (s_music_paused) {
+        return 0;
+    }
     const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     size_t done = 0;
-    while (done < frames && s_music_active) {
+    while (done < frames && s_music_active && !s_music_paused) {
         const uint32_t w = __atomic_load_n(&s_music_wr, __ATOMIC_RELAXED);
         const uint32_t r = __atomic_load_n(&s_music_rd, __ATOMIC_ACQUIRE);
         const uint32_t space = MUSIC_RING_FRAMES - (w - r);
@@ -2199,9 +2310,38 @@ esp_err_t audio_player_music_stop(void)
         return ESP_ERR_NOT_SUPPORTED;
     }
     const bool was_active = s_music_active;
+    const bool was_paused = s_music_paused;
     s_music_active = false;
     s_music_eof = true;
+    s_music_pause_req = false;
+    s_music_paused = false;
+    s_music_resume_req = false;
+    s_music_pause_fade_started = false;
     s_music_drop_req = true; /* 实际丢弃由 ch_pump（消费侧）执行，避免 rd 双写 */
+
+    /* T4.3：暂停态没有 PUMP 消费者，没有人会执行 drop_req / 清通道状态；
+     * 这里直接丢弃 ring 并结束 CH_MUSIC，保证 stop_url() 在暂停态也能 active=false。
+     * 若 PUMP 还在淡出（c->paused=false）则交给它自己收尾，避免与 player 任务双写。 */
+    bool channel_paused = false;
+    if (s_music_ring) {
+        portENTER_CRITICAL(&s_mix_mux);
+        channel_paused = s_ch[AUDIO_PLAYER_CH_MUSIC].paused;
+        portEXIT_CRITICAL(&s_mix_mux);
+    }
+    if (was_paused && (channel_paused || !s_mix_pump_job)) {
+        portENTER_CRITICAL(&s_mix_mux);
+        mix_ch_t *c = &s_ch[AUDIO_PLAYER_CH_MUSIC];
+        c->run_active = false;
+        c->closed = true;
+        c->paused = false;
+        c->resume_req = false;
+        c->req_active = false;
+        c->wr = 0;
+        c->rd = 0;
+        portEXIT_CRITICAL(&s_mix_mux);
+        const uint32_t w = __atomic_load_n(&s_music_wr, __ATOMIC_ACQUIRE);
+        __atomic_store_n(&s_music_rd, w, __ATOMIC_RELEASE);
+    }
     return was_active ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
@@ -2227,6 +2367,90 @@ esp_err_t audio_player_music_stop_url(void)
 bool audio_player_music_active(void)
 {
     return s_music_active;
+}
+
+bool audio_player_music_paused(void)
+{
+    return s_music_paused;
+}
+
+esp_err_t audio_player_music_pause(uint32_t fade_ms)
+{
+    if (!s_music_ring) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!s_music_active) {
+        return ESP_ERR_INVALID_STATE; /* 还没起播/已经停了：由调用方重试或放弃 */
+    }
+    if (s_music_paused) {
+        return ESP_OK; /* 幂等：已暂停再 pause */
+    }
+    /* 没有正在跑的 PUMP 可消费暂停请求（正常收尾的 150ms 冲刷窗口）：让调用方重试/按 EOF
+     * 收尾，不能接受一个永远不会生效的暂停（否则状态会谎报 paused）。 */
+    if (!s_mix_pump_running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (fade_ms == 0) {
+        fade_ms = 1;
+    } else if (fade_ms > 1000) {
+        fade_ms = 1000;
+    }
+    /* 先把暂停参数写好，再置请求标志（player 任务按 s_music_pause_req 消费） */
+    s_music_pause_fade_ms = fade_ms;
+    s_music_pause_req_us = esp_timer_get_time();
+    s_music_resume_req = false;
+    s_music_pause_req = true;
+    s_music_paused = true; /* 对外的暂停态：淡出属于暂停过程 */
+    source_http_pause();   /* 暂停拉流（任务不退出、不读 socket；失败可能是任务已 EOF） */
+    return ESP_OK;
+}
+
+esp_err_t audio_player_music_resume(void)
+{
+    if (!s_music_ring) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!s_music_active || !s_music_paused) {
+        return ESP_ERR_INVALID_STATE; /* 未暂停不能 resume */
+    }
+    /* 暂停淡出还没结束（pause_req 仍在）时允许 resume：mix_loop 会取消淡出并 10ms 淡入；
+     * 若请求已经丢了（c->paused=false 且没有 pause_req），不能假装续播。 */
+    portENTER_CRITICAL(&s_mix_mux);
+    const bool channel_paused = s_ch[AUDIO_PLAYER_CH_MUSIC].paused;
+    portEXIT_CRITICAL(&s_mix_mux);
+    /* 允许"淡出还没结束就 resume"（PUMP 还在跑，可以取消淡出）；请求已经丢了则不能假装续播 */
+    if (!channel_paused && !(s_music_pause_req && s_mix_pump_running)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_music_resume_req = true;
+    s_music_pause_req = false; /* 若暂停淡出还没结束：块边界取消淡出 */
+    s_music_paused = false;
+    source_http_resume(); /* 任务已退出（长暂停断流）时返回错误，交给 EOF 探测兜底 */
+
+    portENTER_CRITICAL(&s_mix_mux);
+    s_ch[AUDIO_PLAYER_CH_MUSIC].resume_req = true;
+    const bool enqueue = !s_mix_pump_running;
+    if (enqueue) {
+        s_mix_pump_running = true;
+    }
+    portEXIT_CRITICAL(&s_mix_mux);
+
+    if (enqueue) {
+        const play_job_t job = {.kind = PLAY_JOB_PUMP};
+        if (xQueueSend(s_queue, &job, 0) != pdTRUE) {
+            portENTER_CRITICAL(&s_mix_mux);
+            s_mix_pump_running = false;
+            s_ch[AUDIO_PLAYER_CH_MUSIC].resume_req = false;
+            portEXIT_CRITICAL(&s_mix_mux);
+            s_music_resume_req = false;
+            s_music_paused = true; /* 入队失败：回到诚实暂停态，由 session 走兜底 */
+            ESP_LOGW(TAG, "music resume: queue full");
+            return ESP_ERR_TIMEOUT;
+        }
+        s_music_resume_req = false;
+    }
+    ESP_LOGI(TAG, "music resume（从暂停点续播，10ms 淡入）");
+    return ESP_OK;
 }
 
 esp_err_t audio_player_music_stats_read(audio_player_music_stats_t *out)

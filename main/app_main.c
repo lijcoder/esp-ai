@@ -16,6 +16,7 @@
 #include "event_bus.h"
 #include "feedback.h"
 #include "music_cloud.h"
+#include "music_session.h"
 #include "net_mgr.h"
 #include "prompt_assets.h"
 #include "transport_ws.h"
@@ -96,6 +97,10 @@ void app_main(void)
 
     /* 会话状态机（T3.1）放在 vc 之后：订阅事件总线 + vc 回调 + 播放完成回调，不建任务 */
     ESP_ERROR_CHECK(vs_init());
+
+    /* 音乐编排（T4.3）放在 vs 之后：注册 mc 回调 + 订阅 VOICE_STATE_CHANGED（语音抢占）；
+     * 两个 esp_timer（起播重试/周期上报+EOF 探测），不建任务 */
+    ESP_ERROR_CHECK(ms_init());
 
     /* 物理交互（T3.4）放在 vs 之后：LED 订阅 VOICE_STATE_CHANGED、按键投 APP_EVT_BUTTON
      * （由 vs 消费为打断/起轮）；静音改音量走 audio_player。不建任务（仅两个 esp_timer） */

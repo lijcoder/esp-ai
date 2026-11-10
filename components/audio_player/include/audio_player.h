@@ -187,6 +187,29 @@ esp_err_t audio_player_music_stop_url(void);
 /* 自然结束（HTTP 流读到 EOF）：保留 ring 里已写入的数据播完再收尾。 */
 esp_err_t audio_player_music_end(void);
 
+/* ---------------- 音乐暂停/继续（T4.3） ----------------
+ * 暂停 ≠ 停止：`s_music_active` 保持 true，CH_MUSIC 通道 ring 与 wr/rd 保留，
+ * `s_music_stats` 不清零（played_frames 冻结在暂停点）；暂停期间不消费 ring、
+ * 不统计 underrun、不触发 EOF。暂停退出 PUMP 作业，把播放器让给提示音/TTS。
+ *
+ * 线程模型：任意任务可调用；只置请求标志，实际淡出/退出在 player 任务块边界完成。
+ * `audio_player_music_paused()` 在请求被接受后即为 true（淡出是暂停过程的一部分）。
+ *
+ * @param fade_ms 淡出时长（ms；0 → CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS 同量级由调用方给）
+ * @return ESP_OK / ESP_ERR_INVALID_STATE（未 active 或播放器已经开始暂停）/ ESP_ERR_NOT_SUPPORTED
+ *
+ * @note 已暂停再 pause 返回 ESP_OK（幂等）；stop_url() 在暂停态必须能取消暂停、丢弃 ring、
+ *       active=false（契约 §2.3）。
+ */
+esp_err_t audio_player_music_pause(uint32_t fade_ms);
+
+/* 从暂停点续播：重新入队 PUMP（不复用 music_start，避免清 ring），淡入 10ms。
+ * 未暂停返回 ESP_ERR_INVALID_STATE。源任务已退出/队列满返回错误。 */
+esp_err_t audio_player_music_resume(void);
+
+/* 当前是否处于暂停（含刚请求、正在淡出的窗口） */
+bool audio_player_music_paused(void);
+
 bool audio_player_music_active(void);
 esp_err_t audio_player_music_stats_read(audio_player_music_stats_t *out);
 

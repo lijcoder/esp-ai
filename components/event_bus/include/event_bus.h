@@ -130,6 +130,20 @@ typedef struct {
     uint8_t reserved[3];
 } app_evt_feedback_t;
 
+/* ---------------- 音乐状态事件 payload（T4.3 定稿，见 build/t43_contract.md §7） ----------------
+ * APP_EVT_MUSIC_STATE_CHANGED / APP_EVT_MUSIC_ERROR 共用本结构（20B）。
+ * to=MC_STATE_ERROR 时 APP_EVT_MUSIC_ERROR 也会投递（reason 带错误类别 3=错误）。
+ * mid=0 表示当前没有曲目（IDLE/STOPPED 后服务端尚未下发新曲目）。 */
+typedef struct {
+    uint16_t mid;        /* 曲目 mid（无曲目为 0） */
+    uint8_t from;        /* mc_state_t 数值（0=idle/1=playing/2=paused/3=stopped/4=error） */
+    uint8_t to;          /* mc_state_t 数值 */
+    uint8_t reason;      /* 0=起播 1=协议 2=EOF 3=错误 4=语音抢占 5=用户暂停 6=用户继续 7=停止 */
+    uint8_t reserved[3];
+    uint32_t progress_ms;
+    uint32_t dur_ms;
+} app_evt_music_state_t;
+
 /*
  * 事件 payload 统一容器：定长 32 字节，跨任务投递时整块拷贝，发布方无需保活。
  * 新增字段时不得让 union 超过 APP_EVT_DATA_MAX；payload 超过 32B 的文本类数据
@@ -144,8 +158,12 @@ typedef union {
     app_evt_voice_state_t voice_state;
     app_evt_button_t button;
     app_evt_feedback_t feedback;
+    app_evt_music_state_t music_state;
     uint8_t raw[APP_EVT_DATA_MAX];
 } app_evt_data_t;
+
+/* 音乐状态 payload 必须装进 32B 容器（T4.3 契约 §7：20B） */
+_Static_assert(sizeof(app_evt_music_state_t) <= APP_EVT_DATA_MAX, "music_state payload too large");
 
 /*
  * 事件处理器：在 event_bus 的 `evt` 任务上下文（核 0）执行，不要做耗时/阻塞操作。

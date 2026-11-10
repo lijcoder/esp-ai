@@ -1,0 +1,68 @@
+menu "Music Session (音乐控制 T4.3)"
+
+    config MS_PAUSE_FADE_MS
+        int "音乐暂停淡出时长（毫秒）"
+        range 20 500
+        default 100
+        help
+            T4.3：暂停/语音抢占时对 CH_MUSIC 做线性淡出，然后退出 PUMP 作业
+            （保留 ring/wr/rd，resume 从暂停点续播）。淡出太短会有 pop，
+            太长会让"暂停 1s 内静音"的真机验收（PV-014）更容易踩线。
+
+    config MS_AUTO_PAUSE_ON_VOICE
+        bool "语音进入活跃态时自动暂停音乐"
+        default y
+        help
+            契约 §4：语音进入 LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR 时，
+            音乐 PLAYING 且不是用户暂停 → auto-pause（pause_reason=2）。
+            T4.4 会改成叠加 + duck，本开关届时可关闭。
+
+    config MS_AUTO_RESUME_ON_IDLE
+        bool "语音回 IDLE 时自动恢复因语音抢占而暂停的音乐"
+        default y
+        help
+            只有 pause_reason=2（语音抢占）才自动恢复；用户暂停（reason=1）
+            必须保持暂停，不得被覆盖。
+
+    config MS_RESUME_FALLBACK_REQUEST
+        bool "继续失败时兜底发一次 music_request"
+        default y
+        help
+            长暂停后服务端 idle 超时/TCP 断，播放器 resume 可能拿不到数据。
+            开启后每个暂停周期最多发一次 music_request{play,index=0}（服务端自选），
+            由服务端重新下发 music_track（T4.5 用 Range 做真续播前的临时兜底）。
+
+    config MS_STATUS_PERIOD_MS
+        int "music_status 周期上报（毫秒）"
+        range 1000 60000
+        default 5000
+        help
+            状态变化仍立即上报一次；播放中/暂停中都按本周期上报
+            （paused 时 progress_ms 冻结）。EOF 探测也复用这个定时器。
+
+    config MS_PLAY_RETRY_MS
+        int "起播/切歌重试间隔（毫秒）"
+        range 20 1000
+        default 120
+        help
+            切歌 = 先 stop_url() 再 play_url()。停止是异步的（music_http 任务要退出），
+            旧任务未退出时 play_url 返回 ESP_ERR_INVALID_STATE，按本间隔重试。
+
+    config MS_PLAY_MAX_RETRIES
+        int "起播/切歌最大重试次数"
+        range 0 50
+        default 15
+        help
+            默认 120ms × 15 ≈ 1.8s，覆盖 HTTP 读超时内的任务退出窗口；
+            超过仍失败按 MC_STATE_ERROR 上报并投 APP_EVT_MUSIC_ERROR。
+
+    config MS_EOF_GUARD_MS
+        int "起播后 EOF 保护窗口（毫秒）"
+        range 500 10000
+        default 1500
+        help
+            play_url 成功只代表 music_http 任务已创建；HTTP 建连/预填期间
+            audio_player_music_active() 还是 false，不能据此判"播完了"。
+            窗口内 EOF 探测直接跳过（沿用 T4.2 的 1.5s 口径）。
+
+endmenu

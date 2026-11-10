@@ -1,3 +1,5 @@
 # make -C test/host 生成的编译产物，不入库
 /prompt_pack_test
 /feedback_policy_test
+
+/music_policy_test

@@ -31,8 +31,16 @@ typedef struct {
 /* 启动拉流任务；已有一个在跑时返回 ESP_ERR_INVALID_STATE。 */
 esp_err_t source_http_play(const char *url);
 
-/* 请求停止：立即静音（music_stop），任务在 HTTP 读超时内自行退出并销毁。 */
+/* 请求停止：立即静音（music_stop），任务在 HTTP 读超时内自行退出并销毁。
+ * T4.3：暂停态也必须能停止（取消暂停门控、丢弃 ring、active=false）。 */
 esp_err_t source_http_stop(void);
+
+/* T4.3 暂停门控：任务不退出、不读 socket（ring 满靠 TCP 背压），
+ * `audio_player_music_write()` 在暂停期立即返回 0（不计 timeout/underrun）。
+ * 暂停期用 50ms 轮询等待；stop 会把任务从等待中唤醒并退出。 */
+esp_err_t source_http_pause(void);
+esp_err_t source_http_resume(void);
+bool source_http_paused(void);
 
 bool source_http_active(void);
 

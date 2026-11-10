@@ -1,29 +1,3 @@
-menu "Music Cloud (音乐协议)"
-
-    config MC_STATUS_PERIOD_MS
-        int "音乐播放状态上报周期（毫秒）"
-        range 1000 60000
-        default 5000
-        help
-            ARCHITECTURE §8.3 / ROADMAP T4.2：播放中每 5s 上报一次 music_status
-            （state + progress_ms）。调小会增加 WS 上行帧与发送队列占用（内部 RAM），
-            只在调试时改小。
-
-    config MC_PLAY_RETRY_MS
-        int "切歌时重试 play_url 的间隔（毫秒）"
-        range 20 1000
-        default 120
-        help
-            T4.2：切歌 = 先停旧的 music_http 任务再起新的。停止是异步的（任务要等
-            HTTP 读超时 / 100ms 淡出结束才退出），旧任务未退出时 play_url 返回
-            ESP_ERR_INVALID_STATE，本组件按该间隔重试。
-
-    config MC_PLAY_MAX_RETRIES
-        int "切歌时 play_url 最大重试次数"
-        range 0 50
-        default 15
-        help
-            默认 120ms × 15 ≈ 1.8s，覆盖 HTTP 读超时（CONFIG_AUDIO_PLAYER_MUSIC_HTTP_TIMEOUT_MS）
-            内的任务退出窗口；超过仍失败按 MC_STATE_ERROR 上报。
-
-endmenu
+# music_cloud（T4.3 起纯协议）没有可调参数：
+# - 上报周期 / 起播重试已迁到 music_session 的 MS_*（CONFIG_MC_* 不再存在）；
+# - URL/标题上限来自 audio_player 的 CONFIG_AUDIO_PLAYER_MUSIC_URL_MAX 与头文件 MC_TITLE_MAX。

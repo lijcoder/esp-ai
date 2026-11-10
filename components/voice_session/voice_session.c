@@ -738,21 +738,18 @@ static void vs_on_wake(void)
         ESP_LOGW(TAG, "会话进行中（%s），忽略本次唤醒", vs_state_name(vs_get_state()));
         return;
     }
-    /* R3：音乐/本地长播中唤醒**不丢弃**（麦克风本来就没关）。单输出通道（P4 才有混音）
-     * 下先把音乐淡出、把通道让给提示音/TTS；duck 叠加播放归 T3.3 混音 + T4.4。 */
-    bool music_playing = false;
-    if (audio_player_is_busy()) {
-        audio_player_src_t cur = AUDIO_PLAYER_SRC_PCM;
-        if (audio_player_current_src(&cur) && cur == AUDIO_PLAYER_SRC_MP3_FILE) {
-            music_playing = true;
-        } else {
-            /* 提示音/TTS 收尾中：本地会话不插队（避免两路提示音叠在一起） */
-            portENTER_CRITICAL(&s_mux);
-            s_stats.wakes_dropped++;
-            portEXIT_CRITICAL(&s_mux);
-            ESP_LOGW(TAG, "播放器忙（提示音/TTS 收尾），忽略本次唤醒");
-            return;
-        }
+    /* R3：音乐播放中唤醒**不丢弃**（麦克风本来就没关）。T4.3 起音乐暂停/恢复统一由
+     * music_session 订阅 VOICE_STATE_CHANGED 处理（见 components/music_session）；
+     * 这里只保留"播放器忙（提示音/TTS 收尾）→ 忽略唤醒"判断，不再淡出音乐。 */
+    /* 只有"音乐正在出声"才允许在播放器忙时放行唤醒；音乐暂停时播放器忙 = 提示音/TTS 收尾 */
+    const bool music_playing = audio_player_music_active() && !audio_player_music_paused();
+    if (audio_player_is_busy() && !music_playing) {
+        /* 提示音/TTS 收尾中：本地会话不插队（避免两路提示音叠在一起） */
+        portENTER_CRITICAL(&s_mux);
+        s_stats.wakes_dropped++;
+        portEXIT_CRITICAL(&s_mux);
+        ESP_LOGW(TAG, "播放器忙（提示音/TTS 收尾），忽略本次唤醒");
+        return;
     }
 
     uint16_t sid;
@@ -774,15 +771,7 @@ static void vs_on_wake(void)
         return;
     }
 
-    if (music_playing) {
-        ESP_LOGW(TAG, "音乐播放中唤醒（R3）：淡出音乐让出输出通道 %d ms（混音叠加归 T3.3/P4）",
-                 CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS);
-        esp_err_t ferr = audio_player_fade_out_and_stop(CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS);
-        if (ferr != ESP_OK) {
-            ESP_LOGW(TAG, "音乐淡出请求失败（%s），提示音将排队等它播完",
-                     esp_err_to_name(ferr));
-        }
-    }
+    /* 音乐播放中唤醒不再在这里淡出：暂停/自动恢复归 music_session（契约 §4）。 */
 
     const prompt_clip_t *wake_clip = prompt_assets_get(PROMPT_WAKE_OK);
     if (wake_clip == NULL || wake_clip->pcm == NULL || wake_clip->samples == 0) {

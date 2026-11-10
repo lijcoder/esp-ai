@@ -25,6 +25,13 @@
   - `stream_abort`：≤20ms 内停止写音频并关 TX、丢弃 ring 剩余、回调 `ok=false`；
   - 流式 active 期间拒绝 `play_pcm`/`play_mp3`，`is_busy()` 返回 true；
 - **远端音乐（T4.1）**：`music play <http(s)://...>` → 独立任务 `music_http`（核 0/优先级 4/栈 6KB，**按需创建/停止销毁**）用 `esp_http_client` 拉流 → **独立 minimp3 实例**（`mp3_stream_*`，PSRAM ~38KB，与 TTS 实例并发互不共享）→ 重采样 44.1k/48k → 48k 单声道 → PSRAM PCM ring（`AUDIO_PLAYER_MUSIC_RING_MS`，默认 1000ms）→ `CH_MUSIC`。起播前预填 150ms；停止 = 丢弃 ring + 100ms 淡出，任务在 HTTP 读超时内退出。URL 只接受 `http(s)`、≤320B；流中采样率变化中止；暂不支持 seek/Range（T4.5）；
+- **音乐暂停/继续（T4.3）**：`audio_player_music_pause(fade_ms)` 在 `mix_loop_run()` 块边界给
+  `CH_MUSIC` 做 `fade_ms` 线性淡出，然后走"暂停退出"专用路径结束 PUMP 作业——**保留
+  `CH_MUSIC` ring 与 `wr/rd`、保留 `s_music_stats`（`played_frames` 冻结）**，把播放器让给
+  提示音/TTS；暂停期不消费 ring、不统计 underrun、不触发 EOF。`audio_player_music_resume()`
+  重新入队 PUMP（**不复用 `music_start()`**，避免清 ring），10ms 淡入从暂停点续播。
+  `source_http` 同步暂停拉流（任务不退出、不读 socket），`audio_player_music_write()` 在暂停期
+  立即返回 0（不计 timeout/underrun）；`stop_url()` 在暂停态也能取消暂停、丢弃 ring、`active=false`。
 - 软件音量 0~100（MAX98357A 无数字音量，增益由 SD 电阻固定）：混音后、限幅前施加，20ms 插值；
 - 淡入 10ms / 淡出 100ms；软限幅 -1dBFS（见上）；
 - 播放结束：静音冲刷 DMA + 150ms 延时 + 关 TX；完成回调带 300ms 尾部延时（半双工规则 R2）；
@@ -65,7 +72,11 @@
 - **T4.1 音乐**：`audio_player_music_play_url(url)` / `audio_player_music_stop_url()`（起停拉流任务），
   `audio_player_music_start(rate)` / `audio_player_music_write(pcm48, frames, timeout)` /
   `audio_player_music_end()` / `audio_player_music_stop()`（通道级，给 `source_http` 用），
-  `audio_player_music_active()`、`audio_player_music_stats_read()`（`MUSICSTAT`/`MUSICHTTP` 字段）。
+  `audio_player_music_active()`、`audio_player_music_stats_read()`（`MUSICSTAT`/`MUSICHTTP` 字段）；
+- **T4.3 暂停**：`audio_player_music_pause(fade_ms)` / `audio_player_music_resume()` /
+  `audio_player_music_paused()`；已暂停再 pause 幂等返回 `ESP_OK`，未暂停 resume 返回
+  `ESP_ERR_INVALID_STATE`。暂停态 `active()` 仍为 true，`paused()` 才区分；`play_url()` 在
+  暂停态返回 `ESP_ERR_INVALID_STATE`（调用方先 `stop_url()`）。
 
 ## 配置（Kconfig）
 
@@ -162,8 +173,8 @@ duck: on=0 gain_q8=256 out_peak=15563 stop: last_stop_ms=79 stops=1
 
 ## 后续（P3/P4）
 
-- 多通道：`CH_TTS` / `CH_PROMPT` / `CH_MUSIC` + 混音 + ducking（T3.3 做混音/限幅，T4.4 做音乐 duck 叠加与恢复；T3.2 已把打断淡出与 duck 增益统一放在输出级 `out_process()`，混音接同一位置）；
+- 多通道：`CH_TTS` / `CH_PROMPT` / `CH_MUSIC` + 混音 + ducking（T3.3 做混音/限幅，T4.4 做音乐 duck 叠加与恢复；T4.3 的语音抢占走"暂停让路"，不改 duck）；
 - 音源抽象：`source_http`（HTTP 流）/`source_file`（FATFS），P4；
-- 流式音乐（T4.x）可复用本组件的 stream API（codec=1），只需扩 codec/声道策略。
+- T4.5：暂停/续播改 Range 做真续播（当前长暂停后依赖 `music_request` 从头兜底）。
 
 对应架构：[docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) §3.2、§3.7、§9.2、§9.3；验收：[docs/STATUS.md](../../docs/STATUS.md) §5。

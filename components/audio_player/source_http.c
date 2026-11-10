@@ -44,6 +44,7 @@ typedef struct {
 static char s_url[CONFIG_AUDIO_PLAYER_MUSIC_URL_MAX];
 static volatile bool s_stop_req;
 static volatile bool s_running;
+static volatile bool s_paused; /* T4.3：暂停门控（任务不退出、不读 socket） */
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 static source_http_stats_t s_stats;
 
@@ -66,6 +67,11 @@ static source_http_stats_t s_stats;
 bool source_http_active(void)
 {
     return s_running;
+}
+
+bool source_http_paused(void)
+{
+    return s_paused;
 }
 
 const char *source_http_url(void)
@@ -121,6 +127,44 @@ static size_t resample_frame(music_ctx_t *ctx, const int16_t *in, size_t n, int1
         ctx->pos_q16 = 0;
     }
     return o;
+}
+
+/* ---------------- 暂停门控（T4.3） ---------------- */
+
+/* 暂停期阻塞等待（50ms 轮询，契约允许 100ms 轮询）；stop 置 s_stop_req 后最迟 50ms 返回。 */
+static void gate_if_paused(void)
+{
+    while (s_paused && !s_stop_req) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+/* 把一块 48k PCM 写完；暂停时等待恢复后继续（已解码数据不丢），停止时立即返回。 */
+static size_t music_write_block(const int16_t *pcm, size_t frames, uint32_t timeout_ms)
+{
+    size_t off = 0;
+    while (off < frames && !s_stop_req) {
+        if (s_paused) {
+            gate_if_paused();
+            continue;
+        }
+        const size_t n = audio_player_music_write(pcm + off, frames - off, timeout_ms);
+        if (n > 0) {
+            off += n;
+            STAT_ADD(pcm_frames, (uint32_t)n);
+        }
+        if (off >= frames) {
+            break;
+        }
+        if (s_paused) {
+            continue; /* 暂停打断写入：恢复后从 off 继续，不计超时 */
+        }
+        if (n == 0) {
+            break; /* 已停止/通道不可用 */
+        }
+        STAT_ADD(write_timeouts, 1); /* ring 满写超时（部分写入） */
+    }
+    return off;
 }
 
 /* ---------------- 拉流任务 ---------------- */
@@ -186,6 +230,10 @@ static void music_task(void *arg)
 
     /* 预填 ~150ms：先不进混音，避免起播时的"空 ring 欠载" */
     while (!s_stop_req && ctx.prefill_n < MUSIC_PREFILL_FRAMES) {
+        gate_if_paused();
+        if (s_stop_req) {
+            break;
+        }
         const int r = esp_http_client_read(cli, (char *)rbuf, MUSIC_HTTP_BUF);
         if (r < 0) {
             ESP_LOGE(TAG, "HTTP read 失败");
@@ -249,13 +297,13 @@ static void music_task(void *arg)
         goto done;
     }
     started = true;
-    size_t written = audio_player_music_write(ctx.prefill, ctx.prefill_n, 500);
-    STAT_ADD(pcm_frames, (uint32_t)written);
-    if (written < ctx.prefill_n) {
-        STAT_ADD(write_timeouts, 1);
-    }
+    (void)music_write_block(ctx.prefill, ctx.prefill_n, 500);
 
     while (!s_stop_req) {
+        gate_if_paused();
+        if (s_stop_req) {
+            break;
+        }
         const int r = esp_http_client_read(cli, (char *)rbuf, MUSIC_HTTP_BUF);
         if (r < 0) {
             ESP_LOGW(TAG, "HTTP read 失败（流中断）");
@@ -267,6 +315,10 @@ static void music_task(void *arg)
         }
         STAT_ADD(http_bytes, (uint32_t)r);
         STAT_ADD(read_calls, 1);
+        gate_if_paused(); /* 暂停请求在 read 期间到达：本块数据留在 rbuf，恢复后再解码 */
+        if (s_stop_req) {
+            break;
+        }
         if (mp3_stream_feed(dec, rbuf, (size_t)r) != ESP_OK) {
             continue;
         }
@@ -290,17 +342,9 @@ static void music_task(void *arg)
                 break;
             }
             const size_t out = resample_frame(&ctx, pcm, samples, ctx.out, MUSIC_OUT_FRAMES);
-            size_t off = 0;
-            while (off < out && !s_stop_req) {
-                const size_t n = audio_player_music_write(ctx.out + off, out - off, 200);
-                STAT_ADD(pcm_frames, (uint32_t)n);
-                off += n;
-                if (n == 0) {
-                    break; /* 停止 */
-                }
-                if (off < out) {
-                    STAT_ADD(write_timeouts, 1);
-                }
+            const size_t off = music_write_block(ctx.out, out, 200);
+            if (s_stop_req || (off < out && !s_paused)) {
+                break; /* 停止/通道结束：本帧剩下的数据丢弃 */
             }
             STAT_ADD(decoded_frames, 1);
         }
@@ -349,6 +393,7 @@ esp_err_t source_http_play(const char *url)
     }
     memcpy(s_url, url, len + 1);
     s_stop_req = false;
+    s_paused = false;
     portENTER_CRITICAL(&s_stats_mux);
     memset(&s_stats, 0, sizeof(s_stats));
     s_stats.content_length = -1;
@@ -365,10 +410,31 @@ esp_err_t source_http_play(const char *url)
 
 esp_err_t source_http_stop(void)
 {
+    const bool was_running = s_running;
+    s_stop_req = true;
+    s_paused = false; /* 打断暂停门控，让任务在 ≤50ms 内退出 */
+    const esp_err_t err = audio_player_music_stop(); /* 立即静音（ring 丢弃 + 100ms 淡出） */
+    if (was_running) {
+        return ESP_OK;
+    }
+    /* 任务已 EOF/退出但音乐通道可能还在收尾（或暂停）：仍按调用方意图返回可停止 */
+    return (err == ESP_OK) ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t source_http_pause(void)
+{
     if (!s_running) {
         return ESP_ERR_INVALID_STATE;
     }
-    s_stop_req = true;
-    audio_player_music_stop(); /* 立即静音（ring 丢弃 + 100ms 淡出） */
+    s_paused = true;
+    return ESP_OK;
+}
+
+esp_err_t source_http_resume(void)
+{
+    if (!s_running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_paused = false;
     return ESP_OK;
 }

@@ -515,11 +515,12 @@ music_session ──music_request──> 服务端 ──music_track{url}──>
 继续：source_http_resume() → 重新入队 PUMP → 从暂停点续播（不清 ring、不回文件头）
 ```
 
-> **实现状态（2026-11-10，T4.3）**：T4.1 `source_http` + `music play/stop/stat` 探针、T4.2 `music_cloud` 协议、
-> T4.3 `music_session` 状态机与暂停/继续/切歌/`music_request`/语音抢占均已交付。
+> **实现状态（2026-11-10，T4.1–T4.3 真机验收通过）**：T4.1 `source_http` + `music play/stop/stat` 探针、T4.2 `music_cloud` 协议、
+> T4.3 `music_session` 状态机与暂停/继续/切歌/`music_request`/语音抢占均已交付并上板验证（`music_e2e_test` 62/62、`music_proto_test` 22/22）。
 > **尚未实现**：duck 叠加（T4.4）、seek/Range/断流重连（T4.5）、域名白名单。
 > `music_cloud` 与 `music_session` 都**不建任务**：解析在 `ws_client` 上下文，播放决策/重试/周期上报在两个 `esp_timer`。
-> **已知限制**：暂停超过服务端 idle 超时（或 TCP 断）后"继续"可能拿不到数据 → 转 ERROR/STOPPED 并发一次 `music_request` 兜底（从头播；Range 续播归 T4.5）；**语音活跃期间到达的新 `music_track` 排队到语音回 IDLE 才起播**（单作业播放器，`music_start()` 会被 TTS/提示音占用），期间 `music_status` 可能先带新 `mid`；`music_control{resume}` 在 TTS 播放中会把状态置 `playing` 但出声排在 TTS 之后（两条时序问题登记 PENDING **PD-006**）。
+> **语音期间的动作一律排队到 IDLE**（2026-11-10 真机修复）：新 `music_track` 排队起播；`music_control{resume}` 也排队——若立即 `audio_player_music_resume()` 会占用单作业播放器，紧接着的确认语 TTS 直接 `tts-fail`（真机日志 `VS: state THINKING -> ERROR（原因=tts-fail）`）。排队只在 `LISTENING/FOLLOW_UP`（新一轮）清空，`THINKING/SPEAKING` 期间保留；暂停/停止/切歌会丢弃排队项。
+> **已知限制**：暂停超过服务端 idle 超时（或 TCP 断）后"继续"可能拿不到数据 → 转 ERROR/STOPPED 并发一次 `music_request` 兜底（从头播；Range 续播归 T4.5；兜底路径真机未稳定触发，登记 **PV-015** 归 T4.5）；**语音活跃期间到达的新 `music_track` 排队到语音回 IDLE 才起播**，期间 `music_status` 可能先带新 `mid`（PENDING **PD-006**）。
 
 ### 8.4 音乐播放中唤醒
 
@@ -532,8 +533,9 @@ music_session ──music_request──> 服务端 ──music_track{url}──>
 ```
 
 > **T4.3 口径（过渡）**：单作业播放器下，语音轮次的提示音/TTS 必须先让音乐泵退出，所以唤醒是**暂停**而不是 duck，
-> 但行为闭环（唤醒 → 说话 → 按意图暂停/继续，且"用户暂停"不会被会话结束覆盖）。
+> 但行为闭环（唤醒 → 说话 → 按意图暂停/继续，且"用户暂停"不会被会话结束覆盖）。**真机验证（2026-11-10）**：唤醒 → `MS: 语音进入活跃态 → auto-pause（reason=voice）`（progress 冻结）→ 回 IDLE `auto-resume（从暂停点续播）`；用户暂停 reason=user 会话结束不恢复。
 > **T4.4** 改为"音乐继续播 + duck −12dB"（R3，100ms 斜坡），把"说暂停/继续"和"唤醒本身"彻底解耦，并做恢复时序验证。
+> **真机现象（2026-11-10，T4.4 必须解决）**：音乐出声时唤醒词被掩蔽——设备混音音量 100/15/10 时 `afplay lexin.wav`（系统 45%、`-v 2`）都无法唤醒，**音量 0 才稳定唤醒**；状态机路径本身正常（本机 T4.3 验收在 `--player-volume 0` 下完成）。
 
 ### 8.5 断线重连
 
@@ -624,7 +626,7 @@ THINKING 超时（10s）───┘
 > **T3.5 实测（2026-11-02，见 STATUS §5）**：提示音迁 `assets` 分区（自定义只读 pack + `esp_partition_mmap` 零拷贝）后，app bin **1,941,840 B（−176,656 B vs T3.6 的 2,118,496 B）**、Flash Data 516,940→337,596 B（−179,344 B，PCM 不再编进 app）；静态 DIRAM **199,766 B（+480 B：`prompt_store` 状态/表 + `diag prompt info`）**、无新增任务；提示音 PCM 常驻 `assets` 分区、**不占 RAM**（mmap 只占 MMU 页）；pack 缺失/损坏时降级不崩溃。**wss 水位未复测**，T5.3 归口。
 
 > **T4.2 构建口径（2026-11-10，未真机）**：新增 `components/music_cloud`（L3，不建任务）+ `diag` 的 `mc` 命令 + `voice_cloud` 音乐事件跳过后，`idf.py build` 通过（零告警）；bin **1,982,880 B**（+7,984 B vs T4.1 1,974,896 B）、总镜像 **1,982,760 B**、**静态 DIRAM 201,046 B（+784 B vs T4.1）**；无新任务、无堆分配（两个 esp_timer + 定长静态缓冲），PSRAM 零增量。播放期内部 RAM 预计与 T4.1 持平；**真机待板（PENDING PV-013）**。
-> **T4.1 构建口径（2026-11-10，未真机）**：新增 `source_http.c` + 音乐 API/Kconfig/diag 后，`idf.py build` 通过（自有代码零告警）；bin **1,974,896 B**（+33,056 B vs T3.5 收口 1,941,840 B，主要 `esp_http_client`/TLS 路径 + 音乐代码）、`idf.py size` 总镜像 **1,974,776 B**、**静态 DIRAM 200,262 B（+480 B）**。PSRAM 常驻 +96KB（音乐 PCM ring），播放期再 +~56KB（解码实例/预填/单帧输出）；内部 RAM 播放期 +6KB 任务栈 + ~8KB HTTP 缓冲（**待真机实测**，PENDING PV-012）。
+> **T4.1–T4.3 真机实测（2026-11-10，见 STATUS §5）**：bin **1,993,664 B**、总镜像 **1,993,540 B**、Flash Code 1,499,206 / Data 349,492、**静态 DIRAM 200,870 B**（4 个修复后与 T4.3 构建口径持平）。**音乐播放期内部堆峰值 231,544 B、最低水位 24,563 B**（`ws://`，44.1k/2ch）→ 静态+峰值 **432,414 B ≤440KB（余 ~7.6KB）**；**水位低于 30KB 线**（`music_http` 6KB 栈 + HTTP 缓冲），停止后回 52,915 B；PSRAM 峰值 **1,633,992 B**。任务：播放期 17（+`music_http`），停止后回基线；无新任务、无堆分配。**wss/音乐并发水位归 T5.3**。
 
 > **T4.3 构建口径（2026-11-10，未真机）**：`music_cloud` 瘦身为纯协议 + 新增 `music_session`（L4，不建任务）后，`idf.py build` 通过（自有代码零告警）；bin **1,993,152 B**（+10,272 B vs T4.2 的 1,982,880 B）、总镜像 **1,993,028 B**、**静态 DIRAM 200,870 B（−176 B vs T4.2 的 201,046 B）**——`music_cloud` 删掉播放状态/重试/定时器释放的约 0.6KB 抵消了 `music_session` 的状态/URL/标题缓冲。**无新任务**（`music_cloud` 的 2 个 esp_timer 迁到 `music_session`，总数不变）、**无堆/PSRAM 分配**（暂停复用已有 ring）。内部堆峰值与水位**未复测**（无板，PV-014）：按 T3.5 口径估算静态+峰值约 **426KB ≤440KB**，`ws://` 水位约 32.5KB 量级，**wss 与水位的正式复测归 T5.3**。播放期内部 RAM 预计与 T4.1/T4.2 持平（`music_http` 6KB 栈 + HTTP 缓冲仅在播放期）。
 

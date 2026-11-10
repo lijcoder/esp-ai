@@ -119,47 +119,17 @@
 | 关闭条件 | 真机 ≥2 轮：首声早于 LLM 完成、`underrun=0`、R2 正常、无 ERROR/断流；按键打断与中途断网各 1 次正常回 IDLE |
 | 关联 | `tools/mock_pipeline.py`、`tools/README.md`「LLM 边出字边播」、STATUS §3 2026-11-10 行、PROTOCOL §3.2 |
 
-### PV-011 · M1 音乐链路（mock `--music`）真机验证
+### PV-015 · 长暂停 / 服务端断流后的「继续」兜底（归 T4.5）
 | 项 | 内容 |
 |---|---|
-| 提出时间 | **2026-11-10 16:2x（采样）**，M1 mock 侧交付时登记 |
-| 来源 | 用户确认「后端 mock 接的是 Hermes 网关、不能传 tool，ESP32 也不该做 NLU」后，采纳 M1 双通道方案：mock 用确定性规则表把 ASR 文本变成 `music_track` / `music_control`，LLM 只负责说话 |
-| 现象/问题 | 离线假设备已验证 178 项（意图/曲库/HTTP Range/事件顺序/未启用不误发），但**未在 ESP32 真机**验证：设备能拉到 mock 内置 HTTP 的 `music_track.url`、能播 6.3s 示例曲目、说「暂停/继续/下一首/停止」时的端侧响应（T4.2/T4.3 实现前只能验到 `vc` 层 WARN 忽略或 T4.1 的 `music play` 探针） |
-| 验收方法 | 回板后：`uv run tools/ws_mock_server.py --music --asr sensevoice` + 设备 `CONFIG_AI_WS_URL` 指向 mock；说「嗨，乐鑫 → 放首歌」：设备端 `PLAYER: play`/`VC: music_track`（T4.2 后）、音频真的出声；URL 用 mock 内置示例曲目或**公网电台直播流**（`--music-url … --music-title …`，无需自备 MP3）；再说「暂停/继续/下一首/停止」各一次，对照 mock 日志 `[MUSIC] ...` 与设备端动作 |
-| 关闭条件 | 真机 ≥1 轮点歌出声（设备拉流成功、时长与 `duration_ms` 同量级）+ 四条控制指令各 1 次端侧动作正确；T4.1/T4.2 落地后由对应任务回写 STATUS §5 |
-| 关联 | `tools/mock_music.py`、`tools/mock_music_test.py`、`docs/ARCHITECTURE.md` §6.3、`docs/PROTOCOL.md` §3.2/§7（P-3）、STATUS §3 2026-11-10 行 |
-
-### PV-012 · T4.1 远端 MP3 音源真机验证（板子未连接）
-| 项 | 内容 |
-|---|---|
-| 提出时间 | **2026-11-10 18:1x（采样）**，T4.1 固件构建通过后登记 |
-| 来源 | T4.1（`source_http` + `music` 探针）实现完成；本机 `ls /dev/tty.usbmodem*` **无设备**（只有 Bluetooth/debug console），无法烧录/串口验证 |
-| 现象/问题 | 构建通过不代表能播：需验证 ① `music play` 后 `music_http` 任务能建、HTTP/TLS 能连、`first_sound <1500ms`；② 44.1k stereo 320kbps 素材重采样后稳态 `underruns=0`；③ `music stop` 后 ≤3s `active=0`/任务消失/内部堆回落；④ 错误路径（非法 URL、404、断流）不崩、不泄漏；⑤ 播放期内部堆/水位（预计 -14KB 左右）与 PSRAM 增量；⑥ 长播/电台流（Content-Length=-1）行为 |
-| 验收方法 | 板子接上后：`uv run tools/music_play_test.py --url 'http://<Mac局域网IP>:9009/media/<曲目>.mp3'`（内部覆盖 play/stat/stop/heap/tasks/ERROR 断言）；再跑 `--url 'http://lhttp.qingting.fm/live/20210755/64k.mp3'` 验直播流；最后用 `curl` 造 404 与 kill HTTP 服务验错误路径。`sys heap`/`sys tasks` 采播放期/停止后数值 |
-| 关闭条件 | 脚本全 PASS：首声 <1500ms、稳态 underruns=0、stop ≤3s 且任务消失、内部堆停止后回落（≤4KB 残留）、无 ERROR/panic；电台流连续 60s 无欠载；结果回写 STATUS §5 并关闭本项 |
-| 关联 | `components/audio_player/source_http.c`、`include/audio_player.h`（music API）、`components/diag/diag.c`（`music`）、`tools/music_play_test.py`、STATUS §3 2026-11-10 T4.1 行、ARCH §3.7/§9.3 |
-
-### PV-013 · T4.2 `music_cloud` 真机验证（板子未连接）
-| 项 | 内容 |
-|---|---|
-| 提出时间 | **2026-11-10 18:4x（采样）**，T4.2 固件构建通过后登记 |
-| 来源 | T4.2（`music_cloud`：`music_track`/`music_control` 解析、`mid` 过滤、5s `music_status`）实现完成；本机仍只有 Bluetooth/debug console，无 USB 串口，无法烧录 |
-| 现象/问题 | 构建通过不等于链路通，需验证：① mock `--music` 点歌 → 设备拉到 mock 内置 HTTP 的示例曲目并出声；② `mc status` 的 state/mid/progress/URL 与 `music stat` 一致；③ `music_status` 每 ~5s 一条、字段正确，stop 后有一条 `stopped`；④ `music_control stop` 能让音乐 ≤1s 内淡出停止；⑤ `pause`/`resume` 按设计**只 WARN + 计数、不改变状态、不误停**；⑥ `mid` 过滤：重复 `music_track`（同 mid）不重复起播、过期 mid 丢弃（可用 `ws send` 注入）；⑦ 切歌：新 `music_track` 到达时先停旧流再起新流（重试窗口内不报错）；⑧ 错误路径：非 http(s) URL、404、`codec:"pcm"` 只 WARN/ERROR 计数、不崩 |
-| 验收方法 | 回板后：`uv run tools/ws_mock_server.py --music` + 设备 `CONFIG_AI_WS_URL` 指向 mock → 说「嗨，乐鑫 → 放首歌」→ `mc status` 看 state=playing/mid/progress 递增、mock 日志出现 `music_status`；再说「停止」看设备 `MC state playing → stopped`；用 `ws send` 注入同 mid/旧 mid 的 `music_track` 验重复与过期丢弃；注入非 http(s) URL 与 `codec:"pcm"` 验拒绝路径；最后 `sys heap`/`sys tasks` 采播放期与停止后数值 |
-| 关闭条件 | 真机 ≥1 轮点歌出声（设备拉流成功、`mc status` 显示 playing、mock 收到 ≥2 条 `music_status`）；stop 1 次生效且上报 stopped；pause/resume 各 1 次按"忽略且不误停"验收；重复/过期 mid 各丢弃 1 次；无 ERROR/panic；结果回写 STATUS §5 并关闭本项 |
-| 关联 | `components/music_cloud/`、`components/diag/diag.c`（`mc`）、`components/voice_cloud/voice_cloud.c`（音乐事件跳过）、`tools/ws_mock_server.py --music`、PROTOCOL §3.1/§3.2/§7（P-3）、STATUS §3 2026-11-10 T4.2 行、ARCH §6.3/§8.3 |
-
-> **2026-11-10 T4.3 起**：本项 ⑤ 的验收口径已过时——`pause`/`resume` 不再"只 WARN"，改为真正执行（用户暂停 latch / 从暂停点续播），这部分验收并入 **PV-014**。
-
-### PV-014 · T4.3 `music_session` 真机验证（板子未连接）
-| 项 | 内容 |
-|---|---|
-| 提出时间 | **2026-11-10 19:0x（采样）**，T4.3 固件构建通过后登记 |
-| 来源 | T4.3（`music_session`：暂停/继续/停止/切歌、`music_request`、与语音抢占）实现完成；本机仍只有 Bluetooth/debug console，无 USB 串口，无法烧录 |
-| 现象/问题 | 构建通过不等于听感/时序正确，需验证：① mock `--music` 点歌出声（`ms status` playing、mock 收到 `music_status`）；② 语音「暂停」→ ≤1s 内静音、上报 `state:"paused"` 且 `progress_ms` 冻结；③ 语音「继续」→ **从暂停点续播**（不是文件开头），progress 接着涨；④ 唤醒自动暂停：播放中说「嗨，乐鑫」→ 音乐 100ms 淡出、会话正常；说完**无音乐意图** → 自动恢复；⑤ 用户暂停 latch：说「暂停」后会话结束**不得**自动恢复；再说「继续」→ 恢复；⑥ 切歌：说「下一首」→ 新 `music_track`，先停旧流再起新流、无 ERROR；⑦ 长暂停（>服务端 idle 超时，如 90s）后「继续」→ 不卡死，转 ERROR/STOPPED 并发一次 `music_request`，服务端回新曲目；⑧ 资源：暂停/继续各 10 次内部堆无单调下降、`sys tasks` 任务数不变（无新任务）、停止后内部堆回落；⑨ 错误路径：非 http(s)/404 不崩 |
-| 验收方法 | 回板后：`uv run tools/ws_mock_server.py --music` + 设备 `CONFIG_AI_WS_URL` 指向 mock；`ms status` / `mc status` 观察状态与统计；`afplay tools/lexin.wav` 唤醒后依次说「暂停」「继续」「下一首」「停止」（mock 固定确认语回报）；长暂停用 mock 暂停后等 90s 再「继续」；每步采 `sys heap` / `sys tasks` 数值 |
-| 关闭条件 | ①~⑨ 全过：暂停 ≤1s 静音、继续不从头、用户暂停不被覆盖、唤醒自动暂停 + 会后恢复、长暂停有兜底、无 ERROR/panic、无内存泄漏；结果回写 STATUS §5 并关闭本项 |
-| 关联 | `components/music_session/`、`components/audio_player/{audio_player.c,source_http.c}`、`components/music_cloud/`、`components/diag/diag.c`（`ms`）、`tools/ws_mock_server.py --music`、ARCH §3.2/§6.3/§7/§8.3/§8.4、PROTOCOL §3.1（P-8/P-9）、STATUS §3 2026-11-10 T4.3 行 |
+| 提出时间 | **2026-11-10 21:4x（采样）**，T4.3 真机验收时拆分登记（原 PV-014 第 ⑦ 项） |
+| 来源 | T4.3 `music_session` 的 `s_resume_watch` + `ms_fallback_request()` 已实现，但真机验收无法稳定构造"继续时数据已断"的场景 |
+| 现象/问题 | 验收做法：播放中 `ms pause` → 杀掉 HTTP 音频服务（模拟服务端 idle 超时断流）→ `ms resume`。实测**仍能续播约 4.4s**——暂停期间 socket 已被内核/HTTP 客户端缓冲了数百 KB，`resume` 先播完缓冲才可能发现断流，因此没有触发兜底 `music_request`。**结论**：兜底逻辑未被真机触发，既不能说它有效，也不能说无效 |
+| 已获得的部分证据 | 协议侧 `music_request` 往返已由 `tools/music_proto_test.py` I1/I2 真机验证（`{action:play,id:1}` → 服务端回 `music_track` 起播）；「继续失败 → 发一次兜底」属 `test/host/music_policy_test` 覆盖范围 |
+| 待验证 | ① 暂停 > 服务端 idle 超时（如 90s）后继续：不卡死、转 ERROR/STOPPED、**恰好发一次** `music_request`；② 断流恢复后服务端回新曲目能起播；③ 反复 10 次不泄漏 |
+| 验收方法 | 回板后：mock `--music` + 可控媒体服务器（能在暂停期主动关连接），`ms status` / `mc status` 观测 `resume_fail`/`fallback` 计数与 mock 侧 `music_request` |
+| 关闭条件 | ①②③ 全过，数据写回 STATUS §5 |
+| 关联 | `components/music_session/music_session.c`（`s_resume_watch`/`ms_fallback_request`）、`docs/ARCHITECTURE.md` §8.3 已知限制、STATUS §1 下一步、T4.5 |
 
 ## 3. 待决定 / 已被暂缓（PD）
 
@@ -247,6 +217,10 @@
 | PD-003 板载 WS2812 解码异常（满白→BOD） | 2026-11-02 21:4x（采样） | **决定不做**：整颗灯移除，固件只把 GPIO48 拉低保持（防止上电噪声锁存亮色），设备恢复稳定可用 | 移除后真机 20 秒 0 BOD / WiFi 正常（5764ms 联网）；`dev_ctrl_test --skip-interrupt` 21/21；实现留档于 git 4f5d152 + 084ef4f |
 | PV-001 T3.4 LED 逐色目视 + 物理按压 | 2026-11-02 21:4x（采样） | **LED 部分作废**（灯已移除）；**物理按键按压部分并入下方 PV-004** | — |
 | PV-005 T3.6 提示音听感 | **2026-11-02 23:0x（采样）** | **用户确认通过**：设备上 `fb test net/cloud/timeout/tts` 与试听 WAV 均接受（音色/语速/响度 OK，与「我在呢」等响、不刺耳） | 用户口头确认 2026-11-02；峰值统一 -7.82 dBFS、时长 1075/1468/1083/1236 ms；试听 WAV `build/t36_prompts/`；后续 T3.5 迁 assets 分区时资源不变 |
+| PV-011 M1 音乐链路（mock `--music`）真机验证 | **2026-11-10 21:4x（采样）** | **通过**：mock `--music --music-url <本地直播流>` 下说「嗨，乐鑫 → 放首歌」→ 设备拉到该 URL 出声；「暂停/继续/下一首/停止」四条控制均端侧生效（`music_control`/新 `music_track`） | `music_e2e_test` 62/62（A 点歌、C 暂停继续、E 切歌/停止）、`music_proto_test` 22/22；mock 日志 `[MUSIC] 意图=…` 与 `music_status` 可见 |
+| PV-012 T4.1 远端 MP3 音源真机验证 | **2026-11-10 21:0x（采样）** | **通过**：`music_play_test` 16/16（首声 10ms、HTTP 200、稳态 0 欠载、stop 后任务消失/堆回落）；本地 60s 无限直播流 16/16（0 欠载）；404 与播放中 kill 服务均收敛无 panic。**公网电台** 60s 5 次欠载判为 CDN 抖动（同固件本地流 0 次）。顺带修复大 ID3 标签、忙等 WDT、起播欠载误计三个固件问题 | `tools/music_play_test.py` 两轮输出；STATUS §3 2026-11-10 行、§5 基线；广播流 URL `http://lhttp.qingting.fm/live/20210755/64k.mp3` |
+| PV-013 T4.2 `music_cloud` 真机验证 | **2026-11-10 21:4x（采样）** | **通过**：点歌出声、`mc status` 与 `ms status` 一致、`music_status` 5s 周期、stop ≤1s、切歌先停旧再起新；**协议边界由假云端注入覆盖**：重复 mid 丢弃、过期 mid 丢弃、非 http(s)/非 mp3 丢弃、`music_request` 往返 | `music_e2e_test` 62/62（A/E）、`music_proto_test` 22/22；STATUS §3 2026-11-10 行 |
+| PV-014 T4.3 `music_session` 真机验证 | **2026-11-10 21:4x（采样）** | **通过（第 ⑦ 项拆出为 PV-015）**：语音暂停 318ms 内生效且 progress 冻结；继续从暂停点续播；唤醒自动暂停（reason=voice）且会后自动恢复；用户暂停 latch 会话结束不恢复；切歌 mid 递增；停止 → stopped；10 次暂停/继续任务数不变、堆 −352B；404 收敛。**修复**：语音期间 resume 抢播放器导致确认语 `tts-fail` → 改为排队到 IDLE。**口径**：音乐播放时唤醒会被音乐掩蔽（音量 100/15/10 均无法唤醒，0 才稳定），本项用 `--player-volume 0` 只验证状态机，**音乐中唤醒体验归 T4.4** | `music_e2e_test` 62/62（B/C/D/E/F/G）、`music_proto_test` 22/22（G/H/J）；STATUS §3/§5；ARCH §8.3 |
 | PV-003 T3.5 无板开发部分 | **2026-11-02 23:5x（采样）** | **真机验收通过**：`assets` 分区 pack 挂载/mmap 加载（303~310us）、5 条提示音播放正常、`error_prompt_test` 290/290、**单独烧 assets 分区替换提示音成功（app bin sha256 不变）**、坏 pack 降级不崩 | `prompt info`（mode=flash-mmap, ver=1, count=5, 181300B）、swap timeout 17325→19769→恢复、坏包 0xFF→ERROR+降级；见 STATUS §5 T3.5 行 |
 | PV-008 T3.7 续听预录修复真机复验 | **2026-11-03 21:5x（采样）** | **用户真机确认通过**：连续对话多轮 ASR 文本完整（修复前只有唤醒轮完整、续听轮缺句首）；设备侧日志出现 `VC: 续听预录开始` / `续听预录：保留 N ms 前导`；窗口超时/退出后预录停止不影响下一轮 | 用户 2026-11-03 21:5x 口头确认；固件 `dfd48b4-dirty`（Compile time Nov 3 2026 21:42:58，bin 1,942,448 B）经原生 USB 烧入后实测；代码/设计见 STATUS §3 2026-11-03 行、ARCH §3.3/§7 |
 
@@ -257,6 +231,7 @@
 - **2026-11-10 16:2x（采样）**：新增 PV-011（M1 音乐链路真机验证）；同日 P-3 按「音乐事件用独立 `mid`」定稿建议落地到 mock 与 PROTOCOL。
 - **2026-11-10 18:1x（采样）**：新增 PV-012（T4.1 真机验证）；T4.1 固件构建通过，但本机无 USB 串口，未烧录。
 - **2026-11-10 18:4x（采样）**：新增 PV-013（T4.2 `music_cloud` 真机验证）；T4.2 固件构建通过（bin 1,982,880 B / DIRAM 201,046 B），仍无 USB 串口。
+- **2026-11-10 21:0x→21:4x（采样）**：开发板接入，T4.1–T4.3 真机验收：`music_play_test` 16/16（+60s 直播流 16/16）、新增 `music_e2e_test` 62/62、新增 `music_proto_test` 22/22；修复 4 个固件问题（大 ID3 标签分块跳过、`pdMS_TO_TICKS` 0 tick 忙等 WDT、起播欠载误计、语音期 resume 排队）；PV-011/012/013/014 关闭，长暂停兜底拆 **PV-015**（归 T4.5）；记录音乐播放期内部 RAM 水位 24,563 B（T5.3 复测）。
 - **2026-11-10 19:1x（采样）**：T4.3 `music_session` 完成（构建口径）：暂停/继续**保 ring 从暂停点续播**、语音抢占（用户暂停 latch 优先）、`music_request` 兜底、`music_status` 增 `paused`；bin **1,993,152 B** / 静态 DIRAM **200,870 B（−176 B）**、host 单测 **76/76**；新增 **PV-014**（真机 9 项）与 **PD-006**（语音期间排队曲目的 mid/status 时序）。
 
 | 时间（Asia/Shanghai） | 事件 |

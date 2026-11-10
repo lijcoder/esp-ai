@@ -1039,10 +1039,64 @@ uv run tools/music_play_test.py --url 'http://192.168.1.23:9009/media/x.mp3'
 uv run tools/music_play_test.py --url 'http://lhttp.qingting.fm/live/20210755/64k.mp3' --seconds 5
 ```
 
-通过串口发 `music play/stat/stop`，断言：`MUSICPLAY err=ESP_OK` → `first_sound<1500ms` →
-稳态 `underruns=0` → `music stop` 后 3s 内 `active=0`/`url_active=0`/`music_http` 任务消失 →
-内部堆回落（≤4KB 残留）→ 无 ERROR/panic。`--skip-invalid` 可跳过非法 URL 断言。
-**当前未真机执行**（无串口，PENDING PV-012）。
+通过串口发 `music play/stat/stop`，断言：先等 `WiFi 状态: UP` → `MUSICPLAY err=ESP_OK` →
+`first_sound<1500ms` → 稳态 `underruns=0` → `music stop` 后 3s 内 `active=0`/`url_active=0`/`music_http`
+任务消失 → 内部堆回落（≤4KB 残留）→ 无 ERROR/panic。`--skip-invalid` 可跳过非法 URL 断言。
+**2026-11-10 真机 16/16**（本地 44.1k/2ch MP3 25s + `local_music_server.py /stream/<file>` 60s 无限直播流各一轮；
+PV-012 关闭）。真机首跑修了 4 个脚本 bug：`sys heap` 解析、`first_sound=10ms` 单位、`MUSICHTTP status`
+未合并、启动抢在 WiFi 前 play（已加联网等待+停残留）。WS/TLS 重连噪声已列入 ERROR 白名单。
+
+## music_e2e_test.py —— T4.2/T4.3 真机音乐回归（真实 mock + 语音）
+
+```bash
+# 需要一条能长期播的曲目/直播流（local_music_server 的 /stream/ 最稳），mock 端口要与设备 ws URL 一致
+uv run tools/local_music_server.py --dir ~/Music --port 9009
+uv run tools/music_e2e_test.py \
+  --music-url 'http://192.168.1.15:9009/stream/test41.mp3' \
+  --http-base http://192.168.1.15:9009 --tts-qwen
+```
+
+一条命令：起 mock（`--music --asr sensevoice`）→ `say -v Tingting` 现生成 5 条中文指令（放首歌/暂停播放/
+继续播放/下一首/停止播放）→ 复位设备 → `vs followup off` + `player mix vol` 清场 → 跑场景 A~G：
+
+| 场景 | 断言 |
+|---|---|
+| A 点歌 | 唤醒 → 「放首歌」出声（mid≥1）、`music_status` 同状态 ~5s 一条、`ms.mid`/`mc.track` 一致 |
+| B 唤醒抢占 | 音乐播放中唤醒 → `paused reason=voice`、progress 冻结；轮次结束自动恢复且进度接续 |
+| C 暂停/继续 | 语音「暂停」→ 暂停 + 冻结 + 用户 latch；「继续」→ 从暂停点续播、**确认语无 tts-fail** |
+| D latch | 用户暂停后普通问答结束仍暂停，再说「继续」恢复 |
+| E 切歌/停止 | 「下一首」mid 递增、新 track 起播；「停止」→ stopped 且上报 |
+| F 资源 | `ms pause/resume` ×10 每次生效、任务数不变、内部堆不单调下降 |
+| G 错误路径 | 非法 scheme 拒绝；404 收敛到 stopped/error，不崩 |
+
+`--volume 31..50`（系统音量，默认 45）、`--player-volume 0..100`（**默认 0**：音乐出声会掩蔽唤醒词，
+见下）、`--only a,b,c` 挑场景、`--log` 存设备日志、`--skip-reset`、`--dry-run`。
+**2026-11-10 真机 62/62**（PV-013/PV-014 关闭）。
+
+> **为什么默认 `--player-volume 0`**：实测音乐出声时（混音音量 100/15/10）`afplay lexin.wav` 都无法触发唤醒，
+> 0 才稳定——这是**音乐中唤醒（duck/AEC）**问题，归 T4.4；本脚本只验 T4.2/T4.3 的协议与状态机。
+
+## music_proto_test.py —— T4.2 协议边界（自建假云端 + 下行注入）
+
+```bash
+# 先停 mock（端口必须空闲，本脚本自己当云端）
+uv run tools/music_proto_test.py --music-url 'http://192.168.1.15:9009/stream/test41.mp3'
+```
+
+`music_e2e_test` 证明「说一句话能出声」，但构造不了重复/过期 `mid`、非法 URL、非 mp3 codec——
+本脚本起一个最小 WS 服务（`hello_ack`/`pong` + 按需下发），用 `ws reconnect` 让设备立刻连过来，
+再用 `mc status`/`ms status` 断言：
+
+| 场景 | 断言 |
+|---|---|
+| A | `hello`/`hello_ack` 握手，后续 `music_status` 上行可见 |
+| B | `music_track mid=10` 起播、`mc.track=1` |
+| C/D/E | 重复 mid `dup+1` 且不重播 / 过期 mid `dropped_mid+1` / 非法 URL+非 mp3 `bad+2` |
+| G/H | `pause` ≤1.5s、progress 冻结、上报 `paused`；`resume` 从暂停点续播 |
+| I | `ms request play 0` → 上行 `music_request{action:play,id:1}` → 回 track 起播 mid=13 |
+| J | `stop` ≤1.5s、上报 `stopped`；全程无 panic |
+
+**2026-11-10 真机 22/22；pause 318ms / stop 313ms**。
 
 ## ws_mock_server.py —— 本地「云端」WS 模拟服务（T1.5 / T2.4）
 
@@ -1639,7 +1693,7 @@ mock 接法（二选一）：
   curl -s http://192.168.1.23:9009/catalog > /tmp/music_catalog.json  # 再 --music-catalog
 ```
 
-- **端点**：`/search?q=`（最多 `--limit` 条）、`/catalog`（整库 JSON）、`/media/<相对路径>`（支持 Range/206、HEAD）。
+- **端点**：`/search?q=`（最多 `--limit` 条）、`/catalog`（整库 JSON）、`/media/<相对路径>`（支持 Range/206、HEAD）、`/stream/<相对路径>`（**2026-11-10 新增**：无限循环、无 Content-Length、连接关闭定界、~100KB/s 限速，用于真机复现**直播流**路径；T4.1 验收用它对 60s 0 欠载）。
 - **标题**取文件名：去掉 `01.` 这类音轨号、`[myfreemp3.ink]` 这类站点标签，并按「歌手 - 歌名」拆成 `artist`/`title`（确认语只念歌名）；`duration_ms=0`（时长未知，端侧 T4.1 按持续流处理）。
 - URL 默认用**本机局域网 IP**（设备要能访问；跨网段 `--public-host` 指定）。只服务 `--dir` 下的 `.mp3`，路径穿越返回 403。
 - 自测：`uv run tools/local_music_server.py --self-test`（17/17）。

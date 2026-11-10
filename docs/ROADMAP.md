@@ -155,17 +155,19 @@
 
 | 编号 | 任务 | 产出 |
 |---|---|---|
-| T4.1 | 源抽象：`source_http`（流式拉取、超时/重试；**只做远端 URL，不做 `source_file`**，2026-11-10 用户决定） | 远端 URL 可播放 |
-| T4.2 | **`music_cloud`（2026-11-10 完成，构建口径）**：`music_track`/`music_control` 解析、`mid` 过滤、`music_status` 每 5s 上报；**`music_request`（端侧主动点歌）与 `pause/resume` 执行移入 T4.3**（ARCH §6.3 边界） | 音乐协议闭环（真机待板 PV-013） |
-| T4.3 | **`music_session`（2026-11-10 完成，构建口径）**：状态机 + 起播/切歌重试、**暂停/继续（保 ring 从暂停点续播）**、`music_request`（含 resume 失败兜底）、**语音抢占**（语音活跃 auto-pause、回 IDLE 仅语音抢占才 auto-resume、用户暂停 latch 优先）；`music_cloud` 收敛为纯协议；host 单测 76/76 | 音乐控制完整（真机待板 PV-014） |
+| T4.1 | 源抽象：`source_http`（流式拉取、超时/重试；**只做远端 URL，不做 `source_file`**，2026-11-10 用户决定） | 远端 URL 可播放（**真机验收 2026-11-10**：`music_play_test` 16/16 + 60s 直播流 16/16） |
+| T4.2 | **`music_cloud`（2026-11-10 真机验收）**：`music_track`/`music_control` 解析、`mid` 过滤、`music_status` 每 5s 上报；**`music_request`（端侧主动点歌）与 `pause/resume` 执行移入 T4.3**（ARCH §6.3 边界） | 音乐协议闭环（`music_e2e_test` 62/62 + `music_proto_test` 22/22） |
+| T4.3 | **`music_session`（2026-11-10 真机验收）**：状态机 + 起播/切歌重试、**暂停/继续（保 ring 从暂停点续播）**、`music_request`（含 resume 失败兜底）、**语音抢占**（语音活跃 auto-pause、回 IDLE 仅语音抢占才 auto-resume、用户暂停 latch 优先）；`music_cloud` 收敛为纯协议；host 单测 76/76 | 音乐控制完整（`music_e2e_test` 62/62 + `music_proto_test` 22/22；长暂停兜底拆 PV-015→T4.5） |
 | T4.4 | 音乐 ducking（-12dB）与"音乐播放中唤醒"流程 | 语音优先体验 |
 | T4.5 | 播放稳定性：预缓冲 200ms、断流重试、错误恢复 | 长播不中断 |
 
-> **T4.2 完成（2026-11-10，构建通过、真机待板 PV-013）**：新增 `music_cloud`（L3，不建任务）——WS 附加订阅槽解析 `music_track`/`music_control`，按连接内 `mid` 过滤（track 只收更新的、control 允许等于当前曲目），起播/切歌在 `esp_timer` 串行执行（切歌先 stop 再 play，120ms×15 重试），播放中每 5s 上行 `music_status{state,mid,progress_ms}` + 状态变化立即一次，周期定时器兼任 EOF/失败探测；`pause/resume` 只解析计数（执行归 T4.3）；`voice_cloud` 对音乐事件静默跳过；`diag` 增 `mc status|report|reset`。构建：bin 1,982,880 B / 总镜像 1,982,760 B / 静态 DIRAM 201,046 B（+784 B），无新任务。数据见 [STATUS.md](STATUS.md) §5。
+> **T4.2 完成（2026-11-10，真机验收通过；PV-013 关闭）**：真机 `music_e2e_test`/`music_proto_test` 覆盖点歌出声、5s `music_status`、stop、切歌、重复/过期 `mid` 丢弃、非 http(s)/非 mp3 丢弃；新增 `music_cloud`（L3，不建任务）——WS 附加订阅槽解析 `music_track`/`music_control`，按连接内 `mid` 过滤（track 只收更新的、control 允许等于当前曲目），起播/切歌在 `esp_timer` 串行执行（切歌先 stop 再 play，120ms×15 重试），播放中每 5s 上行 `music_status{state,mid,progress_ms}` + 状态变化立即一次，周期定时器兼任 EOF/失败探测；`pause/resume` 只解析计数（执行归 T4.3）；`voice_cloud` 对音乐事件静默跳过；`diag` 增 `mc status|report|reset`。构建：bin 1,982,880 B / 总镜像 1,982,760 B / 静态 DIRAM 201,046 B（+784 B），无新任务。数据见 [STATUS.md](STATUS.md) §5。
 
-> **T4.3 完成（2026-11-10，构建通过、host 76/76、真机待板 PV-014）**：新增 `music_session`（L4，不建任务）——状态机、暂停/继续（**保 ring 与读写位置、从暂停点续播**，`source_http` 暂停期不读 socket 靠 TCP 背压）、**与语音抢占**（语音活跃 auto-pause、回 IDLE 仅语音抢占才 auto-resume、用户暂停 latch 优先）、`music_request` 兜底、`music_status` 增 `paused`；`music_cloud` 收敛为纯协议（不调播放器/无定时器），`voice_session` 删除 T3.2 音乐淡出分支。构建：bin 1,993,152 B / 总镜像 1,993,028 B / 静态 DIRAM 200,870 B（**−176 B**），无新任务、无堆分配。数据见 [STATUS.md](STATUS.md) §5。
+> **T4.3 完成（2026-11-10，真机验收通过；PV-014 关闭）**：真机验证暂停 318ms/progress 冻结、继续从暂停点、唤醒 auto-pause+会后 auto-resume、用户 latch、切歌/停止、10 次暂停继续无泄漏；**修复**语音期 resume 抢播放器导致 `tts-fail`（改为排队到 IDLE）；新增 `music_session`（L4，不建任务）——状态机、暂停/继续（**保 ring 与读写位置、从暂停点续播**，`source_http` 暂停期不读 socket 靠 TCP 背压）、**与语音抢占**（语音活跃 auto-pause、回 IDLE 仅语音抢占才 auto-resume、用户暂停 latch 优先）、`music_request` 兜底、`music_status` 增 `paused`；`music_cloud` 收敛为纯协议（不调播放器/无定时器），`voice_session` 删除 T3.2 音乐淡出分支。构建：bin 1,993,152 B / 总镜像 1,993,028 B / 静态 DIRAM 200,870 B（**−176 B**），无新任务、无堆分配。数据见 [STATUS.md](STATUS.md) §5。
 
 **验收**：连续播放 30 分钟无卡顿；起播 < 1.5s；唤醒时音乐 duck 正常、会话后恢复。
+
+> **T4.1–T4.3 真机状态（2026-11-10）**：起播 <1.5s、本地 60s 直播流 0 欠载、暂停/继续/抢占/切歌/停止全过；**30 分钟连续播放**与**音乐中唤醒（duck/AEC）**仍归 T4.4/T4.5。
 
 ### P5 稳定与联调（D27–D31）
 

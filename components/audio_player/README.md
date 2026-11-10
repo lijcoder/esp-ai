@@ -24,6 +24,7 @@
   - `stream_end`：排空已收数据、解码器无更多数据后标记通道 `closed`，通道包络对残留 ≤100ms 做线性淡出 → 静音冲刷/关 TX → 300ms 尾部延时 → 回调 `ok=true`（T3.3 起不再用独立"收尾环"，淡出由混音通道统一施加）；`decoded_frames==0` 时不使能 I2S、WARN、立即回调 `ok=false`；
   - `stream_abort`：≤20ms 内停止写音频并关 TX、丢弃 ring 剩余、回调 `ok=false`；
   - 流式 active 期间拒绝 `play_pcm`/`play_mp3`，`is_busy()` 返回 true；
+- **远端音乐（T4.1）**：`music play <http(s)://...>` → 独立任务 `music_http`（核 0/优先级 4/栈 6KB，**按需创建/停止销毁**）用 `esp_http_client` 拉流 → **独立 minimp3 实例**（`mp3_stream_*`，PSRAM ~38KB，与 TTS 实例并发互不共享）→ 重采样 44.1k/48k → 48k 单声道 → PSRAM PCM ring（`AUDIO_PLAYER_MUSIC_RING_MS`，默认 1000ms）→ `CH_MUSIC`。起播前预填 150ms；停止 = 丢弃 ring + 100ms 淡出，任务在 HTTP 读超时内退出。URL 只接受 `http(s)`、≤320B；流中采样率变化中止；暂不支持 seek/Range（T4.5）；
 - 软件音量 0~100（MAX98357A 无数字音量，增益由 SD 电阻固定）：混音后、限幅前施加，20ms 插值；
 - 淡入 10ms / 淡出 100ms；软限幅 -1dBFS（见上）；
 - 播放结束：静音冲刷 DMA + 150ms 延时 + 关 TX；完成回调带 300ms 尾部延时（半双工规则 R2）；
@@ -61,6 +62,11 @@
 
 流式统计字段（`audio_player_stream_stats_t`）：`active / fed_frames / fed_bytes / decoded_frames / decoded_samples / rate / channels / ring_level_ms / ring_high_ms / underruns / dropped_bytes / bad_frames / first_byte_to_sound_us / duration_ms`。
 
+- **T4.1 音乐**：`audio_player_music_play_url(url)` / `audio_player_music_stop_url()`（起停拉流任务），
+  `audio_player_music_start(rate)` / `audio_player_music_write(pcm48, frames, timeout)` /
+  `audio_player_music_end()` / `audio_player_music_stop()`（通道级，给 `source_http` 用），
+  `audio_player_music_active()`、`audio_player_music_stats_read()`（`MUSICSTAT`/`MUSICHTTP` 字段）。
+
 ## 配置（Kconfig）
 
 | 配置 | 默认 | 说明 |
@@ -72,6 +78,10 @@
 | `AUDIO_PLAYER_STREAM_RING_BYTES` | 65536 | 流式压缩数据 ring（PSRAM）；64KB ≈ 24k/64kbps 约 8s |
 | `AUDIO_PLAYER_STREAM_PREROLL_FRAMES` | 4 | 起播最少已解码帧数（96ms；2/3 帧实测偶发起播欠载） |
 | `AUDIO_PLAYER_STREAM_PREROLL_MS` | 120 | 起播超时（距首个 write） |
+| `AUDIO_PLAYER_MUSIC_RING_MS` | 1000 | **T4.1** 音乐 PCM ring 时长（48k 单声道，PSRAM 48KB/s；1000ms = 96KB） |
+| `AUDIO_PLAYER_MUSIC_TASK_STACK` | 6144 | `music_http` 任务栈（按需创建/销毁；播放期占内部 RAM） |
+| `AUDIO_PLAYER_MUSIC_HTTP_TIMEOUT_MS` | 2000 | HTTP 连接/读超时；`music stop` 后任务最迟此刻退出 |
+| `AUDIO_PLAYER_MUSIC_URL_MAX` | 320 | 音乐 URL 上限（超长拒绝，不截断） |
 | `AUDIO_PLAYER_INTERRUPT_FADE_MS` | 80 | R4 打断淡出时长；P3 验收"按键打断 <100ms 停声"，改大必然超线（实测 last_stop_ms 79~95） |
 | `AUDIO_PLAYER_DUCK_DB` | 12 | R3 音乐 duck 深度（q8 目标 ≈ 0.25 倍振幅） |
 | `AUDIO_PLAYER_DUCK_RAMP_MS` | 100 | duck 斜坡时长（R3：100ms 内到位） |
@@ -79,6 +89,14 @@
 ## 依赖
 
 `audio_io`（写 I2S）、`esp_timer`（解码/播放耗时统计）；MP3 解码器源码在 `third_party/minimp3/`（vendored，不依赖组件管理器）。
+
+## T4.1 音乐内存/实时口径
+
+- 解码/HTTP **不在 `player` 任务**：`music_http` 任务把 PCM 写 ring，混音任务只做 memcpy+混音；
+- PSRAM：PCM ring 96KB 常驻（启动分配）；独立解码实例 ~38KB + 预填/单帧输出 ~18KB 只在播放期；
+- 内部 RAM：播放期 +6KB 任务栈 + `esp_http_client` 4KB + 读缓冲 4KB；停止后释放（任务自删）；
+- 停止延迟：丢 ring + 通道淡出 ≤~120ms；HTTP 读超时（2s）内任务退出；停止后 `sys tasks` 不应再有 `music_http`；
+- **未真机验证**（PENDING PV-012）：水位/首声/欠载/长时间电台流。
 
 ## 内存与实时约束（CONVENTIONS §3/§4）
 
@@ -103,6 +121,17 @@ player reset                   # 清空播放统计 + 流式统计
 ```
 
 量产必须关闭该选项（上传缓冲 512KB PSRAM、console 行缓冲 1024B 都只在开发期编译）。
+
+## `music` 探针（T4.1，常驻 diag）
+
+`music play <http(s)://...>` 启动拉流；`music stat` 打印：
+
+```
+MUSICSTAT active=1 url_active=1 rate=44100 ring=812ms written=..., played=..., underruns=0 first_sound=63ms
+MUSICHTTP status=200 content_length=12154918 bytes=..., first_byte=..., connect=..., decoded=..., errors=0
+```
+
+`music stop` 丢弃 ring + 淡出。自动化：`uv run tools/music_play_test.py --url ...`。
 
 ## 关键日志（契约 §4，工具/voice_cloud 按此解析）
 

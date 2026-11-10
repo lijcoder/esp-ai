@@ -2129,6 +2129,50 @@ static int mix_ch_from_name(const char *name)
     return -1;
 }
 
+/* T4.1：音乐远端 URL 探针（URL 来自 mock/服务端 music_track；设备只校验前缀/长度） */
+static int cmd_music(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: music play <http(s)://...> | stop | stat\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(argv[1], "play") == 0) {
+        if (argc < 3) {
+            printf("用法: music play <http(s)://...>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        const esp_err_t err = audio_player_music_play_url(argv[2]);
+        printf("MUSICPLAY err=%s\n", esp_err_to_name(err));
+        return err;
+    }
+    if (strcmp(argv[1], "stop") == 0) {
+        const esp_err_t err = audio_player_music_stop_url();
+        printf("MUSICSTOP err=%s\n", esp_err_to_name(err));
+        return (err == ESP_ERR_INVALID_STATE) ? ESP_OK : err;
+    }
+    if (strcmp(argv[1], "stat") == 0) {
+        audio_player_music_stats_t st;
+        const esp_err_t err = audio_player_music_stats_read(&st);
+        if (err != ESP_OK) {
+            printf("MUSICSTAT err=%s\n", esp_err_to_name(err));
+            return err;
+        }
+        printf("MUSICSTAT active=%d url_active=%d rate=%u ring=%ums written=%u played=%u "
+               "underruns=%u first_sound=%ums\n",
+               st.active ? 1 : 0, st.url_active ? 1 : 0, (unsigned)st.sample_rate,
+               (unsigned)st.ring_ms, (unsigned)st.written_frames, (unsigned)st.played_frames,
+               (unsigned)st.underruns, (unsigned)st.first_sound_ms);
+        printf("MUSICHTTP status=%d content_length=%d bytes=%u first_byte=%ums connect=%ums "
+               "decoded=%u errors=%u\n",
+               st.http_status, (int)st.content_length, (unsigned)st.http_bytes,
+               (unsigned)st.first_byte_ms, (unsigned)st.connect_ms,
+               (unsigned)st.decoded_frames, (unsigned)st.http_errors);
+        return ESP_OK;
+    }
+    printf("用法: music play <http(s)://...> | stop | stat\n");
+    return ESP_ERR_INVALID_ARG;
+}
+
 static int cmd_player(int argc, char **argv)
 {
     if (argc < 2) {
@@ -2523,6 +2567,11 @@ static esp_err_t register_commands(void)
             .func = cmd_prompt,
         },
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST
+        {
+            .command = "music",
+            .help = "音乐（T4.1）：music play <http(s)://...> | stop | stat",
+            .func = cmd_music,
+        },
         {
             .command = "player",
             .help = "播放探针（T2.3/T2.4/T3.2/T3.3）：player stat | reset | mp3 | duck on|off | stop [ms] | "

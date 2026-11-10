@@ -28,6 +28,7 @@
 
 #include "audio_io.h"
 #include "decoder_mp3.h"
+#include "source_http.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -59,6 +60,8 @@ static const char *TAG = "PLAYER";
 #define MIX_CAP_MAX_FRAMES 16384 /* 探针抓取上限 341ms @48k */
 #define MIX_TONE_MAX_MS    10000u
 #define PEAK_RING_LEN      32 /* 32 × 10ms = 320ms 输出峰值窗口 */
+/* T4.1 音乐 PCM ring：48k 单声道，按 Kconfig 毫秒换算（默认 1000ms = 96KB PSRAM） */
+#define MUSIC_RING_FRAMES  ((uint32_t)CONFIG_AUDIO_PLAYER_MUSIC_RING_MS * AUDIO_IO_SPK_SAMPLE_RATE / 1000u)
 
 /* ---------------- 流式参数（T2.4） ---------------- */
 #define STREAM_RING_BYTES        CONFIG_AUDIO_PLAYER_STREAM_RING_BYTES
@@ -96,7 +99,8 @@ typedef enum {
     MIX_SRC_NONE = 0,
     MIX_SRC_PCM,   /* 一段 PCM（提示音 / 整段 MP3 解码结果），播放任务内线性重采样到 48k */
     MIX_SRC_TONE,  /* 正弦音调（仅开发期探针） */
-    MIX_SRC_STREAM /* TTS 流：由 tts_pump 解码后填 ring */
+    MIX_SRC_STREAM, /* TTS 流：由 tts_pump 解码后填 ring */
+    MIX_SRC_MUSIC   /* 音乐：由 music_http 任务解码成 48k PCM 后填 ring（T4.1） */
 } mix_src_t;
 
 typedef struct {
@@ -293,6 +297,22 @@ typedef struct {
 static stream_ctx_t s_tts_ctx;     /* TTS 流解码上下文（player 任务独占） */
 static bool s_tts_in_underrun;     /* 连续欠载计数去重 */
 
+/* ---------------- 音乐 PCM（T4.1） ----------------
+ * SPSC：生产者 = music_http 任务（只写 wr），消费者 = player 任务（只写 rd）。
+ * 48k 单声道；混音级只做音量/duck/限幅，不在生产者里做任何增益（CONVENTIONS §3）。 */
+static int16_t *s_music_ring;            /* PSRAM：MUSIC_RING_FRAMES × 2B */
+static volatile uint32_t s_music_wr;     /* 单调帧计数（生产者写） */
+static volatile uint32_t s_music_rd;     /* 单调帧计数（消费者写） */
+static volatile bool s_music_eof;        /* 生产者已结束：ring 播空后关通道 */
+static volatile bool s_music_active;     /* start() 后为 true，stop()/出错置 false */
+static volatile bool s_music_sound_seen; /* 首个音乐样本已进混音 */
+static volatile bool s_music_drop_req;   /* stop() 请求丢弃 ring（由消费侧执行，避免双写 rd） */
+static int64_t s_music_start_us;
+static int64_t s_music_first_us;
+static bool s_music_in_underrun;
+static portMUX_TYPE s_music_mux = portMUX_INITIALIZER_UNLOCKED;
+static audio_player_music_stats_t s_music_stats;
+
 /* ---------------- 基础工具 ---------------- */
 
 /* 一次播放的公共尾巴：静音冲刷 DMA（避免余音被硬切）+ 关时钟 */
@@ -349,6 +369,54 @@ static void ch_pump(mix_ch_t *c)
     }
     if (c->src == MIX_SRC_STREAM) {
         return; /* TTS 流由 tts_pump 填 */
+    }
+    if (c->src == MIX_SRC_MUSIC) {
+        if (s_music_drop_req) {
+            /* stop() 只置标志：rd 只允许消费侧写（避免 console 任务与 player 双写） */
+            s_music_drop_req = false;
+            const uint32_t w = __atomic_load_n(&s_music_wr, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&s_music_rd, w, __ATOMIC_RELEASE);
+        }
+        /* 从音乐 PCM ring 搬进通道 ring（每块最多 2×10ms，与其它通道同节奏） */
+        for (int blocks = 0; blocks < 2; blocks++) {
+            if ((MIX_RING_FRAMES - (c->wr - c->rd)) < OUT_FRAMES_CHUNK) {
+                break;
+            }
+            const uint32_t w = __atomic_load_n(&s_music_wr, __ATOMIC_ACQUIRE);
+            const uint32_t r = __atomic_load_n(&s_music_rd, __ATOMIC_RELAXED);
+            const uint32_t avail = w - r;
+            if (avail == 0) {
+                if (s_music_eof) {
+                    c->closed = true; /* 播空即进入 100ms 淡出收尾 */
+                }
+                if (!s_music_in_underrun && !s_music_eof) {
+                    s_music_in_underrun = true;
+                    portENTER_CRITICAL(&s_music_mux);
+                    s_music_stats.underruns++;
+                    portEXIT_CRITICAL(&s_music_mux);
+                }
+                break;
+            }
+            const uint32_t room = MIX_RING_FRAMES - (c->wr - c->rd);
+            uint32_t n = avail < OUT_FRAMES_CHUNK ? avail : OUT_FRAMES_CHUNK;
+            if (n > room) {
+                n = room;
+            }
+            uint32_t idx = r % MUSIC_RING_FRAMES;
+            for (uint32_t i = 0; i < n; i++) {
+                ch_ring_put(c, s_music_ring[idx]);
+                idx++;
+                if (idx == MUSIC_RING_FRAMES) {
+                    idx = 0;
+                }
+            }
+            __atomic_store_n(&s_music_rd, r + n, __ATOMIC_RELEASE);
+            s_music_in_underrun = false;
+            portENTER_CRITICAL(&s_music_mux);
+            s_music_stats.played_frames += n;
+            portEXIT_CRITICAL(&s_music_mux);
+        }
+        return;
     }
     for (int blocks = 0; blocks < 2; blocks++) {
         if ((MIX_RING_FRAMES - (c->wr - c->rd)) < OUT_FRAMES_CHUNK) {
@@ -456,6 +524,8 @@ static void ch_sync(void)
                 c->pcm_samples = samples;
                 c->pcm_rate = rate;
                 c->src_total = (uint64_t)samples * AUDIO_IO_SPK_SAMPLE_RATE / rate;
+            } else if (src == MIX_SRC_MUSIC) {
+                /* 外部生产者填 ring：这里只复位通道状态，不设 src_total */
             } else if (src == MIX_SRC_TONE) {
                 c->tone_freq = tf;
                 c->tone_amp = ta;
@@ -482,6 +552,9 @@ static void ch_update_end(void)
         if (c->closed) {
             if (level == 0) {
                 c->run_active = false;
+                if (i == AUDIO_PLAYER_CH_MUSIC) {
+                    s_music_active = false;
+                }
                 portENTER_CRITICAL(&s_mix_mux);
                 /* 新请求（req_gen 变化）不在本轮清掉，交给 ch_sync 下一块重启通道 */
                 if (c->req_gen == c->run_gen) {
@@ -584,6 +657,13 @@ static bool mix_render(int16_t *out, uint32_t frames)
             }
             if (c->wr == c->rd) {
                 continue; /* 欠载/暂时没数据：本块该通道贡献静音 */
+            }
+            if (ch == AUDIO_PLAYER_CH_MUSIC && c->src == MIX_SRC_MUSIC &&
+                !s_music_sound_seen) {
+                s_music_sound_seen = true;
+                portENTER_CRITICAL(&s_music_mux);
+                s_music_first_us = esp_timer_get_time();
+                portEXIT_CRITICAL(&s_music_mux);
             }
             int32_t s = c->ring[c->rd & MIX_RING_MASK];
             c->rd++;
@@ -1454,6 +1534,13 @@ esp_err_t audio_player_init(void)
         ESP_LOGW(TAG, "MP3 能力不可用（%s），提示音/上行链路不受影响", esp_err_to_name(err));
     }
 
+    /* 音乐 PCM ring（T4.1）：48k × Kconfig 毫秒；失败只降级音乐，不影响语音 */
+    s_music_ring = heap_caps_malloc((size_t)MUSIC_RING_FRAMES * sizeof(int16_t),
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_music_ring) {
+        ESP_LOGW(TAG, "music ring alloc failed（PSRAM 不足，音乐不可用）");
+    }
+
     /* 流式缓冲全部 PSRAM：ring 64KB + 预缓冲 stage ~7KB + 读取暂存 2KB + TTS 泵中转 1KB */
     s_ring = heap_caps_malloc(STREAM_RING_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_stage = heap_caps_malloc((size_t)STREAM_STAGE_SAMPLES * sizeof(int16_t),
@@ -1999,6 +2086,182 @@ void audio_player_mix_stats_reset(void)
     memset(s_peak_ring, 0, sizeof(s_peak_ring));
     s_peak_idx = 0;
     portEXIT_CRITICAL(&s_stop_mux);
+}
+
+/* ---------------- 音乐 PCM 流（T4.1） ---------------- */
+
+esp_err_t audio_player_music_start(uint32_t sample_rate_hint)
+{
+    if (!s_task) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_music_ring) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (s_music_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_busy && !s_mix_pump_running && !s_mix_pump_job) {
+        return ESP_ERR_INVALID_STATE; /* 提示音/TTS/整段 MP3 正在播 */
+    }
+
+    bool need_enqueue = false;
+    portENTER_CRITICAL(&s_mix_mux);
+    mix_ch_t *c = &s_ch[AUDIO_PLAYER_CH_MUSIC];
+    if (c->req_active && c->req_src == MIX_SRC_MUSIC) {
+        portEXIT_CRITICAL(&s_mix_mux);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_music_wr = 0;
+    s_music_rd = 0;
+    s_music_eof = false;
+    s_music_sound_seen = false;
+    s_music_in_underrun = false;
+    s_music_drop_req = false;
+    s_music_start_us = esp_timer_get_time();
+    s_music_first_us = 0;
+    portENTER_CRITICAL(&s_music_mux);
+    memset(&s_music_stats, 0, sizeof(s_music_stats));
+    s_music_stats.sample_rate = sample_rate_hint;
+    portEXIT_CRITICAL(&s_music_mux);
+    s_music_active = true;
+    c->req_active = true;
+    c->req_src = MIX_SRC_MUSIC;
+    c->req_gen++;
+    if (!s_mix_pump_running) {
+        s_mix_pump_running = true;
+        need_enqueue = true;
+    }
+    portEXIT_CRITICAL(&s_mix_mux);
+
+    if (need_enqueue) {
+        const play_job_t job = {.kind = PLAY_JOB_PUMP};
+        if (xQueueSend(s_queue, &job, 0) != pdTRUE) {
+            portENTER_CRITICAL(&s_mix_mux);
+            s_mix_pump_running = false;
+            s_ch[AUDIO_PLAYER_CH_MUSIC].req_active = false;
+            portEXIT_CRITICAL(&s_mix_mux);
+            s_music_active = false;
+            ESP_LOGW(TAG, "music: queue full");
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+    ESP_LOGI(TAG, "music start (src %u Hz → 48k, ring %u ms)",
+             (unsigned)sample_rate_hint, (unsigned)CONFIG_AUDIO_PLAYER_MUSIC_RING_MS);
+    return ESP_OK;
+}
+
+size_t audio_player_music_write(const int16_t *pcm48, size_t frames, uint32_t timeout_ms)
+{
+    if (!pcm48 || frames == 0 || !s_music_ring) {
+        return 0;
+    }
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    size_t done = 0;
+    while (done < frames && s_music_active) {
+        const uint32_t w = __atomic_load_n(&s_music_wr, __ATOMIC_RELAXED);
+        const uint32_t r = __atomic_load_n(&s_music_rd, __ATOMIC_ACQUIRE);
+        const uint32_t space = MUSIC_RING_FRAMES - (w - r);
+        uint32_t n = (uint32_t)(frames - done);
+        if (n > space) {
+            n = space;
+        }
+        if (n > 0) {
+            uint32_t idx = w % MUSIC_RING_FRAMES;
+            const uint32_t first = (MUSIC_RING_FRAMES - idx < n) ? (MUSIC_RING_FRAMES - idx) : n;
+            memcpy(&s_music_ring[idx], pcm48 + done, (size_t)first * sizeof(int16_t));
+            if (n > first) {
+                memcpy(s_music_ring, pcm48 + done + first, (size_t)(n - first) * sizeof(int16_t));
+            }
+            __atomic_store_n(&s_music_wr, w + n, __ATOMIC_RELEASE);
+            done += n;
+            portENTER_CRITICAL(&s_music_mux);
+            s_music_stats.written_frames += n;
+            portEXIT_CRITICAL(&s_music_mux);
+        }
+        if (done == frames) {
+            break;
+        }
+        if (esp_timer_get_time() >= deadline) {
+            portENTER_CRITICAL(&s_music_mux);
+            s_music_stats.underruns++;   /* 生产侧写超时（ring 满） */
+            portEXIT_CRITICAL(&s_music_mux);
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return done;
+}
+
+esp_err_t audio_player_music_stop(void)
+{
+    if (!s_music_ring) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const bool was_active = s_music_active;
+    s_music_active = false;
+    s_music_eof = true;
+    s_music_drop_req = true; /* 实际丢弃由 ch_pump（消费侧）执行，避免 rd 双写 */
+    return was_active ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t audio_player_music_end(void)
+{
+    if (!s_music_ring) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    s_music_eof = true;
+    return ESP_OK;
+}
+
+esp_err_t audio_player_music_play_url(const char *url)
+{
+    return source_http_play(url);
+}
+
+esp_err_t audio_player_music_stop_url(void)
+{
+    return source_http_stop();
+}
+
+bool audio_player_music_active(void)
+{
+    return s_music_active;
+}
+
+esp_err_t audio_player_music_stats_read(audio_player_music_stats_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_music_ring) {
+        memset(out, 0, sizeof(*out));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    portENTER_CRITICAL(&s_music_mux);
+    *out = s_music_stats;
+    const uint32_t w = __atomic_load_n(&s_music_wr, __ATOMIC_ACQUIRE);
+    const uint32_t r = __atomic_load_n(&s_music_rd, __ATOMIC_RELAXED);
+    const uint32_t pending = w - r;
+    const int64_t first = s_music_first_us;
+    const int64_t start = s_music_start_us;
+    portEXIT_CRITICAL(&s_music_mux);
+    out->active = s_music_active;
+    out->ring_ms = (uint32_t)((uint64_t)pending * 1000 / AUDIO_IO_SPK_SAMPLE_RATE);
+    out->first_sound_ms = (first > 0 && start > 0) ? (uint32_t)((first - start) / 1000) : 0;
+
+    source_http_stats_t hs;
+    if (source_http_stats_read(&hs) == ESP_OK) {
+        out->url_active = hs.active;
+        out->http_bytes = hs.http_bytes;
+        out->http_status = hs.http_status;
+        out->content_length = hs.content_length;
+        out->http_errors = hs.http_errors;
+        out->first_byte_ms = hs.first_byte_ms;
+        out->connect_ms = hs.connect_ms;
+        out->decoded_frames = hs.decoded_frames;
+    }
+    return ESP_OK;
 }
 
 esp_err_t audio_player_mix_tone(audio_player_ch_t ch, uint32_t freq_hz, uint32_t ms, uint32_t amp)

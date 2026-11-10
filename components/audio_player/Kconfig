@@ -59,6 +59,42 @@ menu "Audio Player"
             避免弱网/小帧流迟迟不出声。
 
 
+    config AUDIO_PLAYER_MUSIC_RING_MS
+        int "音乐 PCM ring 时长（毫秒，48k 单声道）"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 1000
+        range 200 4000
+        help
+            T4.1：music_http 任务解码出的 48k PCM 先写这块 PSRAM ring，
+            由混音级按 10ms 块搬进 CH_MUSIC。1000ms 覆盖 WiFi 抖动；
+            越大越抗抖，但 PSRAM 占用 = 48k × 2B × ms。
+
+    config AUDIO_PLAYER_MUSIC_URL_MAX
+        int "音乐 URL 最大长度（字节）"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 320
+        range 64 1024
+        help
+            music_http 任务保存 URL 的静态缓冲。URL 来自服务端 music_track，
+            端侧只做 http(s) 前缀与长度校验；超长直接拒绝（不截断）。
+
+    config AUDIO_PLAYER_MUSIC_TASK_STACK
+        int "music_http 任务栈（字节）"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 6144
+        range 4096 12288
+        help
+            T4.1 拉流任务（HTTP/TLS + MP3 解码 + 重采样）。任务按需创建，
+            停止后销毁；栈在任务存活期占内部 RAM，所以不要随意加大。
+
+    config AUDIO_PLAYER_MUSIC_HTTP_TIMEOUT_MS
+        int "音乐 HTTP 读超时（毫秒）"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 2000
+        range 500 10000
+        help
+            esp_http_client 的连接/读超时。停止时任务最多阻塞这么久后退出。
+
     config AUDIO_PLAYER_INTERRUPT_FADE_MS
         int "按键打断淡出时长（毫秒，规则 R4）"
         range 20 100

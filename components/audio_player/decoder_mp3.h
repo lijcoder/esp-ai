@@ -58,3 +58,20 @@ esp_err_t mp3_dec_stream_frame(const int16_t **pcm, uint32_t *samples, uint32_t 
 
 /* 丢弃 pending 里的半帧并重新找同步字（ring 满丢块后调用）。 */
 void mp3_dec_stream_resync(void);
+
+/* ---------------- 独立流式解码实例（P4 音乐，2026-11-10） ----------------
+ * 每个实例自带解码状态/临时区/单帧输出/pending，全部 PSRAM；TTS 仍用上面的默认实例
+ * （mp3_dec_stream_*），音乐用 mp3_stream_*，两者可并发（各自实例，互不共享状态）。
+ * 线程约定：同一实例只在**一个任务**里调用（音乐实例只在 music_http 任务里用）。
+ */
+typedef struct mp3_stream mp3_stream_t;
+
+/* PSRAM 分配失败返回 NULL（音乐降级为不可用，语音链路不受影响）。 */
+mp3_stream_t *mp3_stream_create(void);
+void mp3_stream_destroy(mp3_stream_t *st);
+void mp3_stream_reset(mp3_stream_t *st);
+esp_err_t mp3_stream_feed(mp3_stream_t *st, const uint8_t *data, size_t len);
+esp_err_t mp3_stream_frame(mp3_stream_t *st, const int16_t **pcm, uint32_t *samples,
+                           uint32_t *rate, uint8_t *channels, uint32_t *frame_bytes);
+void mp3_stream_resync(mp3_stream_t *st);
+void mp3_stream_stats_read(mp3_stream_t *st, mp3_dec_stats_t *out);

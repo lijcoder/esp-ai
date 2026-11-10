@@ -142,6 +142,54 @@ typedef struct {
     audio_player_mp3_stats_t mp3;
 } audio_player_stats_t;
 
+/* ---------------- 音乐 PCM 流（P4/T4.1：外部 task 解码 → CH_MUSIC） ----------------
+ * 生产者（music_http 任务）负责 HTTP 拉流 + MP3 解码 + 重采样到 48k，只把**原始 48k
+ * 单声道 PCM** 写进 CH_MUSIC；音量/duck/限幅仍由混音级统一做（CONVENTIONS §3）。
+ * 全部函数非阻塞或只阻塞生产者（audio task 不受影响）；停止到静音 ≤ 通道缓冲 + 100ms 淡出。
+ */
+
+typedef struct {
+    bool active;
+    uint32_t sample_rate;     /* 源采样率（仅展示；写入的必须是 48k） */
+    uint32_t ring_ms;         /* 当前音乐 PCM ring 待播毫秒（近似） */
+    uint32_t written_frames;  /* 生产者写入的 48k 帧数 */
+    uint32_t played_frames;   /* 混音已消费的帧数 */
+    uint32_t underruns;       /* 生产者侧写超时（ring 满）/混音侧欠载次数 */
+    uint32_t first_sound_ms;  /* start() → 首个音乐样本进混音（0=未出声） */
+    /* ---- HTTP/T4.1 拉流统计 ---- */
+    bool url_active;          /* music_http 任务在跑 */
+    uint32_t http_bytes;
+    int http_status;
+    int32_t content_length;   /* -1 = chunked/未知 */
+    uint32_t http_errors;
+    uint32_t first_byte_ms;
+    uint32_t connect_ms;
+    uint32_t decoded_frames;
+} audio_player_music_stats_t;
+
+/* 启动音乐通道（不启动 HTTP；HTTP 在 audio_player 的 source_http 里）。
+ * 前置：播放器空闲（提示音/TTS/整段 MP3 都不在播），否则 ESP_ERR_INVALID_STATE。 */
+esp_err_t audio_player_music_start(uint32_t sample_rate_hint);
+
+/* 写 48k 单声道 PCM；返回实际写入帧数（0=未启动/已停止）。
+ * 只允许在 music_http 任务里调用；ring 满时最多等 timeout_ms，超时返回已写入帧数。 */
+size_t audio_player_music_write(const int16_t *pcm48, size_t frames, uint32_t timeout_ms);
+
+/* 停止：丢弃 ring 里未播数据，通道 100ms 淡出后结束（≤ 通道缓冲 + 100ms）。 */
+esp_err_t audio_player_music_stop(void);
+
+/* T4.1：直接播一个远端 http(s) URL（内部起 music_http 拉流任务）。
+ * URL 只来自服务端 music_track；端侧只校验前缀/长度，不做搜索/解析。 */
+esp_err_t audio_player_music_play_url(const char *url);
+/* 停止拉流任务（会先让音乐通道淡出）。 */
+esp_err_t audio_player_music_stop_url(void);
+
+/* 自然结束（HTTP 流读到 EOF）：保留 ring 里已写入的数据播完再收尾。 */
+esp_err_t audio_player_music_end(void);
+
+bool audio_player_music_active(void);
+esp_err_t audio_player_music_stats_read(audio_player_music_stats_t *out);
+
 /* 开发期探针（diag 的 player pcm 用）：读取最近一次 MP3 解码的单声道 PCM，
  * 让 PC 侧能与 FFmpeg/PyAV 参考解码逐样本对拍——"能出声"之外的真机正确性证据。 */
 esp_err_t audio_player_mp3_pcm_read(int16_t *dst, size_t offset, size_t count);

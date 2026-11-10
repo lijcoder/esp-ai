@@ -1032,6 +1032,18 @@ uv run tools/prompt_gen.py --rate 190              # 可选：强制语速（默
 - 本工具**不自带 esptool**、不做设备探测/重试；板测（真机烧录/听感/回归）由 Lead 执行。
 - 源 WAV 是唯一源：**不要**手改 `build/assets.bin`（每次构建都会覆盖）；pack 可随时从源重建（同源同 sha256）。
 
+## music_play_test.py —— T4.1 真机音乐播放验证
+
+```bash
+uv run tools/music_play_test.py --url 'http://192.168.1.23:9009/media/x.mp3'
+uv run tools/music_play_test.py --url 'http://lhttp.qingting.fm/live/20210755/64k.mp3' --seconds 5
+```
+
+通过串口发 `music play/stat/stop`，断言：`MUSICPLAY err=ESP_OK` → `first_sound<1500ms` →
+稳态 `underruns=0` → `music stop` 后 3s 内 `active=0`/`url_active=0`/`music_http` 任务消失 →
+内部堆回落（≤4KB 残留）→ 无 ERROR/panic。`--skip-invalid` 可跳过非法 URL 断言。
+**当前未真机执行**（无串口，PENDING PV-012）。
+
 ## ws_mock_server.py —— 本地「云端」WS 模拟服务（T1.5 / T2.4）
 
 **作用**：在真实后端就绪前，用一台电脑模拟云端 WebSocket 服务（握手、心跳、事件下发、TTS 音频流），让端侧 T1.4/T1.6 以及 P2–P4 全部能脱机联调（ROADMAP §2.0 P1 顺序 0：可最早启动，端侧不必等后端）。T2.4 起支持 `--tts-mp3` 下发**真实 MP3**（按帧切分、实时节奏），并可用 `--tts-stall-*`/`--tts-late-bin` 制造欠载与窗口外帧。

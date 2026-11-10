@@ -149,6 +149,18 @@
 | 关闭条件 | 真机 ≥1 轮点歌出声（设备拉流成功、`mc status` 显示 playing、mock 收到 ≥2 条 `music_status`）；stop 1 次生效且上报 stopped；pause/resume 各 1 次按"忽略且不误停"验收；重复/过期 mid 各丢弃 1 次；无 ERROR/panic；结果回写 STATUS §5 并关闭本项 |
 | 关联 | `components/music_cloud/`、`components/diag/diag.c`（`mc`）、`components/voice_cloud/voice_cloud.c`（音乐事件跳过）、`tools/ws_mock_server.py --music`、PROTOCOL §3.1/§3.2/§7（P-3）、STATUS §3 2026-11-10 T4.2 行、ARCH §6.3/§8.3 |
 
+> **2026-11-10 T4.3 起**：本项 ⑤ 的验收口径已过时——`pause`/`resume` 不再"只 WARN"，改为真正执行（用户暂停 latch / 从暂停点续播），这部分验收并入 **PV-014**。
+
+### PV-014 · T4.3 `music_session` 真机验证（板子未连接）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-10 19:0x（采样）**，T4.3 固件构建通过后登记 |
+| 来源 | T4.3（`music_session`：暂停/继续/停止/切歌、`music_request`、与语音抢占）实现完成；本机仍只有 Bluetooth/debug console，无 USB 串口，无法烧录 |
+| 现象/问题 | 构建通过不等于听感/时序正确，需验证：① mock `--music` 点歌出声（`ms status` playing、mock 收到 `music_status`）；② 语音「暂停」→ ≤1s 内静音、上报 `state:"paused"` 且 `progress_ms` 冻结；③ 语音「继续」→ **从暂停点续播**（不是文件开头），progress 接着涨；④ 唤醒自动暂停：播放中说「嗨，乐鑫」→ 音乐 100ms 淡出、会话正常；说完**无音乐意图** → 自动恢复；⑤ 用户暂停 latch：说「暂停」后会话结束**不得**自动恢复；再说「继续」→ 恢复；⑥ 切歌：说「下一首」→ 新 `music_track`，先停旧流再起新流、无 ERROR；⑦ 长暂停（>服务端 idle 超时，如 90s）后「继续」→ 不卡死，转 ERROR/STOPPED 并发一次 `music_request`，服务端回新曲目；⑧ 资源：暂停/继续各 10 次内部堆无单调下降、`sys tasks` 任务数不变（无新任务）、停止后内部堆回落；⑨ 错误路径：非 http(s)/404 不崩 |
+| 验收方法 | 回板后：`uv run tools/ws_mock_server.py --music` + 设备 `CONFIG_AI_WS_URL` 指向 mock；`ms status` / `mc status` 观察状态与统计；`afplay tools/lexin.wav` 唤醒后依次说「暂停」「继续」「下一首」「停止」（mock 固定确认语回报）；长暂停用 mock 暂停后等 90s 再「继续」；每步采 `sys heap` / `sys tasks` 数值 |
+| 关闭条件 | ①~⑨ 全过：暂停 ≤1s 静音、继续不从头、用户暂停不被覆盖、唤醒自动暂停 + 会后恢复、长暂停有兜底、无 ERROR/panic、无内存泄漏；结果回写 STATUS §5 并关闭本项 |
+| 关联 | `components/music_session/`、`components/audio_player/{audio_player.c,source_http.c}`、`components/music_cloud/`、`components/diag/diag.c`（`ms`）、`tools/ws_mock_server.py --music`、ARCH §3.2/§6.3/§7/§8.3/§8.4、PROTOCOL §3.1（P-8/P-9）、STATUS §3 2026-11-10 T4.3 行 |
+
 ## 3. 待决定 / 已被暂缓（PD）
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）
@@ -187,6 +199,17 @@
 | 验收方法 | 不接设备：`uv run tools/llm_test.py --text "今天天气怎么样"` 打印回答；接 mock 后：说一句 → 设备播出的**回答**与 `llm_test` 同模型同 prompt 的输出一致，且 `llm_delta` 是回答文本而非复读。**已完成离线验证**：mock 假客户端收到 20+ 个 `llm_delta` 增量、269 帧 TTS、首帧 253ms；真机待验 |
 | 关闭条件 | 两个工具/开关落地、离线自测通过、文档（tools/README、STATUS）同步 |
 | 关联 | `tools/mock_downlink.py` 的 `_asr_text`/`llm_delta` 生成处、`tools/mock_cli.py`、`tools/mock_tts.py`；PD-004（TTS 电平） |
+
+### PD-006 · 音乐 `mid`/`music_status` 与"实际出声"的时序（语音期间排队曲目）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-10 19:1x（采样）**，T4.3 实现时暴露 |
+| 来源 | 播放器仍是**单作业**模型：语音活跃期间到达的新 `music_track` 必须先排队，等 TTS/提示音结束（语音回 IDLE）才能起播，否则 `music_start()` 失败、重试窗口覆盖不了长 TTS 会误报 ERROR |
+| 现象/问题 | ① `mid` 在 `music_track` 被接受时（L3）即更新，排队期间上报的 `music_status` 可能**已经带新 mid**、state 还是旧的 playing/paused、progress=0；② 云端 `music_control{resume}` 在 TTS 播放中会把状态置 `playing`，但 PUMP 排在 TTS 之后才出声 → "上报 playing" 早于 "实际出声"。对"按 `mid` + progress 跟踪播放"的后端可能造成短暂不一致（不影响端侧听感） |
+| 处置方向（待定） | ① **推荐**：接受现状——T4.4 上"音乐继续播 + duck"叠加方案后，TTS 期间音乐不再让路，排队场景消失，问题自然收敛；② 排队期间上报新状态（如需协议加 `pending`/`buffering`）；③ 后端按 `state+progress` 判活，不依赖 mid↔出声严格同步 |
+| 为什么暂缓 | 属 T4.3 过渡实现的副作用，改协议/状态机的代价大于收益；T4.4 会改播放器叠加模型 |
+| 验证/关闭条件 | 真机 **PV-014 ⑥**（语音中说"下一首"）确认端侧行为可接受；**T4.4 定稿时**确认 overlay 后的时序并回写 PROTOCOL（或后端明确接受现状） |
+| 关联 | `components/music_session/music_session.c`（`s_track_pending`/`s_defer_pause_reason`）、ARCH §8.3「已知限制」、STATUS §3 T4.3 行、PV-014 |
 
 ### PD-002 · 断网没有独立的视觉/听觉反馈（设计缺口）
 | 项 | 内容 |
@@ -234,6 +257,7 @@
 - **2026-11-10 16:2x（采样）**：新增 PV-011（M1 音乐链路真机验证）；同日 P-3 按「音乐事件用独立 `mid`」定稿建议落地到 mock 与 PROTOCOL。
 - **2026-11-10 18:1x（采样）**：新增 PV-012（T4.1 真机验证）；T4.1 固件构建通过，但本机无 USB 串口，未烧录。
 - **2026-11-10 18:4x（采样）**：新增 PV-013（T4.2 `music_cloud` 真机验证）；T4.2 固件构建通过（bin 1,982,880 B / DIRAM 201,046 B），仍无 USB 串口。
+- **2026-11-10 19:1x（采样）**：T4.3 `music_session` 完成（构建口径）：暂停/继续**保 ring 从暂停点续播**、语音抢占（用户暂停 latch 优先）、`music_request` 兜底、`music_status` 增 `paused`；bin **1,993,152 B** / 静态 DIRAM **200,870 B（−176 B）**、host 单测 **76/76**；新增 **PV-014**（真机 9 项）与 **PD-006**（语音期间排队曲目的 mid/status 时序）。
 
 | 时间（Asia/Shanghai） | 事件 |
 |---|---|

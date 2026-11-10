@@ -94,8 +94,8 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 | `audio_end` | VAD 静音 800ms 或累计 8s（或调试 `vc stop`） | `sid`(uint16) | `{"t":"audio_end","sid":1}` |
 | `interrupt` | 用户打断（R4：T3.2 已实现，`voice_session`→`vc_interrupt()`；发后立即本地作废本轮，不等应答） | `sid`(uint16) | `{"t":"interrupt","sid":1}` |
 | `ping` | 每 20s | 无 | `{"t":"ping"}` |
-| `music_request` | 音乐控制（端侧主动点歌，T4.3 实现；当前仅 mock 支持） | `action`(str)、`id`/`index`(int) | `{"t":"music_request","action":"play","id":"a1","index":0}` |
-| `music_status` | 播放状态上报（T4.2 已实现）：播放中每 5s + 每次状态变化立即一次 | `state`(str，`playing`/`stopped`/`error`)、`mid`(uint16)、`progress_ms`(int) | `{"t":"music_status","state":"playing","mid":1,"progress_ms":12000}` |
+| `music_request` | 音乐控制（端侧主动点歌，**T4.3 实现**；mock 已支持） | `action`(str)、`id`(int，端侧自增请求序号，仅用于日志关联)、`index`(int，曲目索引，`0`/`-1` = 服务端自选) | `{"t":"music_request","action":"play","id":3,"index":0}` |
+| `music_status` | 播放状态上报（T4.2 实现、**T4.3 增 `paused`**）：播放中每 5s + 每次状态变化立即一次；暂停期照常周期上报但 `progress_ms` 冻结 | `state`(str，`playing`/`paused`/`stopped`/`error`)、`mid`(uint16)、`progress_ms`(int) | `{"t":"music_status","state":"paused","mid":1,"progress_ms":12000}` |
 
 `audio_end` 的收尾原因由端侧日志区分（`vad-silence` / `max-duration` / `stop-request`），**不上报文**（避免与服务端字段耦合）。
 
@@ -111,8 +111,8 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 | `tts_end` | `sid` | `{"t":"tts_end","sid":1}` | 投 `APP_EVT_TTS_END` + 回调；关闭窗口、本轮结束 |
 | `error` | `sid`、`code`(int)、`msg`(str) | `{"t":"error","sid":1,"code":3001,"msg":"TTS failed"}` | ERROR 日志 + 回调；结束本轮，不自动重试 |
 | `pong` | 无 | `{"t":"pong"}` | 传输层消费（RTT 用端侧 tick 计算） |
-| `music_track` | `mid`(uint16)、`url`、`codec`、`duration_ms`（**0 = 直播流/时长未知**）、`title`（可选 `artist`） | `{"t":"music_track","mid":1,"url":"http://192.168.1.5:9000/x.mp3","codec":"mp3","duration_ms":269000,"title":"晴天"}` | **T4.2 已实现（`music_cloud`）**：`url` 只接受 `http(s)` 且 ≤ 320B，`codec` 必须是 `mp3`；`mid` 必须比当前新（同 mid 视为重复、不重复起播），否则丢弃计数；接受后 `audio_player_music_play_url(url)` |
-| `music_control` | `mid`(uint16)、`action`(`pause`/`resume`/`stop`) | `{"t":"music_control","mid":1,"action":"pause"}` | **T4.2 已实现（`music_cloud`）**：`stop` → `audio_player_music_stop_url()`；`pause`/`resume` 只计数 + WARN（执行归 T4.3）；允许 `mid == 当前曲目`、只丢弃更旧的；下一首/上一首不发它，改用新的 `music_track` |
+| `music_track` | `mid`(uint16)、`url`、`codec`、`duration_ms`（**0 = 直播流/时长未知**）、`title`（可选 `artist`） | `{"t":"music_track","mid":1,"url":"http://192.168.1.5:9000/x.mp3","codec":"mp3","duration_ms":269000,"title":"晴天"}` | **T4.2 解析 / T4.3 起播（`music_session`）**：`url` 只接受 `http(s)` 且 ≤ 320B，`codec` 必须是 `mp3`；`mid` 必须比当前新（同 mid 视为重复、不重复起播），否则丢弃计数；接受后由 `music_session` 起播/切歌（先停旧流再起新流，120ms × 15 重试） |
+| `music_control` | `mid`(uint16)、`action`(`pause`/`resume`/`stop`) | `{"t":"music_control","mid":1,"action":"pause"}` | **T4.2 解析 / T4.3 执行**：`pause` = 用户暂停 latch（会话结束不自动恢复）→ `audio_player_music_pause()`；`resume` = 清 latch 并从暂停点续播（不回到文件头）；`stop` → `audio_player_music_stop_url()` 丢弃 ring；允许 `mid == 当前曲目`、只丢弃更旧的；下一首/上一首不发它，改用新的 `music_track` |
 
 ### 3.3 `sid` 规则与迟到帧过滤
 
@@ -122,6 +122,7 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 - 迟到帧过滤已用 mock `--inject-late`（每轮注入一个 `sid+1` 的 `asr_final`）做真机验证；T3.1 回归仍 50/50 PASS。
 - **音乐事件不吃 `sid`**（P-3）：`music_track` / `music_control` 用连接内自增的 `mid`，因为音乐可以跨语音轮次、也可在没有会话时开始；端侧按 `t` 分流，`voice_cloud` 的 `sid` 过滤只作用于语音事件（音乐事件在 `voice_cloud` 里静默跳过，不 WARN、不计入 sid 丢弃）。
 - **`mid` 过滤（T4.2 落地）**：`music_track` 只接受比当前**更新**的 `mid`（同 `mid` 丢弃为重复）；`music_control` 允许 `mid == 当前曲目`（暂停/停止本就指向这首），只丢弃更旧的；WS 断链后清比较基准（新连接内 `mid` 重新计数，音乐本身可继续播）。
+- **暂停/继续不影响 `mid` 基准（T4.3）**：暂停是端侧播放状态，不消耗 `mid`；暂停期间到达的 `music_control` 仍按 `mid` 规则判别（同一曲目允许），恢复后同一 `mid` 仍有效。
 
 ### 3.4 未知事件 / 非法文本
 
@@ -183,6 +184,8 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 | P-5 | 鉴权失败关闭码 | ✅ T1.4：应用关闭码 4001/4002 |
 | P-6 | `pong` 字段与 RTT 口径 | ✅ T1.4：固定 `{"t":"pong"}`，RTT 端侧 tick |
 | P-7 | `ws://` / `wss://` 证书策略 | ✅ T1.4：按 URL scheme 双传输，量产强制 `wss://` |
+| P-8 | `music_request` 字段语义 | ✅ **T4.3 定稿**：`action` 目前只有 `play`；`id` = 端侧自增 uint16 请求序号（只用于日志关联，服务端可忽略）；`index` = 曲目索引，`0`/`-1` = 由服务端自选（曲库/推荐）。原表 `id`/`index` 为 int 与样例 `"id":"a1"` 的冲突以本行为准 |
+| P-9 | 暂停要不要上报 | ✅ **T4.3 定稿**：`music_status.state` 增 `paused`；暂停期仍每 5s 上报但 `progress_ms` 冻结（服务端据此判断暂停时长）；`stop` 后上报一次 `stopped` |
 
 ## 8. 联调工具与已知差异
 
@@ -190,5 +193,5 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 - 缺省 TTS 二进制仍是**合成 payload（不可解码的伪 MP3）**，仅用于帧级/协议联调；真实 MP3 播放用 `--tts-mp3`（`tools/tts_stream_test.py` 自动生成并下发 24k 单声道素材）。
 - **mock 默认对每条连接开 TCP_NODELAY**（T2.4 定稿）：Nagle + 端侧 delayed ACK 会把 20~30ms 均匀下发的 TTS 帧攒批 ~200ms，端侧流式 ring 被打空造成假欠载。**真实云端同样必须关闭 Nagle**。
 - 公网 `wss://echo.websocket.org/.ws` 之类回显端点**不符合本协议**（不回 `hello_ack`、会把 `hello` 原样回显），只用于 TLS 路径/内存水位验证；端侧对非契约下行文本会 WARN 后忽略，属预期。
-- **M1 音乐（2026-11-10，mock 侧，不依赖 LLM 工具）**：`--music` 用一张确定性规则表把 ASR 文本映射成音乐意图——「暂停/继续/下一首/上一首/停止」→ `music_control`，点歌 → 曲库检索后下发 `music_track`；命中时不进 LLM，回答用固定确认语（仍走 TTS 下发）。没有 `--music-url` 时 mock 自带 HTTP 服务下发示例 MP3（`http://<局域网IP>:<端口>/media/demo.mp3`），真机可直接播。曲库：`--music-catalog tools/…json`（`{"tracks":[{"title","artist","url","duration_ms","keywords"}]}`）。曲目可以是**电台直播流**（如 `--music-url http://.../live.mp3 --music-title 清听电台`，`duration_ms=0`，不要求准备本地 MP3）；也可用 `--music-search-url` 接**任意**返回 `{"tracks":[{title,url,duration_ms}]}` 的搜索端点（mock 不内置任何站点抓取/签名，失败回退曲库）；自测：`uv run tools/mock_music_test.py`（178 项，离线）。LLM/Hermes 只负责「说话」；URL 只走 `music_track`。
+- **M1 音乐（2026-11-10，mock 侧，不依赖 LLM 工具）**：`--music` 用一张确定性规则表把 ASR 文本映射成音乐意图——「暂停/继续/下一首/上一首/停止」→ `music_control`，点歌 → 曲库检索后下发 `music_track`；命中时不进 LLM，回答用固定确认语（仍走 TTS 下发）。没有 `--music-url` 时 mock 自带 HTTP 服务下发示例 MP3（`http://<局域网IP>:<端口>/media/demo.mp3`），真机可直接播。曲库：`--music-catalog tools/…json`（`{"tracks":[{"title","artist","url","duration_ms","keywords"}]}`）。曲目可以是**电台直播流**（如 `--music-url http://.../live.mp3 --music-title 清听电台`，`duration_ms=0`，不要求准备本地 MP3）；也可用 `--music-search-url` 接**任意**返回 `{"tracks":[{title,url,duration_ms}]}` 的搜索端点（mock 不内置任何站点抓取/签名，失败回退曲库）；自测：`uv run tools/mock_music_test.py`（178 项，离线）。LLM/Hermes 只负责「说话」；URL 只走 `music_track`。**端侧 T4.3 起会主动发 `music_request`**（"继续"失败兜底与 `ms request play [index]` 探针），mock 已支持：收到后回一条新的 `music_track`（`mid` 继续自增）。
 - 端侧上报的 `audio_end` 原因、`vc` 统计等调试信息**不上报文**，只走日志/console，见 `docs/ARCHITECTURE.md` §10.2。

@@ -1675,25 +1675,31 @@ uv run tools/ws_mock_server.py --music \
 
 - `{query}` 会被 URL 编码后替换；没写占位符时自动补 `?q=`。
 - 超时 / 非 2xx / JSON 坏 / 没有 `http(s)` URL → WARN 并**回退本地曲库**，不打断本轮。
-- 点歌时一次取回最多 5 条结果，`下一首/上一首` 在这批结果里前后移动（不再报"曲库还没有歌"）。
+- 点歌时一次取回最多 5 条结果，`下一首/上一首` 在这批结果里前后移动；单条结果时回退整库。
 - 端侧仍是普通 `music_track`，换源不改协议、不改固件。
 
 ### 本机音乐服务器（`local_music_server.py`）——自己的 MP3，说歌名就播
 
 ```bash
-uv run tools/local_music_server.py --dir ~/Music --port 9009
+# 推荐：同时把曲库写到文件，mock 按 mtime 自动重载（加歌不用重启任何服务）
+uv run tools/local_music_server.py --dir ~/Music --port 9009 \
+  --catalog-out /tmp/music_catalog.json
+
+# 另一个终端：mock 同时接「按歌名搜索」和「整库浏览」
+uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+  tools/ws_mock_server.py --host 0.0.0.0 --port 8765 \
+  --music --music-catalog /tmp/music_catalog.json \
+  --music-search-url 'http://127.0.0.1:9009/search?q={query}' \
+  --asr sensevoice --tts-qwen
 ```
 
-启动后打印可用的两条 mock 命令：
-
-```
-本机音乐服务器：/Users/xxx/Music（12 首 .mp3）
-mock 接法（二选一）：
-  --music-search-url 'http://127.0.0.1:9009/search?q={query}'
-  curl -s http://192.168.1.23:9009/catalog > /tmp/music_catalog.json  # 再 --music-catalog
-```
+说「放一首晴天」→ 按歌名搜索；说「放首歌 / 下一首 / 上一首」→ 在整库顺序移动。
+**目录随时加歌**：服务端每次 `/search`、`/catalog` 前会按 1s 限频重扫（加完歌直接说名字即可）；
+`--catalog-out` 会把新曲库原子写到文件，mock 在下次 放首歌/下一首/上一首 时按 mtime 自动重载
+（日志 `[MUSIC] 曲库已重载：N 首`），**不用重启服务**。
 
 - **端点**：`/search?q=`（最多 `--limit` 条）、`/catalog`（整库 JSON）、`/media/<相对路径>`（支持 Range/206、HEAD）、`/stream/<相对路径>`（**2026-11-10 新增**：无限循环、无 Content-Length、连接关闭定界、~100KB/s 限速，用于真机复现**直播流**路径；T4.1 验收用它对 60s 0 欠载）。
+- **加歌/换目录**：把 `.mp3` 丢进 `--dir`（递归）→ 直接说歌名；`下一首/上一首` 的下一次调用会把游标对齐**当前正在播的曲目**再移动，不会因搜索/重载而漂移。
 - **标题**取文件名：去掉 `01.` 这类音轨号、`[myfreemp3.ink]` 这类站点标签，并按「歌手 - 歌名」拆成 `artist`/`title`（确认语只念歌名）；`duration_ms=0`（时长未知，端侧 T4.1 按持续流处理）。
 - URL 默认用**本机局域网 IP**（设备要能访问；跨网段 `--public-host` 指定）。只服务 `--dir` 下的 `.mp3`，路径穿越返回 403。
 - 自测：`uv run tools/local_music_server.py --self-test`（17/17）。
@@ -1707,7 +1713,7 @@ mock 接法（二选一）：
 | 说的话 | 下发 | 说明 |
 |---|---|---|
 | 放首周杰伦的晴天 / 播放孤勇者 / 来首歌 | `music_track{mid,url,codec:"mp3",duration_ms,title}` | 曲库检索；无匹配回退当前曲目并 WARN |
-| 下一首 / 上一首 / 换一首 | **新的 `music_track`** | 端侧没有播放列表，只有服务端能决定下一首；**接了搜索源时先在本次搜索结果里移动**；搜索只返回 1 条（或电台单曲库）就循环同一首 |
+| 下一首 / 上一首 / 换一首 | **新的 `music_track`** | 端侧没有播放列表，只有服务端能决定下一首；搜索结果 **>1 条**时先在这批结果里移动，否则/搜索单条时回退**整库顺序**（2026-11-10 调整，避免搜一次后「下一首」被单条结果卡住） |
 | 暂停 / 先停一下 | `music_control{mid,action:"pause"}` | 控制事件沿用当前 `mid`（不加 1） |
 | 继续 / 接着放 | `music_control{action:"resume"}` | |
 | 停止播放 / 别放了 / 关掉音乐 | `music_control{action:"stop"}` | 控制词优先于「放」 |

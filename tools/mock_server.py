@@ -226,6 +226,7 @@ class Session(DownlinkMixin):
                 if track is not None:
                     self.music_mid = (self.music_mid + 1) & 0xFFFF
                     await self._send_json(track.as_event(self.music_mid))
+                    self.server.music.last_url = track.url
                     self.stats.music_tracks += 1
                     self._log(logging.INFO, f"music_request → 曲目《{track.title}》{track.url}")
                 else:

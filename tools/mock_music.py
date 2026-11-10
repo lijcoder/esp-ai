@@ -247,6 +247,8 @@ class MusicCatalog:
         for track in tracks:
             self.add(track)
         self._cursor = -1
+        self._source: Path | None = None   # --music-catalog 文件：按 mtime 自动重载
+        self._mtime_ns = 0
 
     def add(self, track: MusicTrack) -> None:
         if not _valid_url(track.url):
@@ -262,6 +264,7 @@ class MusicCatalog:
 
     def resolve(self, query: str) -> tuple[MusicTrack | None, bool]:
         """返回 (曲目, 是否精确命中)；曲库为空返回 (None, False)。"""
+        self.maybe_reload()
         if not self._tracks:
             return None, False
         norm = _normalize(query or "")
@@ -293,41 +296,94 @@ class MusicCatalog:
             self._cursor = 0
         return self._tracks[self._cursor], False
 
+    def seek(self, url: str) -> bool:
+        """把游标对准当前正在播的曲目（下一首/上一首用），避免搜索后游标漂移。"""
+        for index, track in enumerate(self._tracks):
+            if track.url == url:
+                self._cursor = index
+                return True
+        return False
+
     def next_track(self) -> MusicTrack | None:
+        self.maybe_reload()
         if not self._tracks:
             return None
         self._cursor = 0 if self._cursor < 0 else (self._cursor + 1) % len(self._tracks)
         return self._tracks[self._cursor]
 
     def prev_track(self) -> MusicTrack | None:
+        self.maybe_reload()
         if not self._tracks:
             return None
         self._cursor = 0 if self._cursor < 0 else (self._cursor - 1) % len(self._tracks)
         return self._tracks[self._cursor]
 
-    @classmethod
-    def from_json(cls, path: str | Path) -> "MusicCatalog":
-        """读 JSON 曲库：{"tracks":[{"title","url","duration_ms","artist","keywords"}]}。"""
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    @staticmethod
+    def _parse_json(path: Path) -> list[MusicTrack]:
+        data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or not isinstance(data.get("tracks"), list):
             raise ValueError('曲库格式错误：顶层应为 {"tracks": [...]}')
-        catalog = cls()
+        tracks: list[MusicTrack] = []
         for item in data["tracks"]:
             if not isinstance(item, dict) or not item.get("url"):
                 raise ValueError(f"曲库条目缺少 url：{item!r}")
             keywords = item.get("keywords") or ()
             if isinstance(keywords, str):
                 keywords = (keywords,)
-            catalog.add(
-                MusicTrack(
-                    title=str(item.get("title") or "未命名曲目"),
-                    url=str(item["url"]),
-                    duration_ms=int(item.get("duration_ms") or 0),
-                    artist=str(item.get("artist") or ""),
-                    keywords=tuple(str(k) for k in keywords),
-                )
+            track = MusicTrack(
+                title=str(item.get("title") or "未命名曲目"),
+                url=str(item["url"]),
+                duration_ms=int(item.get("duration_ms") or 0),
+                artist=str(item.get("artist") or ""),
+                keywords=tuple(str(k) for k in keywords),
             )
+            if not _valid_url(track.url):
+                raise ValueError(f"曲目 {track.title!r} 的 url 非法（只允许 http/https）：{track.url!r}")
+            tracks.append(track)
+        return tracks
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "MusicCatalog":
+        """读 JSON 曲库：{"tracks":[{"title","url","duration_ms","artist","keywords"}]}。"""
+        source = Path(path)
+        catalog = cls()
+        for track in cls._parse_json(source):
+            catalog.add(track)
+        catalog._source = source
+        try:
+            catalog._mtime_ns = source.stat().st_mtime_ns
+        except OSError:
+            catalog._mtime_ns = 0
         return catalog
+
+    def maybe_reload(self) -> bool:
+        """`--music-catalog` 文件变化时自动重载（local_music_server --catalog-out 会重写它）。"""
+        if self._source is None:
+            return False
+        try:
+            mtime = self._source.stat().st_mtime_ns
+        except OSError:
+            return False
+        if mtime == self._mtime_ns:
+            return False
+        current_url = None
+        if 0 <= self._cursor < len(self._tracks):
+            current_url = self._tracks[self._cursor].url
+        try:
+            tracks = self._parse_json(self._source)
+        except (OSError, ValueError) as exc:
+            LOG.warning("[MUSIC] 曲库重载失败（%s），继续用旧表：%s", self._source.name, exc)
+            self._mtime_ns = mtime
+            return False
+        self._tracks = tracks
+        if self._tracks:
+            index = next((i for i, t in enumerate(tracks) if t.url == current_url), None)
+            self._cursor = index if index is not None else min(max(self._cursor, 0), len(tracks) - 1)
+        else:
+            self._cursor = -1
+        self._mtime_ns = mtime
+        LOG.info("[MUSIC] 曲库已重载：%d 首（%s）", len(tracks), self._source.name)
+        return True
 
 
 # ============================================================================
@@ -592,6 +648,7 @@ class MusicService:
         self._need_demo = need_demo
         self.http: MusicHttpServer | None = None
         self.demo_url = ""
+        self.last_url = ""      # 最近一次下发的曲目 URL（下一首/上一首据此对齐游标）
 
     # ---- 构造 ----
 
@@ -671,6 +728,11 @@ class MusicService:
         return self.search.search_tracks(query, limit=limit)
 
     def track_for(self, intent: MusicIntent) -> tuple[MusicTrack | None, bool]:
+        # 下一首/上一首：先把游标对齐当前曲目（搜索/重载后游标可能漂移）
+        if intent.action in (ACTION_NEXT, ACTION_PREV):
+            self.catalog.maybe_reload()
+            if self.last_url:
+                self.catalog.seek(self.last_url)
         # 点歌：先问搜索源（可能在网络上，调用方用 to_thread 包住），失败/无结果回退曲库
         if intent.action == ACTION_PLAY and intent.query and self.search is not None:
             track = self.search.search(intent.query)

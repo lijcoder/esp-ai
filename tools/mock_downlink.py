@@ -608,13 +608,13 @@ class DownlinkMixin:
                     track, matched = tracks[0], True
                 else:
                     track, matched = music.catalog.resolve(intent.query)
-            elif intent.action == ACTION_PLAY:      # "放首歌"（无 query）：沿用上次搜索结果
-                if self.music_queue:
+            elif intent.action == ACTION_PLAY:      # "放首歌"（无 query）：曲库浏览（单条搜索结果不困住）
+                if len(self.music_queue) > 1:
                     self.music_index = max(0, self.music_index)
                     track, matched = self.music_queue[self.music_index], True
                 else:
                     track, matched = music.catalog.resolve("")
-            elif self.music_queue:                  # 下一首/上一首：先在搜索结果里游标移动
+            elif len(self.music_queue) > 1:         # 下一首/上一首：多结果时先在搜索结果里游标移动
                 step = 1 if intent.action == ACTION_NEXT else -1
                 self.music_index = (self.music_index + step) % len(self.music_queue)
                 track, matched = self.music_queue[self.music_index], True
@@ -625,6 +625,7 @@ class DownlinkMixin:
                 return "抱歉，没找到这首歌。"
             self.music_mid = (self.music_mid + 1) & 0xFFFF
             await self._send_json(track.as_event(self.music_mid))
+            music.last_url = track.url
             self.stats.music_tracks += 1
             detail = (
                 f"（搜索结果 {len(self.music_queue)} 首 / 当前 {self.music_index + 1}）"

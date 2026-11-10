@@ -105,14 +105,33 @@ def _keywords(text: str) -> list[str]:
 
 
 class Library:
-    """扫描目录 → 曲目表 + 关键词检索。"""
+    """扫描目录 → 曲目表 + 关键词检索。
 
-    def __init__(self, root: Path, public_host: str, port: int, limit: int = 5) -> None:
+    目录会持续增长（用户往里面丢新歌），所以 `/search` 与 `/catalog` 会先做一次
+    **限频重扫**（`refresh_if_stale`，默认 1s 内最多一次）；`--catalog-out` 时每次重扫
+    还会原子重写曲库 JSON，mock 侧按 mtime 自动按需重载，**不用重启 mock**。
+    """
+
+    def __init__(self, root: Path, public_host: str, port: int, limit: int = 5,
+                 catalog_out: Path | None = None) -> None:
         self.root = root.resolve()
         self.public_host = public_host
         self.port = port
         self.limit = max(1, limit)
+        self.catalog_out = catalog_out
         self._tracks: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._last_scan = 0.0
+        self._scan_min_interval = 1.0
+
+    def refresh_if_stale(self) -> int:
+        """限频重扫：新放进目录的歌不用重启服务就能被搜到。"""
+        with self._lock:
+            now = time.monotonic()
+            if now - self._last_scan < self._scan_min_interval:
+                return len(self._tracks)
+            self._last_scan = now
+        return self.refresh()
 
     def refresh(self) -> int:
         tracks: list[dict[str, Any]] = []
@@ -133,8 +152,21 @@ class Library:
                 "_rel": rel,
                 "_norm": _norm(f"{artist} {title}"),
             })
-        self._tracks = tracks
+        with self._lock:
+            self._tracks = tracks
+        if self.catalog_out is not None:
+            self._write_catalog()
         return len(tracks)
+
+    def _write_catalog(self) -> None:
+        """原子写曲库 JSON（mock `--music-catalog` 按 mtime 重载，避免读到半个文件）。"""
+        payload = {"tracks": [{k: v for k, v in t.items() if not k.startswith("_")}
+                              for t in list(self._tracks)]}
+        target = Path(self.catalog_out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(target)
 
     @property
     def tracks(self) -> list[dict[str, Any]]:
@@ -213,12 +245,13 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = _recover_utf8(unquote(parsed.path))
         if path == "/search":
+            self.library.refresh_if_stale()
             query = _recover_utf8((parse_qs(parsed.query).get("q") or [""])[0])
             tracks = self.library.search(query)
             self._json({"tracks": [_public_payload(t) for t in tracks]}, head_only)
             return
         if path == "/catalog":
-            self.library.refresh()
+            self.library.refresh_if_stale()
             self._json(self.library.catalog(), head_only)
             return
         if path.startswith("/media/"):
@@ -365,8 +398,10 @@ class _ThreadingServer(ThreadingHTTPServer):
 
 class MusicServer:
     def __init__(self, directory: Path, host: str, port: int, public_host: str,
-                 limit: int = 5, rescan: bool = False) -> None:
-        self.library = Library(directory, public_host, port, limit=limit)
+                 limit: int = 5, rescan: bool = False,
+                 catalog_out: Path | None = None) -> None:
+        self.library = Library(directory, public_host, port, limit=limit,
+                               catalog_out=catalog_out)
         self.host = host
         self.port = port
         self.rescan = rescan
@@ -539,7 +574,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=9009, help="端口（0=随机）")
     parser.add_argument("--public-host", default="", help="写进 url 的主机名（设备要能访问；缺省自动探测局域网 IP）")
     parser.add_argument("--limit", type=int, default=5, help="单次搜索最多返回条数")
-    parser.add_argument("--rescan", action="store_true", help="每次 /search 前重新扫描目录")
+    parser.add_argument("--rescan", action="store_true", help="每次 /search 前重新扫描目录（默认已按 1s 限频重扫）")
+    parser.add_argument("--catalog-out", default="",
+                        help="把曲库原子写到该 JSON（配合 mock --music-catalog 自动重载：加歌后不用重启 mock）")
     parser.add_argument("--self-test", action="store_true", help="进程内自测（不需要音乐文件）")
     args = parser.parse_args(argv)
 
@@ -551,8 +588,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"目录不存在：{root}", file=sys.stderr)
         return 2
     public_host = args.public_host or detect_lan_ip()
+    catalog_out = Path(args.catalog_out) if args.catalog_out else None
     server = MusicServer(root, args.host, args.port, public_host,
-                         limit=args.limit, rescan=args.rescan)
+                         limit=args.limit, rescan=args.rescan, catalog_out=catalog_out)
     count = server.start()
     base = f"http://{public_host}:{server.port}"
     print("=" * 72)

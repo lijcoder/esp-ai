@@ -111,7 +111,8 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 | `tts_end` | `sid` | `{"t":"tts_end","sid":1}` | 投 `APP_EVT_TTS_END` + 回调；关闭窗口、本轮结束 |
 | `error` | `sid`、`code`(int)、`msg`(str) | `{"t":"error","sid":1,"code":3001,"msg":"TTS failed"}` | ERROR 日志 + 回调；结束本轮，不自动重试 |
 | `pong` | 无 | `{"t":"pong"}` | 传输层消费（RTT 用端侧 tick 计算） |
-| `music_track` | `sid`、`url`、`codec`、`duration_ms`、`title` | 见 ARCH §6.3 | T4.2 实现；当前端侧记 WARN 后忽略 |
+| `music_track` | `mid`(uint16)、`url`、`codec`、`duration_ms`（**0 = 直播流/时长未知**）、`title`（可选 `artist`） | `{"t":"music_track","mid":1,"url":"http://192.168.1.5:9000/x.mp3","codec":"mp3","duration_ms":269000,"title":"晴天"}` | T4.2 实现；当前端侧记 WARN 后忽略 |
+| `music_control` | `mid`(uint16)、`action`(`pause`/`resume`/`stop`) | `{"t":"music_control","mid":1,"action":"pause"}` | T4.2 实现；下一首/上一首不发它，改用新的 `music_track` |
 
 ### 3.3 `sid` 规则与迟到帧过滤
 
@@ -119,6 +120,7 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 - 服务端下发语音事件时必须原样回填 `sid`；
 - 端侧规则：**无 `sid`、`sid` 非法、或与当前轮次不一致的事件一律丢弃**，计入 `vc status` 的「sid 丢弃」；不报错、不结束本轮。
 - 迟到帧过滤已用 mock `--inject-late`（每轮注入一个 `sid+1` 的 `asr_final`）做真机验证；T3.1 回归仍 50/50 PASS。
+- **音乐事件不吃 `sid`**（P-3）：`music_track` / `music_control` 用连接内自增的 `mid`，因为音乐可以跨语音轮次、也可在没有会话时开始；端侧按 `t` 分流，`voice_cloud` 的 `sid` 过滤只作用于语音事件。
 
 ### 3.4 未知事件 / 非法文本
 
@@ -175,7 +177,7 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 |---|---|---|
 | P-1 | `hello` 是否有应答 | ✅ T1.4：服务端必须回 `hello_ack`（5s 超时） |
 | P-2 | 二进制帧如何关联 `sid` | ✅ T2.5：帧头不加 `sid`，按 `audio_start → tts_end` 顺序归属（§2.3） |
-| P-3 | 音乐事件 `sid` 生成方/作用域 | ⏳ T4.2；mock 暂用连接内独立计数器 |
+| P-3 | 音乐事件 `sid` 生成方/作用域 | 🟡 **方案已定（2026-11-10）**：音乐事件用**独立 `mid`**（连接内自增，不复用语音 `sid`；理由见 §3.3）。mock 已按此实现（`--music`）；端侧 `music_cloud` 在 T4.2 落地后转 ✅ |
 | P-4 | `error` 错误码表 | ✅ T2.5：码表见 §4 |
 | P-5 | 鉴权失败关闭码 | ✅ T1.4：应用关闭码 4001/4002 |
 | P-6 | `pong` 字段与 RTT 口径 | ✅ T1.4：固定 `{"t":"pong"}`，RTT 端侧 tick |
@@ -187,4 +189,5 @@ wss://<host>/v1/voice?device_id=<id>&token=<token>&ver=1
 - 缺省 TTS 二进制仍是**合成 payload（不可解码的伪 MP3）**，仅用于帧级/协议联调；真实 MP3 播放用 `--tts-mp3`（`tools/tts_stream_test.py` 自动生成并下发 24k 单声道素材）。
 - **mock 默认对每条连接开 TCP_NODELAY**（T2.4 定稿）：Nagle + 端侧 delayed ACK 会把 20~30ms 均匀下发的 TTS 帧攒批 ~200ms，端侧流式 ring 被打空造成假欠载。**真实云端同样必须关闭 Nagle**。
 - 公网 `wss://echo.websocket.org/.ws` 之类回显端点**不符合本协议**（不回 `hello_ack`、会把 `hello` 原样回显），只用于 TLS 路径/内存水位验证；端侧对非契约下行文本会 WARN 后忽略，属预期。
+- **M1 音乐（2026-11-10，mock 侧，不依赖 LLM 工具）**：`--music` 用一张确定性规则表把 ASR 文本映射成音乐意图——「暂停/继续/下一首/上一首/停止」→ `music_control`，点歌 → 曲库检索后下发 `music_track`；命中时不进 LLM，回答用固定确认语（仍走 TTS 下发）。没有 `--music-url` 时 mock 自带 HTTP 服务下发示例 MP3（`http://<局域网IP>:<端口>/media/demo.mp3`），真机可直接播。曲库：`--music-catalog tools/…json`（`{"tracks":[{"title","artist","url","duration_ms","keywords"}]}`）。曲目可以是**电台直播流**（如 `--music-url http://.../live.mp3 --music-title 清听电台`，`duration_ms=0`，不要求准备本地 MP3）；也可用 `--music-search-url` 接**任意**返回 `{"tracks":[{title,url,duration_ms}]}` 的搜索端点（mock 不内置任何站点抓取/签名，失败回退曲库）；自测：`uv run tools/mock_music_test.py`（178 项，离线）。LLM/Hermes 只负责「说话」；URL 只走 `music_track`。
 - 端侧上报的 `audio_end` 原因、`vc` 统计等调试信息**不上报文**，只走日志/console，见 `docs/ARCHITECTURE.md` §10.2。

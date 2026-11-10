@@ -120,6 +120,7 @@
 | T3.5 | 提示音存储：SPIFFS vs 自定义只读 pack | **采纳自定义只读 pack + `esp_partition_mmap`**（方案 D，用户 2026-11-02 拍板）：`assets` 分区存 24B 头+条目表+PCM，固件启动校验后零拷贝映射；不用 SPIFFS（mount 占内部堆，而 wss 水位余量仅 ~2.6KB）；"单独烧 assets 分区替换提示音、不重编 app"目标同样满足 | 2026-11-02 | 实现见 ARCH §3.4、`components/prompt_store`、`tools/audio_pack.py`；pack 格式见 `prompt_pack.h` |
 | X1 | console 提示符与日志输出互冲 | 暂不优化，当前可接受（详见 §8） | 2026-10-30 | P5/T5.1 时按 §8 方案对比再评估 |
 | X3 | 内部 RAM 预算口径 + WiFi/WS/TLS 内存 | 暂缓优化，功能优先（先完成 P1–P3）；实测与方案已记录 §8，统一优化排 P2 前评估 | 2026-10-31 | T1.4/T1.6 继续记录 TLS/WS 实际内存；触发条件满足时按 §8 X3 执行 |
+| M1 | 音乐意图由谁识别 / URL 从哪来 | **端侧不做 NLU；意图与 UI 在云端**。不要求 Hermes 支持 tool calling：云端用确定性规则层把 ASR 文本变成 `music_track`（曲库给 URL）或 `music_control`（暂停/继续/停止），LLM 只负责说话；**URL 只出现在结构化下行里**，禁止从 LLM 文本解析（防 TTS 念链接/prompt 注入）。mock 按此实现（`--music`），端侧 P4 只依赖事件契约 | 2026-11-10 | T4.1 `source_http`；T4.2 `music_cloud` 解析 `music_track`/`music_control`；后端/Hermes 后续可换成 tool 或意图路由，端侧不返工 |
 | Q6-a | 连续对话免唤醒（follow-up） | **采纳**（窗口式，不做常开聆听）：TTS 播完进入 FOLLOW_UP 续听窗口（默认 5s / 最多 5 轮续听 / 人声确认 250ms），窗口内直接说话免唤醒、不播提示音；静音超时/轮数上限/按键/断网退出；窗口内唤醒词 = 重开一轮（播提示音、轮数清零）；运行期 `vs followup on\|off`，Kconfig 可关 | 2026-11-01 | 实现见 ROADMAP T3.7；ARCH §7/§8.1；限制：嘈杂环境可能被持续人声误触发（有确认窗口 + 轮数上限兜底），唤醒率/误触发基线归 T5.2 |
 
 ---

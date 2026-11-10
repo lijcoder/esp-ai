@@ -119,6 +119,16 @@
 | 关闭条件 | 真机 ≥2 轮：首声早于 LLM 完成、`underrun=0`、R2 正常、无 ERROR/断流；按键打断与中途断网各 1 次正常回 IDLE |
 | 关联 | `tools/mock_pipeline.py`、`tools/README.md`「LLM 边出字边播」、STATUS §3 2026-11-10 行、PROTOCOL §3.2 |
 
+### PV-011 · M1 音乐链路（mock `--music`）真机验证
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-10 16:2x（采样）**，M1 mock 侧交付时登记 |
+| 来源 | 用户确认「后端 mock 接的是 Hermes 网关、不能传 tool，ESP32 也不该做 NLU」后，采纳 M1 双通道方案：mock 用确定性规则表把 ASR 文本变成 `music_track` / `music_control`，LLM 只负责说话 |
+| 现象/问题 | 离线假设备已验证 178 项（意图/曲库/HTTP Range/事件顺序/未启用不误发），但**未在 ESP32 真机**验证：设备能拉到 mock 内置 HTTP 的 `music_track.url`、能播 6.3s 示例曲目、说「暂停/继续/下一首/停止」时的端侧响应（T4.2/T4.3 实现前只能验到 `vc` 层 WARN 忽略或 T4.1 的 `music play` 探针） |
+| 验收方法 | 回板后：`uv run tools/ws_mock_server.py --music --asr sensevoice` + 设备 `CONFIG_AI_WS_URL` 指向 mock；说「嗨，乐鑫 → 放首歌」：设备端 `PLAYER: play`/`VC: music_track`（T4.2 后）、音频真的出声；URL 用 mock 内置示例曲目或**公网电台直播流**（`--music-url … --music-title …`，无需自备 MP3）；再说「暂停/继续/下一首/停止」各一次，对照 mock 日志 `[MUSIC] ...` 与设备端动作 |
+| 关闭条件 | 真机 ≥1 轮点歌出声（设备拉流成功、时长与 `duration_ms` 同量级）+ 四条控制指令各 1 次端侧动作正确；T4.1/T4.2 落地后由对应任务回写 STATUS §5 |
+| 关联 | `tools/mock_music.py`、`tools/mock_music_test.py`、`docs/ARCHITECTURE.md` §6.3、`docs/PROTOCOL.md` §3.2/§7（P-3）、STATUS §3 2026-11-10 行 |
+
 ## 3. 待决定 / 已被暂缓（PD）
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）
@@ -200,6 +210,8 @@
 ---
 
 ## 5. 时间线（便于回溯"什么时候的问题"）
+
+- **2026-11-10 16:2x（采样）**：新增 PV-011（M1 音乐链路真机验证）；同日 P-3 按「音乐事件用独立 `mid`」定稿建议落地到 mock 与 PROTOCOL。
 
 | 时间（Asia/Shanghai） | 事件 |
 |---|---|

@@ -15,7 +15,7 @@
 | 唤醒应答 | 播放本地提示音（assets 分区，如"我在呢"） |
 | 语音对话 | 唤醒 → 上行 Opus 音频 → 云端 ASR/LLM → TTS(MP3) 流式下行 → 边下边播 |
 | 打断 | 按键打断（半双工，播放中不听麦克风） |
-| 音乐播放 | MP3 播放；端侧同时支持 HTTP(S) 流式与本地文件两种入口；曲目来源后续接入 |
+| 音乐播放 | MP3 播放；**只有 HTTP(S) 远端 URL 一种入口**（2026-11-10 用户决定：不做本地文件/SD 卡曲库）；曲目 URL 由服务端下发 |
 | 异常反馈 | **本地语音提示音（T3.6：`feedback` 组件，四类异常）+ `APP_EVT_FEEDBACK` 语义事件（屏幕/灯光等未来通道订阅）**；板载 LED 状态灯已于 2026-11-02 移除（PENDING PD-003） |
 | 交互按键 | 短按：打断/开始对话；长按：静音/恢复 |
 | 调试 | esp_console 命令行 + 分级日志 + 堆/任务监控 |
@@ -293,7 +293,7 @@ esp-ai/
 │   ├── board/
 │   ├── audio_io/
 │   ├── audio_fe/
-│   ├── audio_player/               # decoder_mp3.c / resample.c / mixer.c / source_http.c / source_file.c
+│   ├── audio_player/               # decoder_mp3.c / resample.c / mixer.c / source_http.c（不做 source_file）
 │   ├── prompt_store/               # T3.5：提示音 pack（assets 分区）加载/映射（L1）
 │   ├── codec_enc/
 │   ├── config_store/
@@ -391,11 +391,19 @@ esp-ai/
 | `asr_partial` / `asr_final` | ASR 中间/最终结果，带 `sid`、`text` |
 | `llm_delta` | LLM 增量文本，带 `sid`、`text` |
 | `tts_start` / `tts_end` | TTS 起止，带 `sid`、`codec`、`sr`（`tts_end` 只带 `sid`） |
-| `music_track` | 曲目信息：`{"t":"music_track","sid":..,"url":"https://...mp3","codec":"mp3","duration_ms":..,"title":..}` |
+| `music_track` | 曲目信息（含 URL，T4.2 端侧实现）：`{"t":"music_track","mid":..,"url":"https://...mp3","codec":"mp3","duration_ms":..,"title":..}`；**下一首/上一首也用它**（服务端下发新曲目）；`duration_ms=0` 表示直播流/时长未知，端侧不能等 EOF 收尾 |
+| `music_control` | 播放控制（2026-11-10 新增，T4.2 端侧实现）：`{"t":"music_control","mid":..,"action":"pause\|resume\|stop"}` |
 | `error` | 错误码与描述：`{"t":"error","sid":..,"code":..,"msg":..}`，码表见 PROTOCOL.md §4 |
 | `pong` | 心跳应答：`{"t":"pong"}`（不带其它字段） |
 
-规则：所有下行事件都带 `sid`；端侧丢弃 `sid` 不匹配当前会话的迟到帧（`voice_cloud` 计数并在 DEBUG 日志里记录）。**错误码表（T2.5 定稿 P-4）**：`1`=通用/未知、`1001`=鉴权、`2001/2002`=ASR 失败/超时、`3001/3002`=TTS 失败/超时、`9001`=服务端内部；端侧统一"ERROR 日志 + 结束本轮（不发 audio_end 重试）"，提示音由 T3.6 负责。
+规则：语音类下行事件都带 `sid`；端侧丢弃 `sid` 不匹配当前会话的迟到帧（`voice_cloud` 计数并在 DEBUG 日志里记录）。
+
+- **音乐事件用独立 `mid`（P-3，2026-11-10 方案已定；端侧 T4.2 落地）**：音乐可以跨语音轮次播放（TTS 播完继续放），也可以在**没有语音轮次**时由按键/云端推荐开始，用语音 `sid` 过滤会被「轮次结束 / 迟到帧丢弃」误杀。端侧 T4.2 按 `t` 分流：语音事件走 `voice_cloud` 的 `sid` 过滤，音乐事件走 `music_cloud`（不参与语音窗口判定）；`mid` 在**每条连接内**单调自增（uint16 回绕），端侧用来丢弃本次连接内的过期音乐事件。
+- **URL 只出现在 `music_track`**：端侧**禁止**从 `llm_delta`/`asr_final` 文本解析 URL（防 prompt 注入、防 TTS 把链接念出来）；只接受 `http(s)` 且可在 Kconfig 配域名白名单。
+- **音乐意图归属云端**：端侧不做 NLU。控制指令（暂停/继续/下一首/停止）由云端的确定性规则层识别后直接下发 `music_control`（不进 LLM，避免一次模型往返）；点歌由曲库检索给出 URL 后下发 `music_track`。mock 的 M1 方案（`--music`）就按这条链路实现，不要求 Hermes 支持 tool calling；LLM 只负责「说话」。
+- **T4.1/T4.2 端侧边界**：T4.1 只做 `source_http`（URL → 流式 MP3 → `CH_MUSIC`），T4.2 才实现 `music_cloud` 对 `music_track`/`music_control` 的解析与 `music_status` 上报；`music_request`（端侧主动点歌）留到 T4.3。
+
+**错误码表（T2.5 定稿 P-4）**：`1`=通用/未知、`1001`=鉴权、`2001/2002`=ASR 失败/超时、`3001/3002`=TTS 失败/超时、`9001`=服务端内部；端侧统一"ERROR 日志 + 结束本轮（不发 audio_end 重试）"，提示音由 T3.6 负责。
 
 ### 6.4 时延目标（端侧可达性约定）
 
@@ -673,9 +681,9 @@ THINKING 超时（10s）───┘
 | **OTA** | 分区表已含 `ota_0/ota_1/otadata`；`ota_svc` 组件未创建 |
 | **屏幕 / UI** | 未纳入；可新增 `ui` 组件（LVGL），消费 `event_bus` 事件 |
 | **定制唤醒词** | `audio_fe` 模型名走 Kconfig（当前固定 `wn9_hilexin`） |
-| **音乐源接入** | `audio_player` 已抽象 `source_http` / `source_file`；`music_cloud` 协议已定义 |
+| **音乐源接入** | `audio_player` 预留 `source_http`（T4.1）；`music_cloud` 协议已定义 |
 | **AEC / 语音打断** | AFE 支持 `"MR"`/`"MMR"` 显式参考通道；`audio_fe` 预留参考通道拼接入口；样板可加第二颗 INMP441 |
-| **SD 卡本地音乐** | `audio_player` 的 `source_file` 可直接指向 FATFS 挂载点 |
+| ~~**SD 卡本地音乐**~~ | **不做**（2026-11-10 用户决定：音乐只播远端 URL；`storage` 分区保留给缓存/日志，不作为曲库） |
 | **电源 / 电池管理** | 预留 `power_mgr` 组件位置与 `BAT_ADC` 引脚（GPIO1） |
 | **离线命令词** | model 分区有 1.5MB 余量，可加 MultiNet 模型 |
 
@@ -683,6 +691,6 @@ THINKING 超时（10s）───┘
 
 | 事项 | 现状 | 影响范围 |
 |---|---|---|
-| 音乐源形态（曲库直链 / SD 卡） | 端侧播放器已同时支持 URL 与本地文件，具体源后续接入 | 仅 `music_cloud` 请求字段与资源准备 |
+| 音乐源形态（曲库直链） | 端侧只支持远端 URL（2026-11-10 决定）；曲库/授权只在服务端 | 仅 `music_cloud` 请求字段与资源准备 |
 | 云端服务端实现 | 端侧契约已定（第 6 节），服务端按契约实现 | 无端侧改动 |
 | 设备鉴权方式 | 当前用 Kconfig 写死的 `device_id` + `token` | 后续可换成动态下发，仅改 `config_store` 与握手 |

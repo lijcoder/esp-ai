@@ -155,7 +155,7 @@
 
 | 编号 | 任务 | 产出 |
 |---|---|---|
-| T4.1 | 源抽象：`source_http`（流式拉取、超时/重试）、`source_file`（FATFS） | 两种来源可播放 |
+| T4.1 | 源抽象：`source_http`（流式拉取、超时/重试；**只做远端 URL，不做 `source_file`**，2026-11-10 用户决定） | 远端 URL 可播放 |
 | T4.2 | `music_cloud`：`music_request` 请求、`music_track` 解析、`music_status` 每 5s 上报 | 音乐协议闭环 |
 | T4.3 | `music_session`：播放/暂停/继续/停止/切歌、状态机、与语音抢占 | 音乐控制完整 |
 | T4.4 | 音乐 ducking（-12dB）与"音乐播放中唤醒"流程 | 语音优先体验 |

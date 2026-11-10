@@ -47,6 +47,7 @@ struct mp3_stream {
     int16_t mono[MP3_MAX_SAMPLES_PER_CH]; /* 流式单声道输出（双声道取均值） */
     uint8_t pending[MP3_STREAM_PENDING_BYTES];
     size_t pending_len;
+    size_t id3_skip_remaining; /* 大于 pending 的 ID3v2 标签体：跨 feed 分块跳过 */
     uint32_t abs_fed; /* 累计 feed 字节，仅用于 resync 日志的绝对偏移 */
     bool stream_ready;
     bool resync_req;
@@ -197,6 +198,7 @@ void mp3_stream_reset(mp3_stream_t *st)
     mp3_state_t *p = (mp3_state_t *)st;   /* 同一类型（struct mp3_stream） */
     mp3dec_init(&p->dec);
     p->pending_len = 0;
+    p->id3_skip_remaining = 0;
     p->abs_fed = 0;
     p->resync_req = false;
     p->stream_ready = true;
@@ -372,6 +374,7 @@ esp_err_t mp3_stream_feed(mp3_stream_t *st, const uint8_t *data, size_t len)
         ESP_LOGW(TAG, "stream feed overflow（%u + %u > %u），丢弃该段并重新同步",
                  (unsigned)st->pending_len, (unsigned)len, (unsigned)MP3_STREAM_PENDING_BYTES);
         st->pending_len = 0;
+        st->id3_skip_remaining = 0;
         st->resync_req = true;
         st->abs_fed += (uint32_t)len;
         return ESP_ERR_NO_MEM;
@@ -400,6 +403,18 @@ esp_err_t mp3_stream_frame(mp3_stream_t *st, const int16_t **pcm, uint32_t *samp
             return ESP_ERR_NOT_FOUND;
         }
 
+        /* 超大 ID3v2 标签体（封面图常见，几十~几百 KB）：分块跳过。
+         * 旧实现要求标签完整落在 8KB pending 里，真实文件必然凑不齐 → 永远等不到，
+         * feed 溢出后 resync 丢掉开头的音频（T4.1 真机首跑：起播多 1 次欠载）。 */
+        if (st->id3_skip_remaining > 0) {
+            const size_t n = st->pending_len < st->id3_skip_remaining
+                                 ? st->pending_len
+                                 : st->id3_skip_remaining;
+            st->stats.skipped_bytes += (uint32_t)n;
+            st->id3_skip_remaining -= n;
+            pending_consume(st, n);
+            continue;
+        }
         /* ID3v2：标签头/标签体可能跨 chunk，不完整就等下一段数据 */
         if (st->pending_len >= 3 && memcmp(st->pending, "ID3", 3) == 0) {
             if (st->pending_len < 10) {
@@ -410,6 +425,13 @@ esp_err_t mp3_stream_frame(mp3_stream_t *st, const int16_t **pcm, uint32_t *samp
                          ((size_t)(h[8] & 0x7f) << 7) | (size_t)(h[9] & 0x7f);
             size_t total = 10 + tag + ((h[5] & 0x10) ? 10 : 0);
             if (total > st->pending_len) {
+                if (total > MP3_STREAM_PENDING_BYTES) {
+                    /* 吃掉 10 字节标签头，剩余字节按 pending 容量分块丢弃 */
+                    st->stats.skipped_bytes += 10;
+                    pending_consume(st, 10);
+                    st->id3_skip_remaining = total - 10;
+                    continue;
+                }
                 return ESP_ERR_NOT_FOUND;
             }
             st->stats.skipped_bytes += (uint32_t)total;
@@ -504,6 +526,7 @@ void mp3_stream_resync(mp3_stream_t *st)
     }
     st->stats.skipped_bytes += (uint32_t)st->pending_len;
     st->pending_len = 0;
+    st->id3_skip_remaining = 0;
     st->resync_req = true;
 }
 

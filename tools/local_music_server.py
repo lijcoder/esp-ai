@@ -224,7 +224,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/media/"):
             self._file(path[len("/media/"):], head_only)
             return
-        self._json({"error": "not found", "hint": "/search?q= /media/<path> /catalog"}, head_only,
+        if path.startswith("/stream/"):
+            self._stream(path[len("/stream/"):], head_only)
+            return
+        self._json({"error": "not found",
+                    "hint": "/search?q= /media/<path> /stream/<path> /catalog"}, head_only,
                    status=404)
 
     def _json(self, body: dict[str, Any], head_only: bool, status: int = 200) -> None:
@@ -280,6 +284,43 @@ class _Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
+
+    def _stream(self, rel: str, head_only: bool) -> None:
+        """无限循环直播流（T4.1 电台路径验证）：无 Content-Length、connection close 定界。
+
+        目的：把"直播流（时长未知）"的代码路径从公网 CDN 抖动里剥离出来，让真机
+        60s 连续播放可复现（PV-012 第 ⑥ 项）。客户端断开后写失败即结束。
+        """
+        rel = rel.lstrip("/")
+        target = (self.library.root / rel).resolve()
+        try:
+            target.relative_to(self.library.root)
+        except ValueError:
+            self._json({"error": "forbidden"}, head_only, status=403)
+            return
+        if not target.is_file() or target.suffix.lower() not in AUDIO_SUFFIXES:
+            self._json({"error": "not found"}, head_only, status=404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/mpeg")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        if head_only:
+            return
+        try:
+            with target.open("rb") as handle:
+                while True:
+                    chunk = handle.read(4096)
+                    if not chunk:
+                        handle.seek(0)
+                        continue
+                    self.wfile.write(chunk)
+                    # 按"直播节奏"限速（~100KB/s，高于常见网络电台码率即可）：
+                    # 不限速会以磁盘读速猛灌，客户端一旦读满就只留下巨大的临时残留。
+                    time.sleep(0.04)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         if os.environ.get("LOCAL_MUSIC_VERBOSE"):

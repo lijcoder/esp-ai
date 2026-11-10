@@ -1248,7 +1248,11 @@ static stream_result_t stream_preroll(stream_ctx_t *c)
                                  (int64_t)CONFIG_AUDIO_PLAYER_STREAM_PREROLL_MS * 1000) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        {
+            /* 同上：2ms < 1 tick（HZ=100），至少让出 1 tick，避免起播等待期忙等 */
+            const TickType_t tick = pdMS_TO_TICKS(2);
+            vTaskDelay(tick > 0 ? tick : 1);
+        }
     }
 
     /* 起播：把 stage 里已解出的样本作为首块输入，跨帧重采样状态归零 */
@@ -2216,7 +2220,9 @@ esp_err_t audio_player_music_start(uint32_t sample_rate_hint)
     s_music_rd = 0;
     s_music_eof = false;
     s_music_sound_seen = false;
-    s_music_in_underrun = false;
+    /* 起播预填（source_http 在 start 之后才写 150ms 数据）期间 ring 为空是正常过程，
+     * 不计入 underruns；首次成功读出后由消费侧清零，之后才统计真实欠载。 */
+    s_music_in_underrun = true;
     s_music_drop_req = false;
     s_music_paused = false;
     s_music_pause_req = false;
@@ -2299,7 +2305,10 @@ size_t audio_player_music_write(const int16_t *pcm48, size_t frames, uint32_t ti
             portEXIT_CRITICAL(&s_music_mux);
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        /* HZ=100 时 pdMS_TO_TICKS(5) == 0 tick，vTaskDelay(0) 不会真正让出 CPU：
+         * ring 满期间生产者会忙等，饿死 IDLE0 → task WDT（T4.1 真机首跑实测）。 */
+        const TickType_t tick = pdMS_TO_TICKS(5);
+        vTaskDelay(tick > 0 ? tick : 1);
     }
     return done;
 }

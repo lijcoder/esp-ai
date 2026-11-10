@@ -97,18 +97,31 @@ class Dev:
 
 
 def parse_heap(text: str) -> tuple[int | None, int | None]:
-    """解析 `sys heap` 的 `内存水位 : 内部 RAM 剩余 X B / 最低水位 Y B`。"""
-    match = re.search(r"内部 RAM 剩余 (\d+) B / 最低水位 (\d+) B", text)
+    """解析 `sys heap` 的 `内部 RAM: ..., 剩余 X B, ..., 最低水位 Y B, ...`。
+
+    兼容两种输出：`sys info` 的 `内存水位 : 内部 RAM 剩余 X B / 最低水位 Y B`
+    与 `sys heap` 的分行明细（T4.1 真机首跑发现只匹配前者）。
+    """
+    match = re.search(r"内部 RAM.*?剩余 (\d+) B.*?最低水位 (\d+) B", text)
     if not match:
         return None, None
     return int(match.group(1)), int(match.group(2))
 
 
 def parse_musicstat(text: str) -> dict[str, str]:
-    for line in reversed(text.splitlines()):
-        if line.startswith("MUSICSTAT"):
-            return dict(re.findall(r"(\w+)=(-?\w+)", line))
-    return {}
+    """合并 `MUSICSTAT`（播放器统计）与 `MUSICHTTP`（HTTP 统计）两行。"""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.startswith("MUSICSTAT") or line.startswith("MUSICHTTP"):
+            out.update(dict(re.findall(r"(\w+)=(-?[\w.]+)", line)))
+    return out
+
+
+def stat_num(stat: dict[str, str], key: str) -> int:
+    """取数值字段：固件带单位（如 `first_sound=10ms`），这里剥掉非数字后缀。"""
+    raw = stat.get(key, "") or ""
+    digits = re.match(r"-?\d+", raw)
+    return int(digits.group(0)) if digits else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -132,6 +145,22 @@ def main(argv: list[str] | None = None) -> int:
     dev = Dev(port)
     try:
         dev.send("", 0.5)
+        # 刚复位时 WiFi 可能还没拿到 IP（T4.1 真机首跑：抢在联网前 play → sock<0）
+        net_ok = False
+        for _ in range(30):
+            if "WiFi 状态: UP" in dev.send("wifi status", 0.25):
+                net_ok = True
+                break
+            time.sleep(0.5)
+        check(net_ok, "设备已联网（WiFi UP）")
+        # 上一次运行可能留下正在播的音乐：先停干净，保证统计从 0 起算
+        for cmd in ("ms stop", "music stop"):
+            dev.send(cmd, 0.5)
+        for _ in range(10):
+            st = parse_musicstat(dev.send("music stat", 0.3))
+            if st.get("active") == "0" and st.get("url_active") == "0":
+                break
+            time.sleep(0.2)
         heap = dev.send("sys heap", 0.6)
         free0, min0 = parse_heap(heap)
         check(free0 is not None, "读取启动后内部堆", heap[-200:])
@@ -147,19 +176,19 @@ def main(argv: list[str] | None = None) -> int:
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
             stat = parse_musicstat(dev.send("music stat", 0.35))
-            if stat and stat.get("url_active") == "1" and int(stat.get("first_sound", "0") or 0) > 0:
+            if stat and stat.get("url_active") == "1" and stat_num(stat, "first_sound") > 0:
                 break
         check(bool(stat), "能读到 MUSICSTAT", stat)
         check(stat.get("url_active") == "1", "拉流任务在跑", stat)
-        first_sound = int(stat.get("first_sound", "0") or 0)
+        first_sound = stat_num(stat, "first_sound")
         check(0 < first_sound < 1500, "首声 <1500ms", f"{first_sound}ms")
-        check(stat.get("http_status") in ("200", "206"), "HTTP 200/206", stat.get("http_status", "?"))
+        check(stat.get("status") in ("200", "206"), "HTTP 200/206", stat.get("status", "?"))
 
         time.sleep(args.seconds)
         stat = parse_musicstat(dev.send("music stat", 0.5))
-        played = int(stat.get("played", "0") or 0)
+        played = stat_num(stat, "played")
         check(played > 0, "混音已消费音乐帧", stat)
-        underruns = int(stat.get("underruns", "0") or 0)
+        underruns = stat_num(stat, "underruns")
         check(underruns <= args.max_underruns,
               f"稳态欠载 ≤{args.max_underruns}", f"{underruns} 次")
 
@@ -188,8 +217,11 @@ def main(argv: list[str] | None = None) -> int:
             check(free1 >= free0 - 4096, "停止后内部堆回落（≤4KB 残留）", f"{free0} → {free1}")
 
         log = dev.buf
+        # WS/TLS 重连噪声不是播放路径错误（mock 未起时必然出现），只过滤这些
+        benign = re.compile(r"transport_base|transport_ws|esp-tls|websocket_client|WS: WS 错误|WS: 连接断开")
         bad = [line for line in log.splitlines()
-               if re.search(r"^E \(|panic|Guru Meditation|abort\(\)", line)]
+               if re.search(r"^E \(|panic|Guru Meditation|abort\(\)", line)
+               and not benign.search(line)]
         check(not bad, "无 ERROR/panic", "\n".join(bad[:3]))
     finally:
         dev.close()

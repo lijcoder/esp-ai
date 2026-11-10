@@ -97,6 +97,7 @@ static bool s_resume_watch;     /* resume 后等待数据；用于长暂停断�
 static uint32_t s_resume_watch_frames;
 static bool s_fallback_sent;    /* 本暂停周期是否已发过兜底 music_request */
 static bool s_track_pending;    /* 语音活跃时收到 music_track：排队到语音回 IDLE 再起播 */
+static bool s_defer_resume;     /* 语音活跃时收到 resume：排队到语音回 IDLE 再续播（否则抢播放器让 TTS 失败） */
 static uint8_t s_defer_pause_reason; /* 起播/切歌进行中收到的暂停请求，起播成功后补执行 */
 static uint16_t s_req_id;       /* music_request 端侧自增序号（0 保留） */
 static ms_stats_t s_stats;
@@ -657,6 +658,7 @@ static void ms_on_track(const mc_evt_t *evt)
     portENTER_CRITICAL(&s_mux);
     s_mid = evt->mid;
     s_have_mid = true;
+    s_defer_resume = false;
     s_duration_ms = evt->duration_ms;
     memcpy(s_url, evt->url, sizeof(s_url));
     memcpy(s_title, evt->title, sizeof(s_title));
@@ -743,6 +745,7 @@ static esp_err_t ms_pause_internal(uint8_t reason, uint32_t fade_ms)
     bool resume_pending;
 
     portENTER_CRITICAL(&s_mux);
+    s_defer_resume = false;
     cur = s_state;
     play_pending = (s_cmd_valid && s_cmd.kind == MS_CMD_PLAY);
     resume_pending = (s_cmd_valid && s_cmd.kind == MS_CMD_RESUME);
@@ -802,6 +805,15 @@ static esp_err_t ms_resume_internal(void)
     if (pause_pending) {
         (void)ms_cancel_cmd(MS_CMD_PAUSE); /* 暂停已执行，排队的重复暂停无意义 */
     }
+    /* 语音活跃（提示音/THINKING/SPEAKING/FOLLOW_UP）：此刻续播会占用单作业播放器，
+     * 紧接着的 TTS 会 start 失败（真机实测 VS: tts-fail）。先排队，语音回 IDLE 再续播。 */
+    if (s_voice_active) {
+        portENTER_CRITICAL(&s_mux);
+        s_defer_resume = true;
+        portEXIT_CRITICAL(&s_mux);
+        ESP_LOGI(TAG, "语音活跃中收到 resume → 排队到语音回 IDLE 后续播");
+        return ESP_OK;
+    }
     ms_schedule(MS_CMD_RESUME, MS_REASON_USER_RESUME, 0, 0, 0, MS_CMD_DELAY_US);
     return ESP_OK;
 }
@@ -822,6 +834,7 @@ static esp_err_t ms_stop_internal(void)
     portENTER_CRITICAL(&s_mux);
     s_track_pending = false;
     s_defer_pause_reason = MS_PAUSE_REASON_NONE;
+    s_defer_resume = false;
     portEXIT_CRITICAL(&s_mux);
     ms_schedule(MS_CMD_STOP, MS_REASON_STOP, 0, 0, 0, MS_CMD_DELAY_US);
     return ESP_OK;
@@ -845,6 +858,14 @@ static void ms_on_voice_state(void *arg, app_evt_t evt, const app_evt_data_t *da
     portEXIT_CRITICAL(&s_mux);
 
     if (voice_active) {
+        /* 新的一轮开始（LISTENING/FOLLOW_UP）才撤回排队中的续播；THINKING/SPEAKING
+         * 期间必须保留——"继续"指令正是在 THINKING 到达的（真机首跑：每次状态迁移都清，
+         * 排队续播永远丢失）。 */
+        if (to == 1 /* LISTENING */ || to == 4 /* FOLLOW_UP */) {
+            portENTER_CRITICAL(&s_mux);
+            s_defer_resume = false;
+            portEXIT_CRITICAL(&s_mux);
+        }
         if (ms_policy_auto_pause(cur, reason, to, CONFIG_MS_AUTO_PAUSE_ON_VOICE)) {
             ESP_LOGI(TAG, "语音进入活跃态（to=%u）→ auto-pause（抢占让路）", (unsigned)to);
             (void)ms_pause_internal(MS_PAUSE_REASON_VOICE, CONFIG_MS_PAUSE_FADE_MS);
@@ -869,12 +890,25 @@ static void ms_on_voice_state(void *arg, app_evt_t evt, const app_evt_data_t *da
 
     /* 语音期间排队的曲目优先于"恢复旧曲目"：点歌/下一首在 TTS 结束后才起播 */
     bool pending_track;
+    bool defer_resume;
     portENTER_CRITICAL(&s_mux);
     pending_track = s_track_pending;
+    defer_resume = s_defer_resume;
     if (pending_track) {
         s_track_pending = false;
+        defer_resume = false; /* 新曲目会直接起播，不需要再恢复旧曲目 */
     }
+    s_defer_resume = false;
     portEXIT_CRITICAL(&s_mux);
+    if (!pending_track && defer_resume) {
+        portENTER_CRITICAL(&s_mux);
+        const mc_state_t st = s_state;
+        portEXIT_CRITICAL(&s_mux);
+        if (st == MC_STATE_PAUSED) {
+            ESP_LOGI(TAG, "语音回 IDLE → 执行排队中的续播");
+            ms_schedule(MS_CMD_RESUME, MS_REASON_USER_RESUME, 0, 0, 0, MS_CMD_DELAY_US);
+        }
+    }
     if (pending_track) {
         portENTER_CRITICAL(&s_mux);
         const mc_state_t st = s_state;

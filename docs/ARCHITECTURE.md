@@ -183,6 +183,9 @@ TTS(MP3 流/整段) ─┐
   - **边收边解**：只把「凑满整帧」的数据交给 minimp3（其在数据不足分支会重置解码器、丢比特池）；跨帧连续线性重采样（游标 + 上一块末样本 carry），帧边界不重复淡入淡出、无缝隙；欠载时补静音继续走 I2S 时钟，每次连续欠载计 1 次 `underruns` 并限频 WARN。
   - **收尾**：`tts_end` 后先解完 ring 内数据，切 100ms 收尾环线性淡出 → 既有静音冲刷/关 TX → 300ms 尾部延时 → 完成回调（`src=TTS_STREAM`）；abort（cancel/error/断链/新轮次/响应超时）立即关 TX、丢弃 ring、回调 `ok=false`。
   - **云端要求（T2.4 实测新增）**：服务端必须关闭 Nagle（`TCP_NODELAY`）。Nagle + 端侧 delayed ACK 会把均匀 TTS 帧攒批 ~200ms 再交付，任何预缓冲都会被打穿（mock 已默认开启，真实云端同样必须）。
+  - **T4.1 远端音源（`source_http.c`）**：`music play <url>` → 独立任务 `music_http`（核 0/优先级 4/栈 `CONFIG_AUDIO_PLAYER_MUSIC_TASK_STACK`=6KB，**按需创建、停止后销毁**）→ `esp_http_client` HTTP(S) 拉流 → **独立 minimp3 实例**（PSRAM ~38KB，与 TTS 默认实例互不共享）→ 48k 单声道重采样 → PSRAM PCM ring（`AUDIO_PLAYER_MUSIC_RING_MS`，默认 1000ms）→ `CH_MUSIC`。起播前预填 150ms（避免空 ring 欠载）；停止 = 丢弃 ring + 100ms 淡出，拉流任务在 HTTP 读超时（2s）内自行退出。URL 只接受 `http(s)`、长度 ≤ `AUDIO_PLAYER_MUSIC_URL_MAX`（320），流中采样率变化即中止；**不做 seek/Range**（T4.5）。
+  - **T4.1 内存口径**：音乐 PCM ring 96KB 在 PSRAM（启动时分配）；解码实例/预填/单帧输出 ~56KB 只在播放期占 PSRAM；`music_http` 任务栈 6KB + HTTP client 缓冲（4KB）+ 读缓冲（4KB）只在播放期占内部 RAM。**真机实测待补（PENDING PV-012）**：wss 握手期若与播放重叠，水位需 ≥30KB；T4.1 先按"播放中不重连"验证，T5.3 复测。
+  - **T4.2 边界**：`music_cloud` 对 `music_track`/`music_control` 的解析、`music_status` 上报与 `mid` 过滤尚未实现；T4.1 只有 console 探针 `music play <url>`。
   - **整段路径**保留给本地/探针（`audio_player_play_mp3`），**T3.3 起走 `CH_MUSIC`**（音乐通道，`player duck` 可验证 R3 duck；`mp3_test.py` 48/48 仍过）；PCM 预分配上限从 1.5MB 下调到 **512KB**。流式 TTS 走 `CH_TTS`，提示音走 `CH_PROMPT`。
 
 ---
@@ -216,7 +219,7 @@ TTS(MP3 流/整段) ─┐
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发；入站回调支持主回调 + 附加订阅（T2.5，业务与 console 观测并存） | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_subscribe()`, `ws_unsubscribe()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
 | `audio_fe` | L2 音频引擎 | AFE 封装：**半双工门控仲裁（T3.2：原因位图 `PROMPT/TTS/PROBE` + 恢复丢弃窗口 R5）**、唤醒/VAD 事件（T1.2b 起投 `APP_EVT_WAKE_DETECTED`/`APP_EVT_VAD_*` 到 event_bus，回调仅调试兼容）、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_feed_hold()`, `audio_fe_feed_release()`, `audio_fe_feed_discard_ms()`, `audio_fe_feed_stats_read()`, `audio_fe_feed_enabled()`, `audio_fe_set_feed_enabled()`（旧接口/探针兼容）, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
-| `audio_player` | L2 音频引擎 | 播放引擎：**三通道混音（T3.3：`CH_TTS`/`CH_PROMPT`/`CH_MUSIC`，PSRAM ring → 饱和相加 → 音量 20ms 插值 → -1dBFS 软限幅 → I2S）** + 重采样到 48k + 淡入淡出；提示音/整段 MP3/TTS 流式分别接入通道；**T3.2：输出级打断淡出（R4）与输出峰值/停声耗时观测；T3.3：duck 改为 `CH_MUSIC` 通道增益**；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；音乐源/HTTP 随 P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_fade_out_and_stop()`, `audio_player_set_duck()`, `audio_player_get_duck()`, `audio_player_current_src()`, `audio_player_set_volume()`, `audio_player_stats_read()`, `audio_player_mix_stats_read()/reset()`, `audio_player_mix_tone()/stop()/capture()/capture_status()/capture_read()` |
+| `audio_player` | L2 音频引擎 | 播放引擎：**三通道混音（T3.3：`CH_TTS`/`CH_PROMPT`/`CH_MUSIC`，PSRAM ring → 饱和相加 → 音量 20ms 插值 → -1dBFS 软限幅 → I2S）** + 重采样到 48k + 淡入淡出；提示音/整段 MP3/TTS 流式分别接入通道；**T3.2：输出级打断淡出（R4）与输出峰值/停声耗时观测；T3.3：duck 改为 `CH_MUSIC` 通道增益**；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；音乐源/HTTP 随 P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_fade_out_and_stop()`, `audio_player_set_duck()`, `audio_player_get_duck()`, `audio_player_current_src()`, `audio_player_set_volume()`, `audio_player_stats_read()`, `audio_player_mix_stats_read()/reset()`, `audio_player_mix_tone()/stop()/capture()/capture_status()/capture_read()`, **T4.1：`audio_player_music_play_url(url)` / `audio_player_music_stop_url()` / `audio_player_music_start(rate)` / `audio_player_music_write(pcm48, frames, timeout)` / `audio_player_music_end()` / `audio_player_music_stop()` / `audio_player_music_active()` / `audio_player_music_stats_read()`** |
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms，定点实现 + VBR，状态/伪栈在 PSRAM，不建任务） | `enc_open()`, `enc_encode(pcm, samples, out, cap, &out_len)`, `enc_flush()`, `enc_reset()`, `enc_close()`, `enc_stats_read()` |
 | `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发、**下行 0x02 接入 `audio_player` 流式播放 + R1/R2（T2.4；T3.2 起经 `audio_fe` 原因位仲裁）**；**不含会话状态机**（归 T3.1 `voice_session`）；T3.1 起回调增加 `VC_EVT_UPLINK_END`/`VC_EVT_ROUND_END` 供状态机驱动，`sid` 由会话机传入；T3.2 起 `vc_interrupt()` 负责 R4 的 `interrupt` 报文；**T3.6：`vc_is_ready()` 供唤醒前预判、`VC_EVT_TTS_FAIL`（code=`vc_tts_fail_t`）上报"设备侧 TTS 无法播放"** | `vc_init()`, `vc_start(sid)`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_interrupt()`（T3.2：先发 `interrupt` 报文再 cancel）, `vc_is_busy()`, `vc_is_ready()`（T3.6）, `vc_preroll_start()`, `vc_preroll_stop()`（T3.7 续听预录）, `vc_get_state()`, `vc_register_cb()`, `vc_stats_read()` |
 | `music_cloud` | L3 能力 | 曲目请求与播放状态上报协议 | `mc_request(next/prev/id)`, `mc_report(state, progress)` |
@@ -496,12 +499,16 @@ SPEAKING ──TTS 排空 + R2 恢复收音──> FOLLOW_UP ──VAD 人声≥
 ### 8.3 音乐播放
 
 ```
-music_session ──mc_request──> 服务端 ──music_track{url}──> player_play_uri(CH_MUSIC, url)
+music_session ──mc_request──> 服务端 ──music_track{url}──> audio_player_music_play_url(url)
         │                                                        │
-   music_status 每 5s 上报                              HTTP 流式拉取 → MP3 解码 → 48k
-        │                                                        │
+   music_status 每 5s 上报                      music_http 任务：HTTP(S) → 独立 minimp3
+        │                                         → 48k 单声道 PCM ring → CH_MUSIC
         └──────────── 暂停/继续/停止/切歌 ◄──────────────────────┘
 ```
+
+> **实现状态**：T4.1 已交付 `music play <url>` 探针与 `source_http`（HTTP(S) → `CH_MUSIC`），
+> `music stop` / `music stat` 可观测；`music_track`/`music_control` 的解析、`media_session`
+> 状态机、暂停/继续/切歌与 `music_status` 上报归 T4.2/T4.3（`music_cloud`/`music_session`）。
 
 ### 8.4 音乐播放中唤醒
 
@@ -600,6 +607,8 @@ THINKING 超时（10s）───┘
 
 > **T3.5 实测（2026-11-02，见 STATUS §5）**：提示音迁 `assets` 分区（自定义只读 pack + `esp_partition_mmap` 零拷贝）后，app bin **1,941,840 B（−176,656 B vs T3.6 的 2,118,496 B）**、Flash Data 516,940→337,596 B（−179,344 B，PCM 不再编进 app）；静态 DIRAM **199,766 B（+480 B：`prompt_store` 状态/表 + `diag prompt info`）**、无新增任务；提示音 PCM 常驻 `assets` 分区、**不占 RAM**（mmap 只占 MMU 页）；pack 缺失/损坏时降级不崩溃。**wss 水位未复测**，T5.3 归口。
 
+> **T4.1 构建口径（2026-11-10，未真机）**：新增 `source_http.c` + 音乐 API/Kconfig/diag 后，`idf.py build` 通过（自有代码零告警）；bin **1,974,896 B**（+33,056 B vs T3.5 收口 1,941,840 B，主要 `esp_http_client`/TLS 路径 + 音乐代码）、`idf.py size` 总镜像 **1,974,776 B**、**静态 DIRAM 200,262 B（+480 B）**。PSRAM 常驻 +96KB（音乐 PCM ring），播放期再 +~56KB（解码实例/预填/单帧输出）；内部 RAM 播放期 +6KB 任务栈 + ~8KB HTTP 缓冲（**待真机实测**，PENDING PV-012）。
+
 ### 9.3 任务与核心（确定）
 
 | 任务 | 核 | 优先级 | 栈 | 职责 |
@@ -610,7 +619,7 @@ THINKING 超时（10s）───┘
 | `evt` | 0 | 5 | 4KB | 事件分发（`event_bus` 自建 esp_event 循环，T1.2a 起） |
 | `ws` | 0 | 5 | 6KB | WS 状态机/退避/心跳/发送队列（TLS 收发在库任务 `ws_client`） |
 | `vc` | 0 | 4 | 8KB | 上行 Opus 编码 + 发送、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、**下行 0x02 → `audio_player` 流式播放 + R1/R2（T2.4）**（编码在本任务内串行，伪栈在 PSRAM，见 §3.6） |
-| `music_http` | 0 | 4 | 6KB | HTTP 拉流 |
+| `music_http` | 0 | 4 | 6KB | **T4.1 起按需创建/销毁**（只在播放期间存在）：HTTP(S) 拉流 → 独立 minimp3 实例 → 重采样 48k → `CH_MUSIC` PCM ring；解码/HTTP 不在 `player` 任务里，停止后任务栈释放 |
 | `diag` | 0 | 1 | 8KB | console + 周期监控（T2.2：`enc test` 在 REPL 任务里调 libopus，实测 4KB 会栈溢出 → 8KB） |
 
 原则：核 1 只跑音频路径，不受网络抖动影响；跨核只通过队列/ringbuffer。
@@ -665,7 +674,7 @@ THINKING 超时（10s）───┘
 | `audio play <file\|url>` | 手测播放 |
 | `audio stop` | 停止播放 |
 | `voice state` / `voice start` / `voice interrupt` / `voice wake on\|off` | 会话调试 |
-| `music play <url>` / `music pause` / `music resume` / `music stop` | 音乐调试 |
+| **`music play <http(s)://...>` / `music stop` / `music stat`** | **T4.1 音乐探针**：`music play` 启动 `music_http` 拉流（URL 只接受 http(s)、长度 ≤ Kconfig），`music stat` 打印 `MUSICSTAT`（active/url_active/rate/ring/written/played/underruns/first_sound）与 `MUSICHTTP`（status/content_length/bytes/first_byte/connect/decoded/errors），`music stop` 丢弃 ring + 100ms 淡出；暂停/继续/切歌归 T4.3 |
 
 日志 TAG 固定：`BOARD`、`AUDIO_IO`、`AFE`、`PLAYER`、`ENC`、`NET`、`WS`、`VC`、`VS`、`MC`、`MS`、`DEV`、`FB`（T3.6 异常反馈）、`DIAG`、`CFG`、`EVT`、`APP`（`APP` 属 `main/` 启动编排，`EVT` 属 `event_bus` 基础服务，均不占业务层级）。
 

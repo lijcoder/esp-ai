@@ -129,6 +129,16 @@
 | 关闭条件 | 真机 ≥1 轮点歌出声（设备拉流成功、时长与 `duration_ms` 同量级）+ 四条控制指令各 1 次端侧动作正确；T4.1/T4.2 落地后由对应任务回写 STATUS §5 |
 | 关联 | `tools/mock_music.py`、`tools/mock_music_test.py`、`docs/ARCHITECTURE.md` §6.3、`docs/PROTOCOL.md` §3.2/§7（P-3）、STATUS §3 2026-11-10 行 |
 
+### PV-012 · T4.1 远端 MP3 音源真机验证（板子未连接）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-10 18:1x（采样）**，T4.1 固件构建通过后登记 |
+| 来源 | T4.1（`source_http` + `music` 探针）实现完成；本机 `ls /dev/tty.usbmodem*` **无设备**（只有 Bluetooth/debug console），无法烧录/串口验证 |
+| 现象/问题 | 构建通过不代表能播：需验证 ① `music play` 后 `music_http` 任务能建、HTTP/TLS 能连、`first_sound <1500ms`；② 44.1k stereo 320kbps 素材重采样后稳态 `underruns=0`；③ `music stop` 后 ≤3s `active=0`/任务消失/内部堆回落；④ 错误路径（非法 URL、404、断流）不崩、不泄漏；⑤ 播放期内部堆/水位（预计 -14KB 左右）与 PSRAM 增量；⑥ 长播/电台流（Content-Length=-1）行为 |
+| 验收方法 | 板子接上后：`uv run tools/music_play_test.py --url 'http://<Mac局域网IP>:9009/media/<曲目>.mp3'`（内部覆盖 play/stat/stop/heap/tasks/ERROR 断言）；再跑 `--url 'http://lhttp.qingting.fm/live/20210755/64k.mp3'` 验直播流；最后用 `curl` 造 404 与 kill HTTP 服务验错误路径。`sys heap`/`sys tasks` 采播放期/停止后数值 |
+| 关闭条件 | 脚本全 PASS：首声 <1500ms、稳态 underruns=0、stop ≤3s 且任务消失、内部堆停止后回落（≤4KB 残留）、无 ERROR/panic；电台流连续 60s 无欠载；结果回写 STATUS §5 并关闭本项 |
+| 关联 | `components/audio_player/source_http.c`、`include/audio_player.h`（music API）、`components/diag/diag.c`（`music`）、`tools/music_play_test.py`、STATUS §3 2026-11-10 T4.1 行、ARCH §3.7/§9.3 |
+
 ## 3. 待决定 / 已被暂缓（PD）
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）
@@ -212,6 +222,7 @@
 ## 5. 时间线（便于回溯"什么时候的问题"）
 
 - **2026-11-10 16:2x（采样）**：新增 PV-011（M1 音乐链路真机验证）；同日 P-3 按「音乐事件用独立 `mid`」定稿建议落地到 mock 与 PROTOCOL。
+- **2026-11-10 18:1x（采样）**：新增 PV-012（T4.1 真机验证）；T4.1 固件构建通过，但本机无 USB 串口，未烧录。
 
 | 时间（Asia/Shanghai） | 事件 |
 |---|---|

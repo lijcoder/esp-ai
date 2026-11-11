@@ -979,6 +979,10 @@ static bool mix_loop_run(int16_t *out, play_job_kind_t kind, bool *aborted, bool
         }
 
         const bool fade_done = mix_render(out, OUT_FRAMES_CHUNK);
+        /* T4.4 C3：把“真正送往 DAC 的混音输出”作为 AEC 参考（post 音量/duck/限幅） */
+        if (audio_io_ref_enabled()) {
+            audio_io_ref_push_stereo48(out, OUT_FRAMES_CHUNK);
+        }
         const int64_t used = esp_timer_get_time() - t0;
         portENTER_CRITICAL(&s_stats_mux);
         if ((uint32_t)used > s_mix_snap.block_max_us) {

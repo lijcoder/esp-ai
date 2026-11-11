@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "audio_fe.h"
+#include "audio_io.h"
 #include "audio_player.h"
 #include "codec_enc.h"
 #include "config_store.h"
@@ -2774,6 +2775,123 @@ static int cmd_aec(int argc, char **argv)
     return ESP_OK;
 }
 #endif /* CONFIG_DIAG_ENABLE_AEC_TEST */
+#if CONFIG_AUDIO_FE_AEC_ENABLE
+/* T4.4 C3：运行期 AEC 观测/调参（参考延迟/开关/ERLE） */
+static int cmd_aecr(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: aecr stat | on | off | delay <ms> | corr\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(argv[1], "on") == 0) {
+        audio_fe_aec_set_enabled(true);
+        return ESP_OK;
+    }
+    if (strcmp(argv[1], "off") == 0) {
+        audio_fe_aec_set_enabled(false);
+        return ESP_OK;
+    }
+    if (strcmp(argv[1], "delay") == 0) {
+        if (argc < 3) {
+            printf("用法: aecr delay <ms>\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        audio_fe_aec_set_delay_ms((uint32_t)atoi(argv[2]));
+        return ESP_OK;
+    }
+    if (strcmp(argv[1], "corr") == 0) {
+        const int n = AUDIO_FE_AEC_CORR_SAMPLES;
+        int16_t *mic = heap_caps_malloc((size_t)n * sizeof(int16_t),
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        int16_t *ref = heap_caps_malloc((size_t)n * sizeof(int16_t),
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (mic == NULL || ref == NULL || !audio_fe_aec_corr_start()) {
+            printf("AECCORR 不可用（AEC 未启用/缓冲不足）\n");
+            heap_caps_free(mic);
+            heap_caps_free(ref);
+            return ESP_FAIL;
+        }
+        const int64_t deadline = esp_timer_get_time() + 3000000;
+        while (!audio_fe_aec_corr_ready() && esp_timer_get_time() < deadline) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (!audio_fe_aec_corr_get(mic, ref)) {
+            printf("AECCORR 超时（没有在播/AEC 未运行）\n");
+            heap_caps_free(mic);
+            heap_caps_free(ref);
+            return ESP_FAIL;
+        }
+        int best_lag = 0;
+        double best_corr = -2.0;
+        for (int lag = -512; lag <= 512; lag += 1) {
+            const int i0 = (lag < 0) ? -lag : 0;
+            const int i1 = (lag > 0) ? (n - lag) : n;
+            if (i1 <= i0) {
+                continue;
+            }
+            double sxy = 0.0, sxx = 0.0, syy = 0.0;
+            for (int i = i0; i < i1; i++) {
+                const double x = mic[i];
+                const double y = ref[i + lag];
+                sxy += x * y;
+                sxx += x * x;
+                syy += y * y;
+            }
+            if (sxx <= 0.0 || syy <= 0.0) {
+                continue;
+            }
+            const double c = sxy / sqrt(sxx * syy);
+            if (c > best_corr) {
+                best_corr = c;
+                best_lag = lag;
+            }
+        }
+        double zero_corr = 0.0;
+        {
+            double sxy = 0.0, sxx = 0.0, syy = 0.0;
+            for (int i = 0; i < n; i++) {
+                const double x = mic[i];
+                const double y = ref[i];
+                sxy += x * y;
+                sxx += x * x;
+                syy += y * y;
+            }
+            if (sxx > 0.0 && syy > 0.0) {
+                zero_corr = sxy / sqrt(sxx * syy);
+            }
+        }
+        printf("AECCORR best_lag=%d samples corr=%.2f zero_corr=%.2f（best_lag>0 表示参考超前）\n",
+               best_lag, best_corr, zero_corr);
+        heap_caps_free(mic);
+        heap_caps_free(ref);
+        return ESP_OK;
+    }
+    if (strcmp(argv[1], "stat") == 0) {
+        audio_fe_aec_stats_t st;
+        audio_io_ref_stats_t rs;
+        if (audio_fe_aec_stats_read(&st) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        audio_io_ref_stats_read(&rs);
+        printf("AEC stat created=%d enabled=%d delay=%ums chunksize=%u frames=%u in_rms=%u "
+               "out_rms=%u",
+               st.created ? 1 : 0, st.enabled ? 1 : 0, (unsigned)st.delay_ms,
+               (unsigned)st.chunksize, (unsigned)st.frames, (unsigned)st.in_rms,
+               (unsigned)st.out_rms);
+        if (st.out_rms > 0 && st.in_rms > 0) {
+            printf(" erle=%.1fdB", 20.0 * log10((double)st.in_rms / (double)st.out_rms));
+        }
+        printf(" ref_rms=%u under=%u\n", (unsigned)st.ref_rms, (unsigned)st.underruns);
+        printf("AECREF written=%u read=%u under=%u over=%u\n", (unsigned)rs.written,
+               (unsigned)rs.read, (unsigned)rs.underruns, (unsigned)rs.overwritten);
+        return ESP_OK;
+    }
+    printf("用法: aecr stat | on | off | delay <ms> | corr\n");
+    return ESP_ERR_INVALID_ARG;
+}
+#endif
+
+
 
 
 
@@ -2900,6 +3018,14 @@ static esp_err_t register_commands(void)
             .hint = "info",
             .func = cmd_prompt,
         },
+#if CONFIG_AUDIO_FE_AEC_ENABLE
+        {
+            .command = "aecr",
+            .help = "AEC 运行期观测（T4.4 C3）：aecr stat | on | off | delay <ms>",
+            .hint = "stat|on|off|delay",
+            .func = cmd_aecr,
+        },
+#endif
 #if CONFIG_DIAG_ENABLE_AEC_TEST
         {
             .command = "aec",

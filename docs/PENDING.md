@@ -201,7 +201,8 @@
 | 现象/问题 | 语音打断（TTS/音乐中喊唤醒词）必须 AEC + 开麦（R1 修订）；当前音乐期内部水位 24,563 B、预算余 7.6KB，AEC 直接加会破 440KB/30KB 两条线；需先搬 PSRAM（rbuf/WS RX/HTTP buffer/4 个非实时栈 ≈31KB）或放宽预算 |
 | 已获得的部分证据（2026-11-11 spike） | `diag aec test`（合成回声，590 帧计入耗时）：**SR_LOW_COST + PSRAM caps：内部 +12,576 B / PSRAM +69,716 B / avg 2.64ms、max 4.82ms（无 >5ms 帧）/ ERLE 59.7dB**；**FD_LOW_COST：内部 +12,660 B / PSRAM +108,692 B / avg 6.90ms、max 10.80ms（590/590 帧 >5ms）/ ERLE 65.2dB**；**caps=INTERNAL 实测 OOM→重启，不可用**。销毁后内部/PSRAM 均回落（无泄漏）。结论：AEC 必须 PSRAM caps，但内部仍要 ~12.6KB → **必须先做 C2 PSRAM 搬迁**（`music_http`/`ws` 栈 + `rbuf` + WS RX + HTTP buffer ≈21KB）才能进预算；SR 的 CPU 可接受，FD 需在真实音乐/TTS 负载下复测 |
 | C2 后状态（2026-11-11） | 已搬 ~24KB 内部到 PSRAM（含 2 个任务栈）；音乐期内部水位 **37,203 B**、free 43,947 B。AEC 候选实测：**SR_LOW_COST filter=2：内部 +6,440 B / 0.81ms**（AEC 后水位 ~30.8KB，余量仅 43B）；**SR_HIGH_PERF filter=2：内部 +4,388 B / 1.78ms**（水位 ~32.8KB，较稳）；SR filter=4 内部 +12,576 B（水位 ~24.6KB，破线）；FD avg 6.9ms（需负载复测）。近端 2kHz 经 AEC 后 RMS≈1409（注入≈2000，未吞近端）；合成 ERLE inf/59.7dB 仅证链路。 |
-| 待决定 | ① AEC 模式（SR filter=2 / SRH filter=2 / FD）与真实声学 go/no-go；② 是否允许放宽 440KB/30KB 预算；③ 若真实参考（C3）go/no-go 不达标，接受“仅近场/仅音乐/仅按键”的哪一种降级；④ C2 是否搬 `vc` 栈（8KB，Opus 实时路径，风险较高） |
+| C3 结论（2026-11-11） | 真实参考链路已打通（tone 18.8dB），但**人声歌曲 ERLE 仅 0~3.6dB**；唤醒实测：music vol0 5/5、vol10 0/3（同曲暂停 3/3）、vol20 0/5、vol30 0/10（AEC on/off 均 0）。**音乐中唤醒 no-go**（单麦 + 软件参考 + WakeNet 的边界）。 |
+| 待决定 | ① 继续调参（filter=8/FD high-perf/近场大声/仅器乐）是否值得；② 接受按键兜底、放弃语音唤醒打断；③ 硬件升级（第二颗麦/带 ADC 回采 codec，H1/H2）；② 是否允许放宽 440KB/30KB 预算；③ 若真实参考（C3）go/no-go 不达标，接受“仅近场/仅音乐/仅按键”的哪一种降级；④ C2 是否搬 `vc` 栈（8KB，Opus 实时路径，风险较高） |
 | 关闭条件 | C3 spike 产出内部/PSRAM 增量、单帧耗时、ERLE、音乐/TTS 中唤醒成功率（≥8/10）后，用户拍板并回写 ARCH §1/§5、CONVENTIONS §4、PRODUCT_IDEAS F5 |
 | 关联 | `build/t44_contract.md` §5/§5.3、ARCH §3.3 R1/R3、STATUS §1 阻塞项、PV-015（T4.5） |
 

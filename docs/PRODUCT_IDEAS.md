@@ -266,3 +266,15 @@
 - **重新评估触发条件**：① minimp3 在 S3 上解码吞吐不足（当前 44.1k stereo 4.45ms/帧 ≈17% CPU，余量充足）；② 需要 MP3 以外的下行编码（AAC/Opus 音乐），届时评估官方 `esp_audio_codec`；③ 上游 minimp3 补丁需要重放（升级时按 third_party README 操作）。
 - **参考**：ARCHITECTURE §3.7；`components/audio_player/third_party/minimp3/README.md`；STATUS §5 T2.3 基线；同级项目 `../pipeline_http_mp3`（ESP-ADF 例程 + 自定义 I2S 写回调，仅作对照）。
 
+### X6 软件参考 AEC 实测：音乐播放中唤醒（T4.4 C3，2026-11-11）
+
+- **状态**：**已实测，结论 no-go（单麦 + 软件参考 + WakeNet）**；语音打断（T4.4b/C4）暂停，待决策（按键兜底 / 进一步调参 / 硬件升级）。
+- **做法**：`audio_player` 把混音输出（post 音量/duck/限幅）推入 `audio_io` 的 512ms PSRAM 参考环 → 48k→16k（3:1）→ `audio_fe` 在 feed 任务里 `mic → esp_aec → AFE`；无播放/R1 hold 时旁路。AEC 用 `esp_aec` 直连（caps=PSRAM），支持 SR/FD、filter 2/4、运行时 delay 扫描。
+- **实测数据**：
+  - 合成 1kHz tone（vol 100、FD、delay 20ms）：in 1654 → out 189 = **ERLE 18.8dB**，互相关 0.98/0.90 → 链路/对齐正确；tone 在 vol 10 只剩 0.7dB（回声接近噪声底）。
+  - 人声歌曲（vol 10~100，SR filter2/4、FD）：**ERLE 0~3.6dB**；AEC 对真实歌曲的线性/非线性回声抑制远低于 tone。
+  - 唤醒（`afplay tools/lexin.wav`，系统 50%）：music vol 0 → **5/5**；vol 10 → **0/3**（同曲暂停 3/3）；vol 20 → **0/5**；vol 30 → **0/10**（AEC on/off 均 0）。
+- **根因判断**：单麦无波束/无空间信息；人声歌曲与唤醒词频谱/内容竞争（即使音量 10、回声已接近噪声底，WakeNet 仍失败）；软件参考 AEC 的线性/单通道 NLP 对人声歌曲抑制不足；D 类功放/房间非线性进一步限制。
+- **候选**：① 接受按键/语音暂停（C1 已交付，0 成本）；② 继续调参（filter=8、FD high-perf、近场大声、仅器乐）——预期有限；③ 硬件：第二颗麦（波束成形）或带 ADC 回采的 codec（H1/H2），这是商用“音乐中唤醒”的常规做法。
+- **重新评估触发条件**：① 换麦阵/专业 codec；② 换唤醒模型或阈值可调；③ 用户接受“近场大声+指定音乐音量”的限制。
+- **参考**：`build/t44_contract.md` §5、STATUS §3 C3 行、PENDING PD-007、`components/audio_fe`/`audio_io`（Kconfig `AUDIO_FE_AEC_ENABLE` 默认 n）。

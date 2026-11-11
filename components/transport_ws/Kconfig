@@ -38,7 +38,7 @@ menu "WebSocket Transport"
     config WS_RX_BUFFER_BYTES
         int "单帧收包缓冲（字节）"
         range 1024 4096
-        default 2048
+        default 1024
         help
             下行单帧最大长度；超过会被客户端分片，本组件按 payload_offset 重组，
             重组后仍超过该值则丢弃并 WARN（计入 rx_bad）。当前最大的下行帧是

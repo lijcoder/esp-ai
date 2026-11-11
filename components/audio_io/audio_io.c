@@ -69,8 +69,15 @@ static esp_err_t rx_init(void)
         return err;
     }
 
+    /* T4.4 C2：I2S 读暂存放 PSRAM。i2s_channel_read 内部是
+     * 「DMA buffer → memcpy 到用户缓冲」，用户缓冲不参与 DMA；失败回退内部。 */
     s_rx_scratch = heap_caps_malloc((size_t)RX_SCRATCH_FRAMES * sizeof(int32_t),
-                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_rx_scratch) {
+        s_rx_scratch = heap_caps_malloc((size_t)RX_SCRATCH_FRAMES * sizeof(int32_t),
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_LOGW(TAG, "rx scratch PSRAM 分配失败，回退内部 RAM");
+    }
     if (!s_rx_scratch) {
         ESP_LOGE(TAG, "rx scratch alloc failed");
         return ESP_ERR_NO_MEM;

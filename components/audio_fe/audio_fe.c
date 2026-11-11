@@ -5,10 +5,6 @@
 #include "audio_io.h"
 #include "esp_afe_sr_iface.h"
 #include "esp_afe_sr_models.h"
-#if CONFIG_AUDIO_FE_AEC_ENABLE
-#include "esp_aec.h"
-#include <math.h>
-#endif
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -34,31 +30,6 @@ static void *s_cb_arg = NULL;
 static volatile bool s_running = false;
 static char s_wn_name[32] = {0};
 static bool s_fetch_chunk_logged; /* 只在 fetch 任务里读写，单线程无需保护 */
-
-#if CONFIG_AUDIO_FE_AEC_ENABLE
-/* ---- 软件参考 AEC（T4.4 C3）：feed 任务内 mic → AEC → AFE ---- */
-static aec_handle_t *s_aec = NULL;
-static int16_t *s_aec_ref = NULL; /* 参考帧（内部，chunksize×2B） */
-static int16_t *s_aec_out = NULL; /* AEC 输出帧（内部） */
-static volatile bool s_aec_on = true;
-static volatile uint32_t s_aec_delay_ms = CONFIG_AUDIO_FE_AEC_REF_DELAY_MS;
-static portMUX_TYPE s_aec_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t s_aec_frames;
-static uint32_t s_aec_in_rms;
-static uint32_t s_aec_out_rms;
-static uint32_t s_aec_underruns;
-static uint32_t s_aec_chunk;
-static uint32_t s_aec_ref_rms;
-static int16_t *s_corr_mic;
-static int16_t *s_corr_ref;
-static volatile bool s_corr_req;
-static volatile bool s_corr_ready;
-static uint32_t s_corr_fill;
-static int64_t s_aec_in_acc;
-static int64_t s_aec_out_acc;
-static int64_t s_aec_ref_acc;
-static uint32_t s_aec_acc_n; /* 每 100 帧（3.2s）更新一次 RMS */
-#endif
 
 /* ---- 半双工门控仲裁（T3.2，R1/R2/R5） ----
  * 位图 = "谁要求暂停收音"；归零才真正恢复。所有字段由 s_feed_mux 保护：
@@ -428,67 +399,7 @@ static void feed_task(void *arg)
         portENTER_CRITICAL(&s_stats_mux);
         s_stat_frames++;
         portEXIT_CRITICAL(&s_stats_mux);
-
-#if CONFIG_AUDIO_FE_AEC_ENABLE
-        const int16_t *feed = buf;
-        if (s_aec != NULL && s_aec_on && !mute
-#if CONFIG_AUDIO_FE_AEC_BYPASS_WHEN_IDLE
-            && audio_io_spk_is_enabled()
-#endif
-        ) {
-            const uint32_t delay = s_aec_delay_ms;
-            if (audio_io_ref_read_16k(s_aec_ref, (size_t)chunksize, delay) == chunksize) {
-                if (s_corr_req && s_corr_mic != NULL && s_corr_ref != NULL) {
-                    const uint32_t off = s_corr_fill ? (uint32_t)chunksize : 0u;
-                    memcpy(s_corr_mic + off, buf, (size_t)chunksize * sizeof(int16_t));
-                    memcpy(s_corr_ref + off, s_aec_ref, (size_t)chunksize * sizeof(int16_t));
-                    s_corr_fill++;
-                    if (s_corr_fill >= 2u) {
-                        s_corr_fill = 0;
-                        s_corr_req = false;
-                        s_corr_ready = true;
-                    }
-                }
-                aec_process(s_aec, buf, s_aec_ref, s_aec_out);
-                feed = s_aec_out;
-                int64_t in_sq = 0;
-                int64_t out_sq = 0;
-                int64_t ref_sq = 0;
-                for (int i = 0; i < chunksize; i++) {
-                    const int32_t a = buf[i];
-                    const int32_t b = s_aec_out[i];
-                    const int32_t r = s_aec_ref[i];
-                    in_sq += (int64_t)a * a;
-                    out_sq += (int64_t)b * b;
-                    ref_sq += (int64_t)r * r;
-                }
-                portENTER_CRITICAL(&s_aec_mux);
-                s_aec_frames++;
-                s_aec_in_acc += in_sq;
-                s_aec_out_acc += out_sq;
-                s_aec_ref_acc += ref_sq;
-                s_aec_acc_n++;
-                if (s_aec_acc_n >= 100u) {
-                    const float denom = (float)s_aec_acc_n * (float)chunksize;
-                    s_aec_in_rms = (uint32_t)sqrtf((float)s_aec_in_acc / denom);
-                    s_aec_out_rms = (uint32_t)sqrtf((float)s_aec_out_acc / denom);
-                    s_aec_ref_rms = (uint32_t)sqrtf((float)s_aec_ref_acc / denom);
-                    s_aec_in_acc = 0;
-                    s_aec_out_acc = 0;
-                    s_aec_ref_acc = 0;
-                    s_aec_acc_n = 0;
-                }
-                portEXIT_CRITICAL(&s_aec_mux);
-            } else {
-                portENTER_CRITICAL(&s_aec_mux);
-                s_aec_underruns++;
-                portEXIT_CRITICAL(&s_aec_mux);
-            }
-        }
-        s_afe->feed(s_afe_data, feed);
-#else
         s_afe->feed(s_afe_data, buf);
-#endif
     }
 
     free(buf);
@@ -601,72 +512,6 @@ esp_err_t audio_fe_init(audio_fe_cb_t cb, void *arg)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-#if CONFIG_AUDIO_FE_AEC_ENABLE
-    {
-        const int chunksize = s_afe->get_feed_chunksize(s_afe_data);
-        aec_mode_t mode;
-#if CONFIG_AUDIO_FE_AEC_MODE_FD_LOW_COST
-        mode = AEC_MODE_FD_LOW_COST;
-#elif CONFIG_AUDIO_FE_AEC_MODE_SR_LOW_COST
-        mode = AEC_MODE_SR_LOW_COST;
-#else
-        mode = AEC_MODE_SR_HIGH_PERF;
-#endif
-        const size_t in_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        const size_t ps_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        aec_config_t acfg = {
-            .mic_num = 1,
-            .ref_num = 1,
-            .out_num = 1,
-            .filter_length = CONFIG_AUDIO_FE_AEC_FILTER_LEN,
-            .sample_rate = AUDIO_IO_MIC_SAMPLE_RATE,
-            .caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-            .mode = mode,
-            .nlp_level = AEC_NLP_LEVEL_AGGR,
-        };
-        s_aec = aec_create_from_config(&acfg);
-        if (s_aec == NULL) {
-            ESP_LOGE(TAG, "AEC 创建失败（mode=%d），旁路", (int)mode);
-        } else if (aec_get_chunksize(s_aec) != chunksize) {
-            ESP_LOGE(TAG, "AEC chunksize=%d != AFE chunksize=%d，旁路",
-                     aec_get_chunksize(s_aec), chunksize);
-            aec_destroy(s_aec);
-            s_aec = NULL;
-        } else {
-            s_aec_ref = heap_caps_malloc((size_t)chunksize * sizeof(int16_t),
-                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-            s_aec_out = heap_caps_malloc((size_t)chunksize * sizeof(int16_t),
-                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-            s_corr_mic = heap_caps_malloc(AUDIO_FE_AEC_CORR_SAMPLES * sizeof(int16_t),
-                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            s_corr_ref = heap_caps_malloc(AUDIO_FE_AEC_CORR_SAMPLES * sizeof(int16_t),
-                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (s_aec_ref == NULL || s_aec_out == NULL || s_corr_mic == NULL ||
-                s_corr_ref == NULL) {
-                ESP_LOGE(TAG, "AEC 帧缓冲分配失败，旁路");
-                heap_caps_free(s_aec_ref);
-                heap_caps_free(s_aec_out);
-                heap_caps_free(s_corr_mic);
-                heap_caps_free(s_corr_ref);
-                s_aec_ref = s_aec_out = NULL;
-                s_corr_mic = s_corr_ref = NULL;
-                aec_destroy(s_aec);
-                s_aec = NULL;
-            } else {
-                s_aec_chunk = (uint32_t)chunksize;
-                const size_t in_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-                const size_t ps_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-                ESP_LOGI(TAG,
-                         "AEC ready：%s filter=%d chunksize=%d 参考延迟=%u ms；"
-                         "内部 +%d B / PSRAM +%d B",
-                         aec_get_mode_string(mode), CONFIG_AUDIO_FE_AEC_FILTER_LEN, chunksize,
-                         (unsigned)s_aec_delay_ms, (int)(in_before - in_after),
-                         (int)(ps_before - ps_after));
-            }
-        }
-    }
-#endif
-
     ESP_LOGI(TAG, "afe ready: input_format=\"%s\" mic=%d Hz", CONFIG_AUDIO_FE_INPUT_FORMAT,
              AUDIO_IO_MIC_SAMPLE_RATE);
 
@@ -677,76 +522,6 @@ esp_err_t audio_fe_init(audio_fe_cb_t cb, void *arg)
     }
     return ESP_OK;
 }
-
-
-#if CONFIG_AUDIO_FE_AEC_ENABLE
-void audio_fe_aec_set_enabled(bool on)
-{
-    s_aec_on = on;
-    ESP_LOGI(TAG, "AEC %s", on ? "开启" : "旁路");
-}
-
-bool audio_fe_aec_enabled(void)
-{
-    return s_aec_on && s_aec != NULL;
-}
-
-void audio_fe_aec_set_delay_ms(uint32_t ms)
-{
-    if (ms > 300) {
-        ms = 300;
-    }
-    s_aec_delay_ms = ms;
-    ESP_LOGI(TAG, "AEC 参考延迟 = %u ms", (unsigned)ms);
-}
-
-
-bool audio_fe_aec_corr_start(void)
-{
-    if (s_corr_mic == NULL || s_corr_ref == NULL) {
-        return false;
-    }
-    s_corr_fill = 0;
-    s_corr_ready = false;
-    s_corr_req = true;
-    return true;
-}
-
-bool audio_fe_aec_corr_ready(void)
-{
-    return s_corr_ready;
-}
-
-bool audio_fe_aec_corr_get(int16_t *mic, int16_t *ref)
-{
-    if (!s_corr_ready || mic == NULL || ref == NULL || s_corr_mic == NULL || s_corr_ref == NULL) {
-        return false;
-    }
-    memcpy(mic, s_corr_mic, AUDIO_FE_AEC_CORR_SAMPLES * sizeof(int16_t));
-    memcpy(ref, s_corr_ref, AUDIO_FE_AEC_CORR_SAMPLES * sizeof(int16_t));
-    s_corr_ready = false;
-    return true;
-}
-
-esp_err_t audio_fe_aec_stats_read(audio_fe_aec_stats_t *out)
-{
-    if (out == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    portENTER_CRITICAL(&s_aec_mux);
-    out->created = (s_aec != NULL);
-    out->enabled = s_aec_on;
-    out->delay_ms = s_aec_delay_ms;
-    out->frames = s_aec_frames;
-    out->in_rms = s_aec_in_rms;
-    out->out_rms = s_aec_out_rms;
-    out->underruns = s_aec_underruns;
-    out->chunksize = s_aec_chunk;
-    out->ref_rms = s_aec_ref_rms;
-    portEXIT_CRITICAL(&s_aec_mux);
-    return ESP_OK;
-}
-#endif
 
 esp_err_t audio_fe_start(void)
 {

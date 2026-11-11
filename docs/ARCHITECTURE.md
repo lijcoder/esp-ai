@@ -108,17 +108,17 @@ TTS(MP3 流/整段) ─┐
 |---|---|
 | R1 | 进入 `SPEAKING`/提示音播放时暂停收音（`audio_fe_feed_hold()` 置原因位），麦克风数据喂静音（不送 AFE） |
 | R2 | `TTS_END` 后延迟 **300ms** 恢复 feed，吸收喇叭尾音与功放余响（延时在 `audio_player` 的完成回调前统一做） |
-| R3 | 音乐播放不关闭麦克风（保持唤醒检测）；唤醒命中后 100ms 内把音乐 duck 到 -12dB |
-| R4 | 按键打断：任意活跃状态 → 播放通道 **80ms** 淡出 → 发 `interrupt` 报文 + 作废 sid → 恢复 feed（丢弃 50ms）→ `IDLE` |
+| R3 | 音乐播放不关闭麦克风（保持唤醒检测）；打断命中后 100ms 内**暂停音乐并保留**（T4.4 pause 模式；语音打断依赖 AEC，duck 留作后续体验模式） |
+| R4 | 按键打断：语音类内容（提示音/TTS）→ **80ms** 淡出并丢弃 → 发 `interrupt` 报文 + 作废 sid → 恢复 feed（丢弃 50ms）→ `IDLE`；**只有音乐在播 → 暂停并保留**（T4.4） |
 | R5 | 恢复 feed 后丢弃最早 **50ms** 的音频（`CONFIG_AUDIO_FE_RESUME_DISCARD_MS`），避免打断瞬间的噪声触发 VAD |
 
 **门控仲裁（T3.2 定稿，唯一入口）**：`audio_fe` 维护一个原因位图，业务方各自 `audio_fe_feed_hold(reason)` / `audio_fe_feed_release(reason)`，**位图归零才真正恢复收音**。原因位：`PROMPT`（唤醒应答提示音，`voice_session`）、`TTS`（云端 TTS 流式播放，`voice_cloud`）、`PROBE`（console/旧 `audio_fe_set_feed_enabled()` 兼容）。这解决了 T3.1 之前"提示音 R1/R2"与"TTS R1/R2"两套独立开关互相覆盖的问题（谁后执行谁生效 → 可能提前开麦自激，或永久关麦卡死会话）。
 
 > **T3.2 实现状态（2026-11-01）**：
 > - **R1/R2**：提示音与 TTS 统一经原因位仲裁（`hold_mask` 在 `mic stat` 可观测：提示音期 `0x1`、TTS 期 `0x2`、恢复后 `0x0`）；300ms 尾部延时仍在 `audio_player`（PCM 与流式一致），完成回调 → 各自 `release` 自己那一位。
-> - **R4**：`voice_session() → vs_interrupt()`：`audio_player_fade_out_and_stop(80ms)`（输出级线性淡出，`player stat` 的 `last_stop_ms` 真机实测 64~80ms；80ms 淡出被 10ms 输出块量化，故只设上界 <100ms）→ `vc_interrupt()` 发 `{"t":"interrupt","sid":N}` 并 `vc_cancel()` → `audio_fe_feed_discard_ms(50)` → 回 `IDLE`。播放完成回调以 `ok=false` 上报。淡出期间 `vc_cancel` 的立即 abort 不会截断淡出（`run_stream` 里"有淡出请求时忽略 abort_req"）。按键来源：`APP_EVT_BUTTON`（payload 见 §4.2），**自 T3.4 起由 `dev_ctrl` 扫描真实 GPIO0 投递**；console 仍可用 `vs interrupt` / `evt post BUTTON` 注入验证。**停声口径**：从按键/命令到输出静音 ≤100ms（80ms 淡出 + 一个 10ms 输出块）。
+> - **R4**：`voice_session() → vs_interrupt()`：语音类内容在播时 `audio_player_fade_out_and_stop(80ms)`（输出级线性淡出，`player stat` 的 `last_stop_ms` 真机实测 64~80ms；80ms 淡出被 10ms 输出块量化，故只设上界 <100ms）→ `vc_interrupt()` 发 `{"t":"interrupt","sid":N}` 并 `vc_cancel()` → `audio_fe_feed_discard_ms(50)` → 回 `IDLE`。播放完成回调以 `ok=false` 上报。淡出期间 `vc_cancel` 的立即 abort 不会截断淡出（`run_stream` 里"有淡出请求时忽略 abort_req"）。**T4.4 补充**：若 `audio_player_voice_active()==false` 且音乐在播（例如会话中音乐被显式恢复），则走 `audio_player_music_pause(80ms)` **暂停保留**，不发音乐相关报文；正常路径下音乐在语音进入活跃态时已 auto-pause。按键来源：`APP_EVT_BUTTON`（payload 见 §4.2），**自 T3.4 起由 `dev_ctrl` 扫描真实 GPIO0 投递**；console 仍可用 `vs interrupt` / `evt post BUTTON` 注入验证。**停声口径**：从按键/命令到输出静音 ≤100ms（80ms 淡出 + 一个 10ms 输出块）。
 > - **R5**：`audio_fe_feed_discard_ms()` 在恢复后把最早 50ms 的麦克风数据喂零并计数（`mic stat` 的 `discard_samples=800`）；只在打断/断链恢复路径使用，正常 TTS 收尾由 R2 的 300ms 覆盖、**不叠加** R5。
-> - **R3**：**T3.3 起 duck 是 `CH_MUSIC` 的通道增益**（`-12dB`，q16=16384，**100ms 线性斜坡**；目标变化时按 100ms 重算步进、块内逐样本推进），不再压整个输出；`player duck on|off` 为探针。真实音乐源在 P4；混音链路本身已支持"音乐 ring 持续供数 + 提示音/TTS 叠加 + 自动 duck"，完整音乐流程（含会话结束恢复音乐）归 T4.4；T3.2 的唤醒路径（音乐播放中唤醒不丢弃 → 淡出抢占）暂时保留，T4.4 接音乐源后再切叠加路径。真机探针：T3.2 的 `out_peak` 15563→3890（0.250）；T3.3 用 `player mix` 三通道复验 1760Hz 峰 8000→2000、440Hz 峰 8000→4000。
+> - **R3（T4.4 定稿：pause 模式）**：音乐播放中不关麦；打断命中后 100ms 内**暂停并保留**（保 ring/进度），会话结束**不自动恢复**，等用户明确说"继续"；`duck`（CH_MUSIC 通道增益，-12dB/100ms 斜坡）仍保留为探针/后续体验模式，本轮不做叠加。T3.3 的混音链路（音乐 ring 持续供数 + 提示音/TTS 叠加 + 自动 duck）为后续 duck 模式预留，当前不使用。真机探针：T3.2 的 `out_peak` 15563→3890（0.250）；T3.3 用 `player mix` 三通道复验 1760Hz 峰 8000→2000、440Hz 峰 8000→4000。
 
 > **T3.7 连续对话**：`FOLLOW_UP` 窗口建立在 TTS 的 R2（feed 已恢复）之后；窗口内起轮不再 hold PROMPT（不播提示音），直接进入上行；窗口内按键/断网按 R4/R5 退出。窗口的"人声确认"只依赖 VAD 事件，不改变 R1–R5 语义。
 >
@@ -186,7 +186,7 @@ TTS(MP3 流/整段) ─┐
   - **T4.1 远端音源（`source_http.c`）**：`music play <url>` → 独立任务 `music_http`（核 0/优先级 4/栈 `CONFIG_AUDIO_PLAYER_MUSIC_TASK_STACK`=6KB，**按需创建、停止后销毁**）→ `esp_http_client` HTTP(S) 拉流 → **独立 minimp3 实例**（PSRAM ~38KB，与 TTS 默认实例互不共享）→ 48k 单声道重采样 → PSRAM PCM ring（`AUDIO_PLAYER_MUSIC_RING_MS`，默认 1000ms）→ `CH_MUSIC`。起播前预填 150ms（避免空 ring 欠载）；停止 = 丢弃 ring + 100ms 淡出，拉流任务在 HTTP 读超时（2s）内自行退出。URL 只接受 `http(s)`、长度 ≤ `AUDIO_PLAYER_MUSIC_URL_MAX`（320），流中采样率变化即中止；**不做 seek/Range**（T4.5）。
   - **T4.1 内存口径**：音乐 PCM ring 96KB 在 PSRAM（启动时分配）；解码实例/预填/单帧输出 ~56KB 只在播放期占 PSRAM；`music_http` 任务栈 6KB + HTTP client 缓冲（4KB）+ 读缓冲（4KB）只在播放期占内部 RAM。**真机实测待补（PENDING PV-012）**：wss 握手期若与播放重叠，水位需 ≥30KB；T4.1 先按"播放中不重连"验证，T5.3 复测。
   - **T4.2 音乐协议（`music_cloud`，2026-11-10 实现）**：WS 附加订阅槽解析 `music_track`/`music_control`，按连接内 `mid` 过滤后驱动 `audio_player_music_play_url/stop_url`；播放中每 `CONFIG_MC_STATUS_PERIOD_MS`（5s）上行 `music_status`，状态变化立即一次；起播/切歌在 `esp_timer` 里串行执行（切歌先 stop 再 play，按 `MC_PLAY_RETRY_MS` 重试旧任务退出窗口）。`pause/resume` 的执行、`music_request` 与切歌状态机自 T4.3 起由 `music_session` 接管（见下条）。T4.1 的 console 探针 `music play/stop/stat` 保留。
-  - **T4.3 音乐控制（`music_session`，2026-11-10 实现）**：新增 L4 组件 `music_session`（**不建任务**），`music_cloud` 瘦身为纯协议（解析/`mid` 过滤/JSON 收发，不再调用播放器）。状态 IDLE/PLAYING/PAUSED/STOPPED/ERROR；**暂停 = `CH_MUSIC` 100ms 淡出后结束 PUMP 作业但保留 ring 与读写位置**，`source_http` 停止读 socket（靠 TCP 背压，不丢数据），**继续 = 重新入队 PUMP 从暂停点续播**（不重置 ring、不从文件头重放）；播放中每 `MS_STATUS_PERIOD_MS`（5s）上报 `music_status`（新增 `state:"paused"`，暂停期 `progress_ms` 冻结）+ 状态变化立即一次。**与语音抢占**：订阅 `APP_EVT_VOICE_STATE_CHANGED`，语音进入 LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR → auto-pause（100ms），回 IDLE 时**仅当本次暂停来自语音抢占**才 auto-resume；云端 `pause` 是**用户暂停 latch**，会话结束不自动恢复。`music_request`（端侧主动点歌）与"继续失败"兜底归本任务。duck 叠加归 T4.4，seek/Range/断流重连归 T4.5。
+  - **T4.3 音乐控制（`music_session`，2026-11-10 实现）**：新增 L4 组件 `music_session`（**不建任务**），`music_cloud` 瘦身为纯协议（解析/`mid` 过滤/JSON 收发，不再调用播放器）。状态 IDLE/PLAYING/PAUSED/STOPPED/ERROR；**暂停 = `CH_MUSIC` 100ms 淡出后结束 PUMP 作业但保留 ring 与读写位置**，`source_http` 停止读 socket（靠 TCP 背压，不丢数据），**继续 = 重新入队 PUMP 从暂停点续播**（不重置 ring、不从文件头重放）；播放中每 `MS_STATUS_PERIOD_MS`（5s）上报 `music_status`（新增 `state:"paused"`，暂停期 `progress_ms` 冻结）+ 状态变化立即一次。**与语音抢占**：订阅 `APP_EVT_VOICE_STATE_CHANGED`，语音进入 LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR → auto-pause（100ms），回 IDLE 时**保持暂停、不自动恢复**（T4.4 pause 模式）；云端 `pause` 是**用户暂停 latch**，会话结束不自动恢复。`music_request`（端侧主动点歌）与"继续失败"兜底归本任务。duck 叠加不再做（T4.4 定稿 pause 模式），seek/Range/断流重连归 T4.5。
   - **整段路径**保留给本地/探针（`audio_player_play_mp3`），**T3.3 起走 `CH_MUSIC`**（音乐通道，`player duck` 可验证 R3 duck；`mp3_test.py` 48/48 仍过）；PCM 预分配上限从 1.5MB 下调到 **512KB**。流式 TTS 走 `CH_TTS`，提示音走 `CH_PROMPT`。
 
 ---
@@ -220,7 +220,7 @@ TTS(MP3 流/整段) ─┐
 | `transport_ws` | L1 基础服务 | wss 客户端：连接/退避重连、`hello`/`hello_ack` 握手、20s/10s 心跳、发送队列、二进制帧收发；入站回调支持主回调 + 附加订阅（T2.5，业务与 console 观测并存） | `ws_init()`, `ws_start()`, `ws_send_text()`, `ws_send_bin()`, `ws_register_cb()`, `ws_subscribe()`, `ws_unsubscribe()`, `ws_reconnect()`, `ws_is_ready()`, `ws_status_read()` |
 | `event_bus` | L1 基础服务 | 全局事件定义与分发（基于 esp_event 独立循环，任务/队列可控） | `app_evt_init()`, `app_evt_register()`, `app_evt_unregister()`, `app_evt_post()`, `app_evt_name()` |
 | `audio_fe` | L2 音频引擎 | AFE 封装：**半双工门控仲裁（T3.2：原因位图 `PROMPT/TTS/PROBE` + 恢复丢弃窗口 R5）**、唤醒/VAD 事件（T1.2b 起投 `APP_EVT_WAKE_DETECTED`/`APP_EVT_VAD_*` 到 event_bus，回调仅调试兼容）、上行 16k 单声道 PCM 输出（PSRAM 环形缓冲，T2.1） | `audio_fe_init(cb)`, `audio_fe_start()`, `audio_fe_feed_hold()`, `audio_fe_feed_release()`, `audio_fe_feed_discard_ms()`, `audio_fe_feed_stats_read()`, `audio_fe_feed_enabled()`, `audio_fe_set_feed_enabled()`（旧接口/探针兼容）, `audio_fe_wakenet_name()`, `audio_fe_uplink_start()`, `audio_fe_uplink_stop()`, `audio_fe_uplink_read()`, `audio_fe_uplink_stats_read()` |
-| `audio_player` | L2 音频引擎 | 播放引擎：**三通道混音（T3.3：`CH_TTS`/`CH_PROMPT`/`CH_MUSIC`，PSRAM ring → 饱和相加 → 音量 20ms 插值 → -1dBFS 软限幅 → I2S）** + 重采样到 48k + 淡入淡出；提示音/整段 MP3/TTS 流式分别接入通道；**T3.2：输出级打断淡出（R4）与输出峰值/停声耗时观测；T3.3：duck 改为 `CH_MUSIC` 通道增益**；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；音乐源/HTTP 随 P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_fade_out_and_stop()`, `audio_player_set_duck()`, `audio_player_get_duck()`, `audio_player_current_src()`, `audio_player_set_volume()`, `audio_player_stats_read()`, `audio_player_mix_stats_read()/reset()`, `audio_player_mix_tone()/stop()/capture()/capture_status()/capture_read()`, **T4.1：`audio_player_music_play_url(url)` / `audio_player_music_stop_url()` / `audio_player_music_start(rate)` / `audio_player_music_write(pcm48, frames, timeout)` / `audio_player_music_end()` / `audio_player_music_stop()` / `audio_player_music_active()` / `audio_player_music_stats_read()`，**T4.3：`audio_player_music_pause(fade_ms)` / `audio_player_music_resume()` / `audio_player_music_paused()`（暂停保留 ring 与读写位置、从暂停点续播）** |
+| `audio_player` | L2 音频引擎 | 播放引擎：**三通道混音（T3.3：`CH_TTS`/`CH_PROMPT`/`CH_MUSIC`，PSRAM ring → 饱和相加 → 音量 20ms 插值 → -1dBFS 软限幅 → I2S）** + 重采样到 48k + 淡入淡出；提示音/整段 MP3/TTS 流式分别接入通道；**T3.2：输出级打断淡出（R4）与输出峰值/停声耗时观测；T3.3：duck 改为 `CH_MUSIC` 通道增益**；MP3 用 vendored minimp3（状态/临时区/ring 全 PSRAM），流式边收边解、欠载补静音、跨帧连续重采样；完成回调主槽 + 3 附加槽 `(src, ok, arg)`；音乐源/HTTP 随 P4 增加 | `audio_player_init()`, `audio_player_play_pcm()`, `audio_player_play_mp3()`, `audio_player_mp3_ready()`, `audio_player_register_done_cb()`, `audio_player_subscribe_done()`, `audio_player_unsubscribe_done()`, `audio_player_stream_open()`, `audio_player_stream_write()`, `audio_player_stream_end()`, `audio_player_stream_abort()`, `audio_player_stream_active()`, `audio_player_stream_stats_read()`, `audio_player_fade_out_and_stop()`, `audio_player_set_duck()`, `audio_player_get_duck()`, `audio_player_current_src()`, `audio_player_set_volume()`, `audio_player_stats_read()`, `audio_player_mix_stats_read()/reset()`, `audio_player_mix_tone()/stop()/capture()/capture_status()/capture_read()`, **T4.1：`audio_player_music_play_url(url)` / `audio_player_music_stop_url()` / `audio_player_music_start(rate)` / `audio_player_music_write(pcm48, frames, timeout)` / `audio_player_music_end()` / `audio_player_music_stop()` / `audio_player_music_active()` / `audio_player_music_stats_read()`，**T4.3：`audio_player_music_pause(fade_ms)` / `audio_player_music_resume()` / `audio_player_music_paused()`（暂停保留 ring 与读写位置、从暂停点续播）**，**T4.4：`audio_player_voice_active()`（区分语音作业与音乐泵）** |
 | `codec_enc` | L2 音频引擎 | Opus 编码（16k/16kbps/20ms，定点实现 + VBR，状态/伪栈在 PSRAM，不建任务） | `enc_open()`, `enc_encode(pcm, samples, out, cap, &out_len)`, `enc_flush()`, `enc_reset()`, `enc_close()`, `enc_stats_read()` |
 | `voice_cloud` | L3 能力 | 语音云协议：一轮会话的上行音频（`audio_fe` 读 PCM → Opus → `ws_send_bin`）、`audio_start/audio_end`、下行事件解析与 `sid` 过滤、事件/回调分发、**下行 0x02 接入 `audio_player` 流式播放 + R1/R2（T2.4；T3.2 起经 `audio_fe` 原因位仲裁）**；**不含会话状态机**（归 T3.1 `voice_session`）；T3.1 起回调增加 `VC_EVT_UPLINK_END`/`VC_EVT_ROUND_END` 供状态机驱动，`sid` 由会话机传入；T3.2 起 `vc_interrupt()` 负责 R4 的 `interrupt` 报文；**T3.6：`vc_is_ready()` 供唤醒前预判、`VC_EVT_TTS_FAIL`（code=`vc_tts_fail_t`）上报"设备侧 TTS 无法播放"** | `vc_init()`, `vc_start(sid)`, `vc_start_auto()`, `vc_stop()`, `vc_cancel()`, `vc_interrupt()`（T3.2：先发 `interrupt` 报文再 cancel）, `vc_is_busy()`, `vc_is_ready()`（T3.6）, `vc_preroll_start()`, `vc_preroll_stop()`（T3.7 续听预录）, `vc_get_state()`, `vc_register_cb()`, `vc_stats_read()` |
 | `music_cloud` | L3 能力 | **音乐协议（T4.3 起纯协议）**：WS 附加订阅槽解析 `music_track`/`music_control`（零分配手写 JSON）、`mid` 过滤（P-3）、断链清基准、`music_status`/`music_request` 编码发送；**不调播放器、不建定时器** | `mc_init()`, `mc_register_cb()`, `mc_report_status()`, `mc_send_request()`, `mc_current_mid()`, `mc_have_mid()`, `mc_stats_read/reset()` |
@@ -228,7 +228,7 @@ TTS(MP3 流/整段) ─┐
 | `feedback` | L3 能力 | **异常反馈路由（T3.6）**：`fb_notify(kind, code, sid)` → ① 发布语义事件 `APP_EVT_FEEDBACK`（未来屏幕/灯光等通道订阅它，**语音只是一种反馈方式**）；② 当前语音通道：`assets` 提示音 → `audio_player_play_pcm()`（`CH_PROMPT`）+ R1 门控；TTS 流占用时 pending 到流完成回调再补播；**不建任务/定时器** | `fb_init()`, `fb_notify()`, `fb_abort()`, `fb_is_active()`, `fb_active_kind()`, `fb_register_done_cb()`, `fb_stats_read()/reset()`, `fb_kind_name()`（纯头 `feedback_policy.h`） |
 | `diag` | L3 能力 | esp_console 命令、日志级别控制、堆/任务周期监控 | `diag_init()` |
 | `voice_session` | L4 业务编排 | 会话状态机（IDLE/LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR）、每轮 `sid` 分配、超时/错误策略（THINKING 超时与云端 error → ERROR，同轮不重试）、唤醒编排（T1.2b：订阅 event_bus，播应答提示音并做 R1/R2）、**T3.2：R4 完整打断（淡出→interrupt 报文→R5 丢弃→IDLE）、R3 音乐中唤醒放行、按键事件消费（短按打断/IDLE 起轮）**、**T3.7：连续对话 FOLLOW_UP 续听窗口（窗口内免唤醒起轮、人声确认、轮数上限、窗口内唤醒重开、运行期开关）**、**T3.6：四类异常（网络未连接/云端 error/THINKING 超时/TTS 失败）→ ERROR + `feedback` 播报，提示音完成回调驱动 `ERROR → IDLE`，`CONFIG_VS_ERROR_HOLD_MS` 只作兜底看门狗；唤醒时云端未 READY 直接给"网络未连接"反馈（不先播"我在呢"）；会话中途断网也出声**；**不建任务**（事件驱动，见 §9.3） | `vs_init()`, `vs_start()`, `vs_interrupt()`, `vs_is_busy()`, `vs_get_state()`, `vs_state_name()`, `vs_reason_name()`, `vs_current_sid()`, `vs_set_followup_enabled()`, `vs_followup_enabled()`, `vs_stats_read()`, `vs_stats_reset()` |
-| `music_session` | L4 业务编排 | **音乐播放控制（T4.3）**：状态机（IDLE/PLAYING/PAUSED/STOPPED/ERROR）、起播/切歌重试、暂停/继续（保留 ring 与位置）、`music_request` 兜底、EOF 探测、5s 状态上报；**与语音抢占**（语音活跃 auto-pause、回 IDLE auto-resume、用户暂停 latch 优先）；**不建任务**（两个 esp_timer） | `ms_init()`, `ms_play()`, `ms_pause()`, `ms_resume()`, `ms_stop()`, `ms_request()`, `ms_get_state()`, `ms_info_read()`, `ms_stats_read/reset()` |
+| `music_session` | L4 业务编排 | **音乐播放控制（T4.3）**：状态机（IDLE/PLAYING/PAUSED/STOPPED/ERROR）、起播/切歌重试、暂停/继续（保留 ring 与位置）、`music_request` 兜底、EOF 探测、5s 状态上报；**与语音抢占**（语音活跃 auto-pause、回 IDLE **保持暂停**（T4.4 pause 模式）、用户暂停 latch 优先）；**不建任务**（两个 esp_timer） | `ms_init()`, `ms_play()`, `ms_pause()`, `ms_resume()`, `ms_stop()`, `ms_request()`, `ms_get_state()`, `ms_info_read()`, `ms_stats_read/reset()` |
 | `prompt_store` | L1 基础资源 | **提示音资源存储（T3.5）**：`assets` 分区自定义只读 pack（5 条 16k PCM）→ 启动校验 → `esp_partition_mmap` 零拷贝映射（失败回退 PSRAM + CRC 校验）；pack 缺失/损坏时降级（get 返回 NULL）；**不建任务** | `prompt_store_init()`, `prompt_store_ready()`, `prompt_store_info()`, `prompt_assets_get()`, `prompt_assets_name()` |
 
 ### 4.2 事件总线（确定）
@@ -443,7 +443,7 @@ esp-ai/
 5. **按键（T3.2/T3.4）**：任意活跃状态短按 = R4 打断 → `IDLE`（`FOLLOW_UP` 窗口内短按 = 退出续听回 `IDLE`）；`IDLE` 短按 = `vs_start()` 直接进 `LISTENING`（不播应答提示音）；长按 = 静音切换（由 `dev_ctrl` 自己处理，`voice_session` 忽略；静音无 LED 指示，见 PENDING PD-003）。按键来源自 T3.4 起是真实 GPIO0（`dev_ctrl` 的 10ms 扫描 + 30ms 去抖），console `evt post BUTTON` 保留为注入探针。
 6. **连续对话（T3.7）**：`FOLLOW_UP` 续听窗口默认 5s、最多 5 轮续听、人声确认 250ms；窗口内直接说话免唤醒且不播提示音；窗口内唤醒词 = 重开一轮；静音超时/轮数上限/按键/断网退出；Kconfig `VS_FOLLOWUP_*` + 运行期 `vs followup on|off`。
 7. **异常反馈（T3.6）**：四类异常（网络未连接 / 云端 error / THINKING 超时 / TTS 失败）→ `ERROR` + `feedback` 提示音；**唤醒时云端未 READY 不播"我在呢"，直接播"网络未连接"**（避免两段提示音连播）；**会话中途断网也出声**；`ERROR` 期间按键 = 中止反馈回 `IDLE`；同轮不重试。详细映射与扩展点见 §8.6。
-8. **音乐与语音抢占（T4.3）**：音乐状态由 `music_session` 独占，`voice_session` 不直接操作音乐播放器。`music_session` 订阅 `APP_EVT_VOICE_STATE_CHANGED`：语音进入 `LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR` → **auto-pause**（100ms 淡出，让出播放器给提示音/TTS）；回 `IDLE` 时**仅当暂停原因是"语音抢占"**才 auto-resume。云端 `music_control{pause}` = **用户暂停 latch**，会话结束不自动恢复；`resume` 清 latch 并从暂停点续播。音乐播放中唤醒**不丢弃**（R3：音乐不关麦）。
+8. **音乐与语音抢占（T4.3）**：音乐状态由 `music_session` 独占，`voice_session` 不直接操作音乐播放器。`music_session` 订阅 `APP_EVT_VOICE_STATE_CHANGED`：语音进入 `LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR` → **auto-pause**（100ms 淡出，让出播放器给提示音/TTS）；回 `IDLE` 时**保持暂停、不自动恢复**（T4.4 pause 模式：等用户明确说“继续”）。云端 `music_control{pause}` = **用户暂停 latch**，会话结束不自动恢复；`resume` 清 latch 并从暂停点续播。音乐播放中唤醒**不丢弃**（R3：音乐不关麦）。
 
 > **T3.1 实现状态（2026-11-01）**：
 > - 状态机在 `components/voice_session`（L4）。迁移统一经 `vs_transition()`/`vs_begin_session()` 的 CAS（期望状态 → 目标状态），并发来源（`evt` 任务、`ws_client`、`player` 完成回调、console/timer）不会打乱状态；
@@ -517,7 +517,7 @@ music_session ──music_request──> 服务端 ──music_track{url}──>
 
 > **实现状态（2026-11-10，T4.1–T4.3 真机验收通过）**：T4.1 `source_http` + `music play/stop/stat` 探针、T4.2 `music_cloud` 协议、
 > T4.3 `music_session` 状态机与暂停/继续/切歌/`music_request`/语音抢占均已交付并上板验证（`music_e2e_test` 62/62、`music_proto_test` 22/22）。
-> **尚未实现**：duck 叠加（T4.4）、seek/Range/断流重连（T4.5）、域名白名单。
+> **T4.4 C1（2026-11-11 已上板）**：删除“语音回 IDLE 自动恢复”，音乐被语音/按键打断后**保持暂停**；按键打断语音=丢弃、只有音乐=暂停保留。**尚未实现**：语音打断（需 AEC，T4.4b）、duck 叠加（后续体验模式）、seek/Range/断流重连（T4.5）、域名白名单。
 > `music_cloud` 与 `music_session` 都**不建任务**：解析在 `ws_client` 上下文，播放决策/重试/周期上报在两个 `esp_timer`。
 > **语音期间的动作一律排队到 IDLE**（2026-11-10 真机修复）：新 `music_track` 排队起播；`music_control{resume}` 也排队——若立即 `audio_player_music_resume()` 会占用单作业播放器，紧接着的确认语 TTS 直接 `tts-fail`（真机日志 `VS: state THINKING -> ERROR（原因=tts-fail）`）。排队只在 `LISTENING/FOLLOW_UP`（新一轮）清空，`THINKING/SPEAKING` 期间保留；暂停/停止/切歌会丢弃排队项。
 > **已知限制**：暂停超过服务端 idle 超时（或 TCP 断）后"继续"可能拿不到数据 → 转 ERROR/STOPPED 并发一次 `music_request` 兜底（从头播；Range 续播归 T4.5；兜底路径真机未稳定触发，登记 **PV-015** 归 T4.5）；**语音活跃期间到达的新 `music_track` 排队到语音回 IDLE 才起播**，期间 `music_status` 可能先带新 `mid`（PENDING **PD-006**）。
@@ -525,17 +525,18 @@ music_session ──music_request──> 服务端 ──music_track{url}──>
 ### 8.4 音乐播放中唤醒
 
 ```
-音乐播放中 ──WakeNet 命中──> music_session auto-pause（T4.3：100ms 淡出，让出播放器）──> LISTENING
+音乐播放中 ──语音/按键打断──> music_session auto-pause（100ms 淡出，让出播放器）──> LISTENING
                                   │（会话结束）
                                   ▼
-            暂停原因=语音抢占 → auto-resume（从暂停点续播）
-            暂停原因=用户「暂停」→ 保持暂停，不自动恢复
+            一律保持暂停（T4.4 pause 模式）；用户说“继续”→ 从暂停点续播
+            新 music_track → 替换暂停曲目；说“停止”→ 丢弃 ring
 ```
 
-> **T4.3 口径（过渡）**：单作业播放器下，语音轮次的提示音/TTS 必须先让音乐泵退出，所以唤醒是**暂停**而不是 duck，
-> 但行为闭环（唤醒 → 说话 → 按意图暂停/继续，且"用户暂停"不会被会话结束覆盖）。**真机验证（2026-11-10）**：唤醒 → `MS: 语音进入活跃态 → auto-pause（reason=voice）`（progress 冻结）→ 回 IDLE `auto-resume（从暂停点续播）`；用户暂停 reason=user 会话结束不恢复。
-> **T4.4** 改为"音乐继续播 + duck −12dB"（R3，100ms 斜坡），把"说暂停/继续"和"唤醒本身"彻底解耦，并做恢复时序验证。
-> **真机现象（2026-11-10，T4.4 必须解决）**：音乐出声时唤醒词被掩蔽——设备混音音量 100/15/10 时 `afplay lexin.wav`（系统 45%、`-v 2`）都无法唤醒，**音量 0 才稳定唤醒**；状态机路径本身正常（本机 T4.3 验收在 `--player-volume 0` 下完成）。
+> **T4.4 定稿（2026-11-11 用户拍板，pause 模式）**：
+> - 音乐播放中语音/按键打断 → 100ms 淡出 → **暂停并保留**（保 ring/进度），**会话结束不自动恢复**；用户说“继续”→ 从暂停点续播；新歌替换；说“停止”丢弃。
+> - TTS 播放中按键打断 → 80ms 淡出 → **丢弃**（abort + 发 `interrupt` + 作废 sid）；语音打断 TTS 依赖 AEC + 开麦，归 T4.4b（尚未实现）。
+> - **C1 已上板（2026-11-11）**：按键起轮/打断 → 音乐暂停；回 IDLE 保持暂停；`ms resume` 从暂停点续播；新 track 替换暂停曲目。
+> **真机现象（2026-11-10，T4.4b 必须解决）**：音乐出声时唤醒词被掩蔽——设备混音音量 100/15/10 时 `afplay lexin.wav`（系统 45%、`-v 2`）都无法唤醒，**音量 0 才稳定唤醒**；语音打断需 `esp_aec`（SR/FD 模式），先 spike 再定。
 
 ### 8.5 断线重连
 
@@ -698,7 +699,7 @@ THINKING 超时（10s）───┘
 | `voice state` / `voice start` / `voice interrupt` / `voice wake on\|off` | 会话调试 |
 | **`music play <http(s)://...>` / `music stop` / `music stat`** | **T4.1 音乐探针**：`music play` 启动 `music_http` 拉流（URL 只接受 http(s)、长度 ≤ Kconfig），`music stat` 打印 `MUSICSTAT`（active/url_active/rate/ring/written/played/underruns/first_sound）与 `MUSICHTTP`（status/content_length/bytes/first_byte/connect/decoded/errors），`music stop` 丢弃 ring + 100ms 淡出；本探针仍**直接调播放器**，暂停/继续/切歌走 `ms` 命令或云端 `music_control` |
 | **`mc status` / `mc report` / `mc reset`** | **T4.2/T4.3 音乐协议观测（纯协议层）**：mid/have_mid/最近曲目/URL + 统计（track/control、过期与重复 mid、非法 URL/超长/非 mp3、`music_status` 与 `music_request` 发送成败）；`mc report` 用最近一次快照立即上报一次 `music_status`，`mc reset` 清统计 |
-| **`ms status` / `ms play <http(s)://...>` / `ms pause` / `ms resume` / `ms stop` / `ms request play [index]` / `ms reset`** | **T4.3 音乐会话观测/控制**：状态机（idle/playing/paused/stopped/error）、mid/进度/时长/标题/URL/**暂停原因（用户/语音抢占）** + 统计（起播/切歌/暂停/恢复/自动暂停/自动恢复/EOF/错误/resume 失败兜底/music_request 发送）；`ms pause` = 用户暂停 latch（会话结束不自动恢复），`ms request play [0]` 上行 `music_request` 探针 |
+| **`ms status` / `ms play <http(s)://...>` / `ms pause` / `ms resume` / `ms stop` / `ms request play [index]` / `ms reset`** | **T4.3 音乐会话观测/控制**：状态机（idle/playing/paused/stopped/error）、mid/进度/时长/标题/URL/**暂停原因（用户/语音抢占）** + 统计（起播/切歌/暂停/恢复/自动暂停/EOF/错误/resume 失败兜底/music_request 发送）；`ms pause` = 用户暂停 latch（会话结束不自动恢复），`ms request play [0]` 上行 `music_request` 探针 |
 
 日志 TAG 固定：`BOARD`、`AUDIO_IO`、`AFE`、`PLAYER`、`ENC`、`NET`、`WS`、`VC`、`VS`、`MC`、`MS`、`DEV`、`FB`（T3.6 异常反馈）、`DIAG`、`CFG`、`EVT`、`APP`（`APP` 属 `main/` 启动编排，`EVT` 属 `event_bus` 基础服务，均不占业务层级）。
 

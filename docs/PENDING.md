@@ -131,6 +131,17 @@
 | 关闭条件 | ①②③ 全过，数据写回 STATUS §5 |
 | 关联 | `components/music_session/music_session.c`（`s_resume_watch`/`ms_fallback_request`）、`docs/ARCHITECTURE.md` §8.3 已知限制、STATUS §1 下一步、T4.5 |
 
+### PV-016 · T4.4 C1 全量真机回归（音乐暂停保留 / 按键打断）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-11 20:5x（采样）**，C1 上板 smoke 后登记 |
+| 来源 | T4.4 C1 实现（删除 auto-resume、按键打断=语音丢弃/音乐暂停保留、`audio_player_voice_active()`） |
+| 已获得的部分证据 | 真机 C1 smoke **10/10**；`music_proto_test` **22/22**（G3 计时口径已修为“淡出走完再取冻结基线”）；`music_e2e_test` **63/63**（A–G，含 404）。smoke 详情：`ms play` → 按键（`evt post BUTTON`）起轮 → 音乐暂停（reason=2）→ `vs interrupt` 回 IDLE 后**仍暂停**、进度冻结（380→380）→ `ms resume` 从暂停点续播（380→590）→ 用户暂停 reason=1 → `ms resume` → 新歌替换暂停曲目。host **23/23+34/34+70/70** |
+| 待验证 | ① ~~e2e 全量~~ ✅ 63/63；② ~~proto 22 项~~ ✅ 22/22；③ **TTS 播放中按键打断**（80ms 淡出、`interrupt`、迟到帧丢弃）——未覆盖；④ 30 分钟音乐 + 每 2 分钟按键打断（underruns/任务数/堆）——未做；⑤ 回归 `voice_cloud_test` 43 项、`error_prompt_test` 289 项、`voice_test` 16/16——未跑 |
+| 验收方法 | 上板跑上述脚本；失败项逐条定位（区分环境/脚本/固件） |
+| 关闭条件 | ①~⑤ 全绿并记入 STATUS §5；若 TTS 按键打断路径不可用，登记缺陷 |
+| 关联 | `build/t44_contract.md` §2/§9.2、STATUS §3/§5 T4.4 C1 行、`components/voice_session/voice_session.c`（`vs_interrupt`） |
+
 ## 3. 待决定 / 已被暂缓（PD）
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）
@@ -176,10 +187,21 @@
 | 提出时间 | **2026-11-10 19:1x（采样）**，T4.3 实现时暴露 |
 | 来源 | 播放器仍是**单作业**模型：语音活跃期间到达的新 `music_track` 必须先排队，等 TTS/提示音结束（语音回 IDLE）才能起播，否则 `music_start()` 失败、重试窗口覆盖不了长 TTS 会误报 ERROR |
 | 现象/问题 | ① `mid` 在 `music_track` 被接受时（L3）即更新，排队期间上报的 `music_status` 可能**已经带新 mid**、state 还是旧的 playing/paused、progress=0；② 云端 `music_control{resume}` 在 TTS 播放中会把状态置 `playing`，但 PUMP 排在 TTS 之后才出声 → "上报 playing" 早于 "实际出声"。对"按 `mid` + progress 跟踪播放"的后端可能造成短暂不一致（不影响端侧听感） |
-| 处置方向（待定） | ① **推荐**：接受现状——T4.4 上"音乐继续播 + duck"叠加方案后，TTS 期间音乐不再让路，排队场景消失，问题自然收敛；② 排队期间上报新状态（如需协议加 `pending`/`buffering`）；③ 后端按 `state+progress` 判活，不依赖 mid↔出声严格同步 |
-| 为什么暂缓 | 属 T4.3 过渡实现的副作用，改协议/状态机的代价大于收益；T4.4 会改播放器叠加模型 |
-| 验证/关闭条件 | 真机 **PV-014 ⑥**（语音中说"下一首"）确认端侧行为可接受；**T4.4 定稿时**确认 overlay 后的时序并回写 PROTOCOL（或后端明确接受现状） |
+| 处置方向（待定） | ① **推荐**：接受现状——T4.4 定稿为 **pause 模式**（不做叠加），语音期间新 `music_track` 仍走单作业排队，但音乐本身已暂停；② 排队期间上报新状态（如需协议加 `pending`/`buffering`）；③ 后端按 `state+progress` 判活，不依赖 mid↔出声严格同步 |
+| **T4.4 C1 后状态（2026-11-11）** | **仍存在**：pause 模式不改变单作业排队；本次 C1 未改协议/状态机。T4.4b（语音打断）不会消除该排队（音乐仍暂停），建议按 ③ 由后端接受；若仍不可接受，另立协议改进任务 |
+| 为什么暂缓 | 属 T4.3 过渡实现的副作用，改协议/状态机的代价大于收益；先由后端按 `state+progress` 判活 |
+| 验证/关闭条件 | 真机 **PV-014 ⑥**（语音中说"下一首"）确认端侧行为可接受；**后端确认**按 `state+progress` 判活后关闭（或登记协议改进任务） |
 | 关联 | `components/music_session/music_session.c`（`s_track_pending`/`s_defer_pause_reason`）、ARCH §8.3「已知限制」、STATUS §3 T4.3 行、PV-014 |
+
+### PD-007 · T4.4b AEC 方案与内部 RAM 预算（spike 后拍板）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-11 20:5x（采样）**，T4.4 方案定稿（语音打断依赖 AEC）时登记 |
+| 来源 | 单麦 + 无模拟回采；音乐/TTS 回声掩蔽实测；`esp_aec` SR_LOW_COST ≈18.8KB 内部 + 64KB PSRAM、FD_LOW_COST ≈30.9KB 内部 + 90KB PSRAM |
+| 现象/问题 | 语音打断（TTS/音乐中喊唤醒词）必须 AEC + 开麦（R1 修订）；当前音乐期内部水位 24,563 B、预算余 7.6KB，AEC 直接加会破 440KB/30KB 两条线；需先搬 PSRAM（rbuf/WS RX/HTTP buffer/4 个非实时栈 ≈31KB）或放宽预算 |
+| 待决定 | ① AEC 模式（SR_LOW_COST / FD_LOW_COST）；② caps 是否全 PSRAM（省内部 RAM 但更慢）；③ 是否允许放宽 440KB/30KB 预算；④ 若 go/no-go 不达标，接受“仅近场/仅音乐/仅按键”的哪一种降级 |
+| 关闭条件 | C3 spike 产出内部/PSRAM 增量、单帧耗时、ERLE、音乐/TTS 中唤醒成功率（≥8/10）后，用户拍板并回写 ARCH §1/§5、CONVENTIONS §4、PRODUCT_IDEAS F5 |
+| 关联 | `build/t44_contract.md` §5/§5.3、ARCH §3.3 R1/R3、STATUS §1 阻塞项、PV-015（T4.5） |
 
 ### PD-002 · 断网没有独立的视觉/听觉反馈（设计缺口）
 | 项 | 内容 |
@@ -260,3 +282,4 @@
 | 2026-11-03 22:0x（采样） | 用户报告下发 TTS 有"嚓嚓"、提示音没有 → 测量定位为**电平差 7~10 dB**（TTS 峰值 -0.52 vs 提示音 -7.82 dBFS）+ VITS 噪底/高频偏多；mock 侧加峰值归一验证，端侧兜底登记 **PD-004** |
 | 2026-11-04 12:4x（采样） | 用户拍板：TTS **去掉 Piper、只用 Qwen3-TTS**，并要**不接开发板**的模块测试（ASR/TTS，后续 LLM）→ 当日落地：`mock_tts` 重写 + mock `--tts-qwen` 流式下发 + 新增 `tools/tts_test.py`、`tools/asr_test.py`；LLM 部分登记 **PD-005** |
 | 2026-11-04 14:2x（采样） | 用户给出 LLM 网关与 token（支持流式）→ 当日落地 `tools/llm_client.py` + `tools/llm_test.py` + mock `--llm`（ASR → LLM → Qwen3-TTS）；离线假客户端验证 269 帧/首帧 253ms；PD-005 主体完成，余多轮上下文/长度上限/TTS 按句流水线待定 |
+| 2026-11-11 20:3x→20:5x（采样） | 用户拍板 T4.4 改 **pause 模式**（音乐打断=暂停保留、不自动恢复；TTS=丢弃；按键保留）→ 完成 **C1** 并上板 smoke **10/10**；登记 **PV-016**（C1 全量回归）与 **PD-007**（AEC 方案/预算） |

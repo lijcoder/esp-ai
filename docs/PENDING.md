@@ -142,6 +142,18 @@
 | 关闭条件 | ①~⑤ 全绿并记入 STATUS §5；若 TTS 按键打断路径不可用，登记缺陷 |
 | 关联 | `build/t44_contract.md` §2/§9.2、STATUS §3/§5 T4.4 C1 行、`components/voice_session/voice_session.c`（`vs_interrupt`） |
 
+### PV-017 · WiFi/音乐负载时 BOD 掉压复位（2026-11-11）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-11 22:3x（采样）** |
+| 来源 | 用户报告“一直在重启”；串口抓取到 `E BOD: Brownout detector was triggered`，复位原因 `rst:0x8 (TG1WDT_SYS_RST)` / `rst:0x3 (RTC_SW_SYS_RST)` |
+| 现象/问题 | 上电/WiFi 关联/（偶发）音乐开始时 5V 掉压 → BOD 复位；复位后再次 WiFi 关联 → 循环。**回退到 C1 固件（commit `ae049f7`）仍复现**，与本轮 C2/C3 固件改动无关；此前 PV-009 已记录 USB Hub 供电下 WiFi 发射瞬间掉压 |
+| 已获得的证据 | 串口逐字：`E BOD: Brownout detector was triggered` 紧接 `ESP-ROM`/`rst:0x8`；C1/C2/C3 固件均出现；静置（WiFi 已连、无音乐）可稳定数十秒 |
+| 验收方法 | ① 换 Mac 直连 USB 口（不经 Hub）/带供电 Hub/5V≥2A 电源；② 换短而粗的 USB 线；③ 复测上电→WiFi→播放音乐 60s、连续 10 次音乐起播，`sys info` 不再出现 BOD/TG1WDT；④ 记录 `rst` 原因与运行时长 |
+| 关闭条件 | 上述供电更换后，WiFi+音乐连续 30min 无 BOD/复位；`sys info` 复位原因仅为 POWERON/SW |
+| 关联 | STATUS §1 阻塞项、PV-009（历史 BOD）、HARDWARE §5 电源、`docs/PENDING.md` 时间线 |
+| 临时处置 | 已回退组件代码到 C1（`ae049f7`），恢复音量 60；等电源问题解决后再评估是否重新应用 C2/C3 |
+
 ## 3. 待决定 / 已被暂缓（PD）
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）

@@ -37,4 +37,13 @@ menu "Diagnostics"
         default 524288
         range 16384 2097152
 
+    config DIAG_ENABLE_AEC_TEST
+        bool "启用 AEC spike 探针（仅开发期，T4.4b）"
+        default n
+        help
+            编译进 `aec test [sr|fd] [psram|internal] [frames]`：创建一个 esp_aec 实例，
+            用合成参考/回声跑 ERLE 与单帧耗时，并打印内部 RAM/PSRAM 增量。
+            用于 PD-007 的 AEC 可行性评估（内存/CPU/算法基本正确性）。
+            **量产固件必须关闭**（默认 n；本地 sdkconfig 临时开启）。
+
 endmenu

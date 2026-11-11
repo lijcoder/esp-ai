@@ -19,6 +19,9 @@
 #include "codec_enc.h"
 #include "config_store.h"
 #include "dev_ctrl.h"
+#if CONFIG_DIAG_ENABLE_AEC_TEST
+#include "esp_aec.h"
+#endif
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_console.h"
@@ -2574,6 +2577,172 @@ static int cmd_player(int argc, char **argv)
 }
 
 #endif /* CONFIG_DIAG_ENABLE_PLAYER_TEST */
+#if CONFIG_DIAG_ENABLE_AEC_TEST
+/* ---------------- T4.4b AEC spike（dev-only，合成回声） ----------------
+ * 目的：先回答 PD-007 的“资源 + 基本正确性”，不接真实参考信号：
+ *   - 用 esp_aec 直连 API（caps 可选 PSRAM/内部），量创建前后内部 RAM/PSRAM 增量；
+ *   - 合成 1kHz 参考 + 10ms 延迟/0.4 增益的回声作为 mic，跑 N 帧量 ERLE 与单帧耗时；
+ *   - 销毁后量内存是否回落（验证无泄漏）。
+ * 真实声学效果（音乐/TTS 中唤醒率）还需要 C3 的真实参考 spike。
+ */
+#define AEC_TEST_RATE  16000
+#define AEC_TEST_DELAY 160 /* 10ms 声学延迟（160 样本 @16k） */
+
+static int cmd_aec(int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "test") != 0) {
+        printf("用法: aec test [sr|fd] [psram|internal] [frames]\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char *mode_s = (argc > 2) ? argv[2] : "sr";
+    const char *caps_s = (argc > 3) ? argv[3] : "psram";
+    int frames = (argc > 4) ? atoi(argv[4]) : 600;
+    if (frames < 50) {
+        frames = 50;
+    }
+    if (frames > 5000) {
+        frames = 5000;
+    }
+
+    aec_mode_t mode;
+    if (strcmp(mode_s, "sr") == 0) {
+        mode = AEC_MODE_SR_LOW_COST;
+    } else if (strcmp(mode_s, "fd") == 0) {
+        mode = AEC_MODE_FD_LOW_COST;
+    } else {
+        printf("未知模式: %s（sr|fd）\n", mode_s);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strcmp(caps_s, "internal") == 0) {
+        /* 实测：caps=INTERNAL 在音乐/语音运行期会 OOM → 触发重启；本探针只支持 PSRAM */
+        printf("AECTEST internal caps 实测不可用（OOM/重启），请用 psram\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+
+    const size_t in_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t ps_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    aec_config_t cfg = {
+        .mic_num = 1,
+        .ref_num = 1,
+        .out_num = 1,
+        .filter_length = 4,
+        .sample_rate = AEC_TEST_RATE,
+        .caps = caps,
+        .mode = mode,
+        .nlp_level = AEC_NLP_LEVEL_AGGR,
+    };
+    aec_handle_t *aec = aec_create_from_config(&cfg);
+    if (aec == NULL) {
+        printf("AECTEST create failed（mode=%s caps=%s）\n", mode_s, caps_s);
+        return ESP_FAIL;
+    }
+    const int n = aec_get_chunksize(aec);
+    const size_t in_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t ps_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    int16_t *mic = heap_caps_aligned_alloc(16, (size_t)n * sizeof(int16_t),
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *ref = heap_caps_aligned_alloc(16, (size_t)n * sizeof(int16_t),
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *out = heap_caps_aligned_alloc(16, (size_t)n * sizeof(int16_t),
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *delay = heap_caps_malloc((size_t)AEC_TEST_DELAY * sizeof(int16_t),
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!mic || !ref || !out || !delay) {
+        printf("AECTEST buffer alloc failed\n");
+        heap_caps_free(mic);
+        heap_caps_free(ref);
+        heap_caps_free(out);
+        heap_caps_free(delay);
+        aec_destroy(aec);
+        return ESP_ERR_NO_MEM;
+    }
+    memset(delay, 0, (size_t)AEC_TEST_DELAY * sizeof(int16_t));
+
+    /* 1kHz @16k：16 点正弦表（避免逐样本 sin） */
+    static const int16_t sine16[16] = {0,     3062,  5655,  7471,  8000,  7471,  5655,  3062,
+                                       0,     -3062, -5655, -7471, -8000, -7471, -5655, -3062};
+    uint32_t gpos = 0;
+    uint32_t dpos = 0;
+    uint64_t sum_in = 0;
+    uint64_t sum_out = 0;
+    uint32_t measured = 0;
+    int64_t us_sum = 0;
+    int64_t us_max = 0;
+    int slow = 0;
+    int timed = 0;
+    const int from = frames / 6;
+    const int to = frames / 2;
+
+    for (int f = 0; f < frames; f++) {
+        for (int i = 0; i < n; i++) {
+            const int16_t r = sine16[(gpos + (uint32_t)i) & 15u];
+            ref[i] = r;
+            const int16_t echo = delay[dpos];
+            delay[dpos] = r;
+            dpos = (dpos + 1u) % AEC_TEST_DELAY;
+            /* 回声 = 0.4 × 延迟参考（约 -8dB）；mic 里没有近端人声，测纯 ERLE */
+            mic[i] = (int16_t)((int32_t)echo * 2 / 5);
+        }
+        gpos += (uint32_t)n;
+
+        const int64_t t0 = esp_timer_get_time();
+        aec_process(aec, mic, ref, out);
+        const int64_t dt = esp_timer_get_time() - t0;
+        /* 前 10 帧含首次调用/缓存冷启动，不计入耗时统计 */
+        if (f >= 10) {
+            us_sum += dt;
+            if (dt > us_max) {
+                us_max = dt;
+            }
+            if (dt > 5000) {
+                slow++;
+            }
+            timed++;
+        }
+
+        if (f >= from && f < to) {
+            for (int i = 0; i < n; i++) {
+                const int32_t m = mic[i];
+                const int32_t o = out[i];
+                sum_in += (uint64_t)(m * m);
+                sum_out += (uint64_t)(o * o);
+            }
+            measured += (uint32_t)n;
+        }
+    }
+
+    const size_t in_created = in_before - in_after;
+    const size_t ps_created = ps_before - ps_after;
+    printf("AECTEST mode=%s caps=%s chunksize=%d frames=%d\n", mode_s, caps_s, n, frames);
+    printf("AECTEST internal_delta=%d B psram_delta=%d B\n", (int)in_created, (int)ps_created);
+    printf("AECTEST frame_us avg=%d max=%d timed=%d slow_gt5ms=%d\n",
+           (int)(us_sum / (timed > 0 ? timed : 1)), (int)us_max, timed, slow);
+    if (sum_out == 0) {
+        printf("AECTEST erle_db=inf（输出全零）\n");
+    } else {
+        const double erle = 10.0 * log10((double)sum_in / (double)sum_out);
+        printf("AECTEST erle_db=%.1f（measured=%u samples）\n", erle, (unsigned)measured);
+    }
+
+    heap_caps_free(mic);
+    heap_caps_free(ref);
+    heap_caps_free(out);
+    heap_caps_free(delay);
+    aec_destroy(aec);
+
+    const size_t in_end = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t ps_end = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    printf("AECTEST after_destroy internal_free=%d psram_free=%d（before internal=%d psram=%d）\n",
+           (int)in_end, (int)ps_end, (int)in_before, (int)ps_before);
+    printf("AECTEST done\n");
+    return ESP_OK;
+}
+#endif /* CONFIG_DIAG_ENABLE_AEC_TEST */
+
+
 
 /* ---------------- 堆水位周期监控（默认关闭） ---------------- */
 
@@ -2698,6 +2867,14 @@ static esp_err_t register_commands(void)
             .hint = "info",
             .func = cmd_prompt,
         },
+#if CONFIG_DIAG_ENABLE_AEC_TEST
+        {
+            .command = "aec",
+            .help = "AEC spike（T4.4b，仅开发期）：aec test [sr|fd] [psram|internal] [frames]",
+            .hint = "test",
+            .func = cmd_aec,
+        },
+#endif
 #if CONFIG_DIAG_ENABLE_PLAYER_TEST
         {
             .command = "music",

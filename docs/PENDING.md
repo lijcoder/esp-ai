@@ -199,7 +199,8 @@
 | 提出时间 | **2026-11-11 20:5x（采样）**，T4.4 方案定稿（语音打断依赖 AEC）时登记 |
 | 来源 | 单麦 + 无模拟回采；音乐/TTS 回声掩蔽实测；`esp_aec` SR_LOW_COST ≈18.8KB 内部 + 64KB PSRAM、FD_LOW_COST ≈30.9KB 内部 + 90KB PSRAM |
 | 现象/问题 | 语音打断（TTS/音乐中喊唤醒词）必须 AEC + 开麦（R1 修订）；当前音乐期内部水位 24,563 B、预算余 7.6KB，AEC 直接加会破 440KB/30KB 两条线；需先搬 PSRAM（rbuf/WS RX/HTTP buffer/4 个非实时栈 ≈31KB）或放宽预算 |
-| 待决定 | ① AEC 模式（SR_LOW_COST / FD_LOW_COST）；② caps 是否全 PSRAM（省内部 RAM 但更慢）；③ 是否允许放宽 440KB/30KB 预算；④ 若 go/no-go 不达标，接受“仅近场/仅音乐/仅按键”的哪一种降级 |
+| 已获得的部分证据（2026-11-11 spike） | `diag aec test`（合成回声，590 帧计入耗时）：**SR_LOW_COST + PSRAM caps：内部 +12,576 B / PSRAM +69,716 B / avg 2.64ms、max 4.82ms（无 >5ms 帧）/ ERLE 59.7dB**；**FD_LOW_COST：内部 +12,660 B / PSRAM +108,692 B / avg 6.90ms、max 10.80ms（590/590 帧 >5ms）/ ERLE 65.2dB**；**caps=INTERNAL 实测 OOM→重启，不可用**。销毁后内部/PSRAM 均回落（无泄漏）。结论：AEC 必须 PSRAM caps，但内部仍要 ~12.6KB → **必须先做 C2 PSRAM 搬迁**（`music_http`/`ws` 栈 + `rbuf` + WS RX + HTTP buffer ≈21KB）才能进预算；SR 的 CPU 可接受，FD 需在真实音乐/TTS 负载下复测 |
+| 待决定 | ① AEC 模式（SR_LOW_COST / FD_LOW_COST）；② 是否允许放宽 440KB/30KB 预算；③ 若真实参考（C3）go/no-go 不达标，接受“仅近场/仅音乐/仅按键”的哪一种降级；④ C2 是否搬 `vc` 栈（8KB，Opus 实时路径，风险较高） |
 | 关闭条件 | C3 spike 产出内部/PSRAM 增量、单帧耗时、ERLE、音乐/TTS 中唤醒成功率（≥8/10）后，用户拍板并回写 ARCH §1/§5、CONVENTIONS §4、PRODUCT_IDEAS F5 |
 | 关联 | `build/t44_contract.md` §5/§5.3、ARCH §3.3 R1/R3、STATUS §1 阻塞项、PV-015（T4.5） |
 

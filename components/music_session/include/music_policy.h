@@ -1,10 +1,11 @@
 /*
  * music_policy —— `music_session` 的**纯逻辑**（无 IDF 依赖，可 host 单测）。
  *
- * 拆出来的原因：暂停抢占/自动恢复、mid 过滤、控制动作应用、resume 兜底这些决策最容易写错，
+ * 拆出来的原因：暂停抢占、mid 过滤、控制动作应用、resume 兜底这些决策最容易写错，
  * 而它们不依赖 FreeRTOS/esp_timer/播放器；`music_session.c` 只负责"什么时候调用/怎么执行"。
  *
- * 契约来源：build/t43_contract.md §3/§4/§5。
+ * 契约来源：build/t43_contract.md §3/§4/§5；T4.4（2026-11-11）把"语音回 IDLE 自动恢复"
+ * 改为**保持暂停**（pause 模式）：音乐被语音/按键打断后不自动续播，等用户明确说"继续"。
  *   - 状态数值与 `mc_state_t` 一致（IDLE=0/PLAYING=1/PAUSED=2/STOPPED=3/ERROR=4）；
  *   - pause_reason：0=无、1=用户、2=语音抢占；
  *   - 语音状态数值与 `vs_state_t` 一致（0=IDLE、1=LISTENING、2=THINKING、3=SPEAKING、
@@ -57,14 +58,8 @@ static inline bool ms_policy_auto_pause(uint8_t music_state, uint8_t pause_reaso
            pause_reason != MS_POLICY_REASON_USER;
 }
 
-/* 语音回 IDLE 时是否要 auto-resume：
- * 只有"因语音抢占而暂停"（reason=2）才恢复；用户暂停（reason=1）保持暂停。 */
-static inline bool ms_policy_auto_resume(uint8_t music_state, uint8_t pause_reason,
-                                         uint8_t voice_state, bool enabled)
-{
-    return enabled && music_state == MS_POLICY_STATE_PAUSED && pause_reason == MS_POLICY_REASON_VOICE &&
-           !ms_policy_voice_active(voice_state);
-}
+/* T4.4（2026-11-11 用户定稿）：语音回 IDLE **不自动恢复**音乐（pause 模式）。
+ * 这里不再提供 auto-resume 策略；显式"继续"由 music_session 的 resume 命令处理。 */
 
 /* ---- mid 过滤（P-3）：music_track 只接受更新；music_control 允许同 mid，只丢更旧 ---- */
 typedef enum {

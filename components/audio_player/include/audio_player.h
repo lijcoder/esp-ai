@@ -43,6 +43,14 @@ esp_err_t audio_player_play_pcm(const int16_t *pcm, size_t samples, uint32_t sam
 /* 是否有播放任务在进行（含队列中的任务；流式播放期间为 true） */
 bool audio_player_is_busy(void);
 
+/**
+ * @brief 当前是否在播"语音类"内容（提示音 / 整段 MP3 / TTS 流），不含音乐泵（T4.4）
+ *
+ * 给 `voice_session` 的按键打断用：语音在播 → 淡出丢弃；只有音乐在播 → 暂停保留。
+ * 非阻塞、任意任务可调用；player 任务空闲或只持有 PUMP（音乐）作业时为 false。
+ */
+bool audio_player_voice_active(void);
+
 /* ---------------- MP3 解码播放（T2.3，minimp3） ----------------
  * 状态与 PCM 缓冲在 audio_player_init() 里一次性分配到 PSRAM（播放任务内禁止 malloc）；
  * 同一时刻只允许一段 MP3（解码输出复用同一块 PSRAM 缓冲），播放中再调用返回

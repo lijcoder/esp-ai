@@ -771,7 +771,7 @@ static void vs_on_wake(void)
         return;
     }
 
-    /* 音乐播放中唤醒不再在这里淡出：暂停/自动恢复归 music_session（契约 §4）。 */
+    /* 音乐播放中唤醒不再在这里淡出：暂停/保持暂停归 music_session（T4.4 pause 模式）。 */
 
     const prompt_clip_t *wake_clip = prompt_assets_get(PROMPT_WAKE_OK);
     if (wake_clip == NULL || wake_clip->pcm == NULL || wake_clip->samples == 0) {
@@ -1030,16 +1030,25 @@ esp_err_t vs_interrupt(void)
         return ESP_OK;
     }
 
-    /* R4：① 播放通道淡出（请求在这里、执行在 player 任务，80ms 见 Kconfig）；
-     *     ② 给云端发 interrupt 报文并作废本轮（vc_interrupt）；
-     *     ③ R5：恢复收音前先置 50ms 丢弃窗口（若提示音/TTS 还压着 PROMPT/TTS 位，
+    /* R4（T4.4 修订）：
+     *     ① 语音类内容在播（提示音/TTS/整段 MP3）→ 播放通道淡出并丢弃；
+     *     ② 只有音乐在播 → **暂停并保留**（不清 ring/进度，语义同语音打断）；
+     *     ③ 给云端发 interrupt 报文并作废本轮（vc_interrupt）；
+     *     ④ R5：恢复收音前先置 50ms 丢弃窗口（若提示音/TTS 还压着 PROMPT/TTS 位，
      *        则由各自完成回调释放后自动开窗）；
-     *     ④ 回 IDLE。提示音/TTS 的 hold 位由播放完成回调释放，这里不抢着释放，
-     *        否则淡出的尾音会被麦克风拾进 AFE。 */
-    if (audio_player_is_busy()) {
+     *     ⑤ 回 IDLE。 */
+    if (audio_player_voice_active()) {
         esp_err_t ferr = audio_player_fade_out_and_stop(CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS);
         if (ferr != ESP_OK) {
             ESP_LOGW(TAG, "淡出请求失败（%s），按立即打断处理", esp_err_to_name(ferr));
+        }
+    } else if (audio_player_music_active() && !audio_player_music_paused()) {
+        /* T4.4：按键打断音乐 = 暂停保留（用户可再说"继续"从暂停点续播） */
+        esp_err_t perr = audio_player_music_pause(CONFIG_AUDIO_PLAYER_INTERRUPT_FADE_MS);
+        if (perr != ESP_OK && perr != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "音乐暂停请求失败（%s）", esp_err_to_name(perr));
+        } else {
+            ESP_LOGI(TAG, "按键打断：音乐暂停保留（可从暂停点续播）");
         }
     }
     audio_fe_feed_discard_ms(CONFIG_AUDIO_FE_RESUME_DISCARD_MS);

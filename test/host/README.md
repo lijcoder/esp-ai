@@ -7,8 +7,9 @@
    覆盖坏包用例（固件启动降级路径的前置条件）；
 2. **异常反馈映射**（T3.6，`components/feedback/include/feedback_policy.h`）：
    `fb_kind_from_cloud_code()`（3001/3002 → `tts-fail`，其余 → `cloud-error`）与 `fb_kind_t` 数值契约；
-3. **音乐编排决策**（T4.3，`components/music_session/include/music_policy.h`）：
-   语音抢占 auto-pause/auto-resume、pause_reason 优先级（用户 > 语音）、`mid` accept/stale/dup、
+3. **音乐编排决策**（T4.3/T4.4，`components/music_session/include/music_policy.h`）：
+   语音抢占 auto-pause、语音回 IDLE 保持暂停（T4.4 pause 模式，无 auto-resume）、
+   pause_reason 优先级（用户 > 语音）、`mid` accept/stale/dup、
    `music_control` 应用结果、resume 失败兜底判定与状态迁移表。
 
 > 提示音资源的**内容**（时长/峰值/首尾静音）现在由 `tools/audio_pack.py --check` 与 `prompt_gen.py`

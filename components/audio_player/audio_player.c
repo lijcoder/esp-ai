@@ -1850,6 +1850,14 @@ bool audio_player_is_busy(void)
     return s_busy;
 }
 
+bool audio_player_voice_active(void)
+{
+    /* PUMP 作业 = 音乐（或探针）泵，不算语音；PCM/MP3/STREAM 才算语音。
+     * 只读一个 volatile 标志：打断路径对几十微秒的竞态不敏感，且调用方（evt 任务）
+     * 不允许阻塞在 player 的临界区上。 */
+    return s_busy && !s_mix_pump_job;
+}
+
 bool audio_player_mp3_ready(void)
 {
     return mp3_dec_ready();

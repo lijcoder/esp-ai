@@ -3,7 +3,8 @@
 ## 作用
 
 音乐播放的**状态机与抢占编排**：起播/暂停/继续/停止/切歌、`music_request` 兜底、
-与语音会话的抢占（语音活跃时暂停让路、回 IDLE 自动恢复）、`music_status` 周期上报与 EOF 探测。
+与语音会话的抢占（语音活跃时暂停让路、**回 IDLE 保持暂停**，T4.4 pause 模式）、
+`music_status` 周期上报与 EOF 探测。
 协议解析归 L3 `music_cloud`，播放引擎归 L2 `audio_player`；本组件**不建任务**，只用两个 `esp_timer`。
 
 ## 对外接口
@@ -20,7 +21,7 @@
 | `ms_info_read()` | 快照：state/mid/have_mid/progress/duration/url/title/pause_reason/paused |
 | `ms_stats_read()/reset()` | 迁移/曲目/起播失败/暂停/继续/抢占/停止/EOF/兜底等统计 |
 
-纯逻辑（auto-pause/auto-resume、pause_reason 合并、mid 过滤、control 应用、兜底判定）
+纯逻辑（auto-pause、pause_reason 合并、mid 过滤、control 应用、兜底判定）
 在 `include/music_policy.h`，无 IDF 依赖，由 `test/host/music_policy_test.c` 覆盖。
 
 ## 状态机
@@ -30,7 +31,7 @@
 | IDLE → PLAYING | `music_track` 起播成功 / `ms_play()` |
 | PLAYING → PLAYING | 新 `music_track`（切歌：先 stop 再 play，`MS_PLAY_RETRY_MS × MS_PLAY_MAX_RETRIES`） |
 | PLAYING → PAUSED | 用户 pause / 语音抢占（pause_reason=1/2） |
-| PAUSED → PLAYING | 用户 resume / 语音回 IDLE 的自动恢复（仅 reason=2） |
+| PAUSED → PLAYING | 用户 resume（显式“继续”）；T4.4 起语音回 IDLE **不再**自动恢复 |
 | PLAYING/PAUSED → STOPPED | `music_control{stop}` / `ms_stop()` / EOF（非暂停态） |
 | PLAYING → ERROR | HTTP/解码失败、起播重试耗尽；同时投 `APP_EVT_MUSIC_ERROR` |
 | PAUSED → STOPPED | 暂停中 stop（丢弃 ring） |
@@ -42,14 +43,15 @@
 
 - 订阅 `APP_EVT_VOICE_STATE_CHANGED`（同层经 event_bus，不改 `voice_session`）；
 - 语音进入 LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR → 音乐 PLAYING 且非用户暂停时 auto-pause；
-- 语音回 IDLE 且 `pause_reason==2` → auto-resume；`pause_reason==1`（用户暂停）保持暂停；
+- 语音回 IDLE **保持暂停**（T4.4 pause 模式，用户 2026-11-11 定稿）：不自动续播，
+  等用户说“继续”（`music_control{resume}`）或点新歌；
 - 云端 `music_control{pause}` = 用户暂停 latch（reason=1）；`{resume}` 清 latch（语音仍活跃也允许，
   PUMP 会排在 TTS 作业之后）；
-- 不改 duck/R3 参数（T4.4 做叠加），不关麦。
+- 不做 duck/叠加（T4.4 定稿走暂停保留，duck 留作后续体验模式），不关麦。
 
 ## 配置
 
-`MS_PAUSE_FADE_MS`（100）、`MS_AUTO_PAUSE_ON_VOICE`（y）、`MS_AUTO_RESUME_ON_IDLE`（y）、
+`MS_PAUSE_FADE_MS`（100）、`MS_AUTO_PAUSE_ON_VOICE`（y）、
 `MS_RESUME_FALLBACK_REQUEST`（y）、`MS_STATUS_PERIOD_MS`（5000）、`MS_PLAY_RETRY_MS`（120）、
 `MS_PLAY_MAX_RETRIES`（15）、`MS_EOF_GUARD_MS`（1500，T4.2 保护窗口迁移）。
 

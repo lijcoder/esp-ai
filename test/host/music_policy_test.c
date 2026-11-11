@@ -1,8 +1,8 @@
 /*
  * music_policy_test —— 音乐编排纯逻辑的 host 单测（不依赖 ESP-IDF）。
  *
- * 契约来源：build/t43_contract.md §3/§4/§5
- *   - 语音活跃态 → auto-pause；语音回 IDLE 且 pause_reason=2 → auto-resume；
+ * 契约来源：build/t43_contract.md §3/§4/§5、build/t44_contract.md §2/§4
+ *   - 语音活跃态 → auto-pause；语音回 IDLE **保持暂停**（T4.4 pause 模式，无 auto-resume）；
  *   - pause_reason 优先级：用户（1）> 语音抢占（2）；
  *   - mid 过滤：music_track 只接受更新（同 mid 重复）；music_control 允许同 mid，只丢更旧；
  *   - music_control 应用结果（pause/resume/stop 与当前状态的组合）；
@@ -34,7 +34,7 @@ static void check(bool ok, const char *what)
 
 int main(void)
 {
-    printf("===== T4.3 host 单测：music_policy（暂停抢占/自动恢复/mid/控制/兜底）=====\n");
+    printf("===== T4.3/T4.4 host 单测：music_policy（暂停抢占/保持暂停/mid/控制/兜底）=====\n");
 
     /* 状态/pause_reason 数值是 ms_info_t 与事件 payload 的契约（契约 §7） */
     check(MS_POLICY_STATE_IDLE == 0 && MS_POLICY_STATE_PLAYING == 1 &&
@@ -74,19 +74,8 @@ int main(void)
     check(!ms_policy_auto_pause(MS_POLICY_STATE_STOPPED, MS_POLICY_REASON_NONE, 3, true),
           "不 auto-pause：stopped");
 
-    /* auto-resume：仅 PAUSED + reason=语音 + 语音回 IDLE + 开关打开 */
-    check(ms_policy_auto_resume(MS_POLICY_STATE_PAUSED, MS_POLICY_REASON_VOICE, 0, true),
-          "auto-resume：paused + reason=2 + IDLE");
-    check(!ms_policy_auto_resume(MS_POLICY_STATE_PAUSED, MS_POLICY_REASON_VOICE, 5, true),
-          "不 auto-resume：语音仍活跃（FOLLOW_UP）");
-    check(!ms_policy_auto_resume(MS_POLICY_STATE_PAUSED, MS_POLICY_REASON_USER, 0, true),
-          "不 auto-resume：用户暂停（reason=1）");
-    check(!ms_policy_auto_resume(MS_POLICY_STATE_PLAYING, MS_POLICY_REASON_NONE, 0, true),
-          "不 auto-resume：本来就在 playing");
-    check(!ms_policy_auto_resume(MS_POLICY_STATE_PAUSED, MS_POLICY_REASON_VOICE, 0, false),
-          "不 auto-resume：Kconfig 关闭");
-    check(!ms_policy_auto_resume(MS_POLICY_STATE_ERROR, MS_POLICY_REASON_VOICE, 0, true),
-          "不 auto-resume：error");
+    /* T4.4（2026-11-11 用户定稿）：语音回 IDLE **不自动恢复**音乐（pause 模式）。
+     * 这里不再有 auto-resume 策略；显式"继续"走 music_control，不在此纯逻辑层判定。 */
 
     /* pause_reason 优先级：用户 > 语音 */
     check(ms_policy_pause_reason_merge(0, 0) == 0, "merge(0,0)=0");

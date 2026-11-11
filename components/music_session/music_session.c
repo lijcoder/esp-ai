@@ -756,7 +756,7 @@ static esp_err_t ms_pause_internal(uint8_t reason, uint32_t fade_ms)
 
     if (cur == MC_STATE_PAUSED) {
         if (resume_pending) {
-            (void)ms_cancel_cmd(MS_CMD_RESUME); /* 语音又活跃：撤销排队中的自动恢复 */
+            (void)ms_cancel_cmd(MS_CMD_RESUME); /* 语音又活跃：撤销排队中的显式续播 */
         }
         portENTER_CRITICAL(&s_mux);
         s_pause_reason = ms_policy_pause_reason_merge(s_pause_reason, reason);
@@ -920,10 +920,10 @@ static void ms_on_voice_state(void *arg, app_evt_t evt, const app_evt_data_t *da
         return;
     }
 
-    if (ms_policy_auto_resume(cur, reason, to, CONFIG_MS_AUTO_RESUME_ON_IDLE)) {
-        ESP_LOGI(TAG, "语音回 IDLE → auto-resume（从暂停点续播）");
-        (void)ms_resume_internal();
-    }
+    /* T4.4（用户 2026-11-11 定稿）：语音回 IDLE **不再自动恢复**音乐——打断后音乐保持暂停，
+     * 等用户明确说"继续"（`music_control{resume}`）或点新歌时再动。
+     * 这里唯一保留的是"语音期间排队的显式续播"（上面 defer_resume 分支）。 */
+    ESP_LOGD(TAG, "语音回 IDLE：音乐保持暂停（T4.4 pause 模式，不自动恢复）");
 }
 
 /* ---------------- 对外 API ---------------- */

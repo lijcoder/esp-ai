@@ -1062,7 +1062,7 @@ uv run tools/music_e2e_test.py \
 | 场景 | 断言 |
 |---|---|
 | A 点歌 | 唤醒 → 「放首歌」出声（mid≥1）、`music_status` 同状态 ~5s 一条、`ms.mid`/`mc.track` 一致 |
-| B 唤醒抢占 | 音乐播放中唤醒 → `paused reason=voice`、progress 冻结；轮次结束自动恢复且进度接续 |
+| B 唤醒抢占 | 音乐播放中唤醒 → `paused reason=voice`、progress 冻结；T4.4 起回 IDLE **保持暂停**（不再自动恢复），脚本用 console `ms resume` 收尾并断言进度接续 |
 | C 暂停/继续 | 语音「暂停」→ 暂停 + 冻结 + 用户 latch；「继续」→ 从暂停点续播、**确认语无 tts-fail** |
 | D latch | 用户暂停后普通问答结束仍暂停，再说「继续」恢复 |
 | E 切歌/停止 | 「下一首」mid 递增、新 track 起播；「停止」→ stopped 且上报 |

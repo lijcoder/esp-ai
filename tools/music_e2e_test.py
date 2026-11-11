@@ -7,7 +7,7 @@
 
 一条命令完成：
   起 mock（`--music --asr sensevoice`）→ 复位设备 → 回放唤醒词 + 语音指令 →
-  断言「点歌出声 / music_status 周期上报 / 暂停冻结 / 继续不从头 / 唤醒自动暂停与会后恢复 /
+  断言「点歌出声 / music_status 周期上报 / 暂停冻结 / 继续不从头 / 唤醒自动暂停与会后保持暂停 /
   用户暂停 latch / 切歌 / 停止 / 资源不泄漏 / 错误路径不崩」→ 汇总 PASS/FAIL。
 
 为什么需要本脚本：T4.2/T4.3 只有 host 单测（`test/host/music_policy_test` 76/76）与构建证据，
@@ -25,8 +25,8 @@
     uv run tools/music_e2e_test.py --music-url ... --dry-run        # 只检查素材/串口/指令
 
 注意：**音乐播放时唤醒会被音乐掩蔽**（实测设备混音音量 100/15/10 均无法唤醒，0 才能稳定唤醒）。
-这是 T4.4「音乐 ducking + 音乐播放中唤醒」要解决的问题；本脚本默认 `--player-volume 0`
-（音乐管线照常跑、状态机行为不变），只验证 T4.2/T4.3 的协议与控制逻辑。
+这是 T4.4「语音打断 + 音乐暂停保留」要解决的问题；本脚本默认 `--player-volume 0`
+（音乐管线照常跑、状态机行为不变），只验证 T4.2/T4.3/T4.4 的协议与控制逻辑。
 """
 
 from __future__ import annotations
@@ -297,7 +297,7 @@ class Harness:
         return info
 
     def wake_only(self, timeout: float = 40.0) -> dict:
-        """只唤醒不说话：用于「唤醒自动暂停 → 会后自动恢复」。"""
+        """只唤醒不说话：用于「唤醒自动暂停 → 会后保持暂停（T4.4）」。"""
         return self.voice_round(None, timeout)
 
     def ms_state_ts(self) -> dict[str, float]:
@@ -353,7 +353,7 @@ def scenario_point_song(h: Harness, cmds: dict[str, str], mock: Mock) -> None:
 
 
 def scenario_auto_pause(h: Harness) -> dict:
-    print("\n[B] 唤醒自动暂停 + 会后自动恢复")
+    print("\n[B] 唤醒自动暂停 + 会后保持暂停（T4.4 pause 模式）")
     before = h.ms_info()
     h.r.check(before is not None and before["state"] == "playing", "B0 前置：音乐在播")
     mark = h.dev.mark()
@@ -373,14 +373,20 @@ def scenario_auto_pause(h: Harness) -> dict:
     if paused:
         h.r.check(paused["reason"] == 2, f"B3 暂停原因=语音抢占（reason={paused['reason']}）")
         h.r.check(paused["paused"] == 1, "B4 paused 标志置位")
-    # 不说话 → 轮次由静音收尾 → 回 IDLE → 自动恢复
+    # 不说话 → 轮次由静音收尾 → 回 IDLE；T4.4：不再自动恢复，保持暂停
     h.dev.wait_line(RE_ROUND_DONE, 30.0, mark)
-    resumed = h.wait_music_playing(20.0)
-    h.r.check(resumed is not None, f"B5 语音回 IDLE 后自动恢复播放（{resumed}）")
-    if resumed and paused:
-        h.r.check(resumed["progress"] >= frozen,
-                  f"B6 从暂停点继续（{frozen} → {resumed['progress']} ms）")
-    return resumed or {}
+    time.sleep(2.0)
+    still = h.ms_info()
+    h.r.check(still is not None and still["state"] == "paused",
+              f"B5 语音回 IDLE 后保持暂停（{still}）")
+    if still and paused:
+        h.r.check(still["progress"] == frozen,
+                  f"B6 暂停期间 progress 冻结（{frozen} → {still['progress']} ms）")
+    # 收尾：console 恢复，供后续场景从 playing 开始
+    h.dev.console("ms resume", END_CMD, 1.5)
+    playing = h.wait_music_playing(10.0)
+    h.r.check(playing is not None, f"B7 console 恢复播放（{playing}）")
+    return playing or {}
 
 
 def scenario_pause_resume(h: Harness, cmds: dict[str, str], mock: Mock) -> None:

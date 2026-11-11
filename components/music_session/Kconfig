@@ -15,14 +15,8 @@ menu "Music Session (音乐控制 T4.3)"
         help
             契约 §4：语音进入 LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR 时，
             音乐 PLAYING 且不是用户暂停 → auto-pause（pause_reason=2）。
-            T4.4 会改成叠加 + duck，本开关届时可关闭。
-
-    config MS_AUTO_RESUME_ON_IDLE
-        bool "语音回 IDLE 时自动恢复因语音抢占而暂停的音乐"
-        default y
-        help
-            只有 pause_reason=2（语音抢占）才自动恢复；用户暂停（reason=1）
-            必须保持暂停，不得被覆盖。
+            T4.4（2026-11-11 用户定稿）走 pause 模式：语音回 IDLE 不自动恢复，
+            等用户说"继续"；本开关控制"语音活跃时是否让路"。
 
     config MS_RESUME_FALLBACK_REQUEST
         bool "继续失败时兜底发一次 music_request"

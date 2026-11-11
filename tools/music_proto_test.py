@@ -288,10 +288,13 @@ def main(argv: list[str] | None = None) -> int:
         r.check(paused is not None and paused["state"] == "paused",
                 f"G1 pause 生效（{took_ms} ms，{paused}）")
         r.check(took_ms <= 1500, f"G2 pause ≤1.5s（{took_ms} ms）")
-        time.sleep(1.5)
+        # 100ms 暂停淡出期间 played_frames 还会前进最后一块，等淡出走完再取冻结基线
+        time.sleep(0.4)
         frozen2 = parse_ms(dev.console("ms status", END_MS, 2.0))["progress"]
-        r.check(paused is not None and paused["progress"] == frozen2,
-                f"G3 暂停中 progress 冻结（{paused['progress'] if paused else '?'} / {frozen2}）")
+        time.sleep(1.2)
+        frozen3 = parse_ms(dev.console("ms status", END_MS, 2.0))["progress"]
+        r.check(frozen2 == frozen3,
+                f"G3 暂停中 progress 冻结（{frozen2} / {frozen3}）")
         r.check(cloud.wait_uplink("music_status", lambda m: m.get("state") == "paused", 7.0) is not None,
                 "G4 上报 state=paused")
 

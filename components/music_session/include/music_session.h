@@ -7,13 +7,14 @@
  *   - 起播 / 切歌（先 stop 再 play，CONFIG_MS_PLAY_RETRY_MS × CONFIG_MS_PLAY_MAX_RETRIES 重试）、
  *     暂停（用户 latch / 语音抢占）、继续（含 resume 失败兜底 `music_request`）、停止；
  *   - 与语音抢占：订阅 `APP_EVT_VOICE_STATE_CHANGED`，语音进入活跃态 auto-pause（暂停让路），
- *     语音回 IDLE 且 pause_reason=语音时才 auto-resume；用户暂停不被覆盖；
+ *     **语音回 IDLE 保持暂停**（T4.4 pause 模式：不自动续播，等用户明确说"继续"）；
+ *     用户暂停不被覆盖；
  *   - 周期上报 + EOF 探测（一个 esp_timer）。
  *
  * 不做什么：
  *   - 不解析协议、不拼 JSON/URL（归 L3 `music_cloud`）；
  *   - 不建任务、不 malloc/PSRAM；只用两个 esp_timer（起播/重试 + 周期上报/EOF 探测）；
- *   - 不关麦、不改 duck/R3 参数（T4.4 才做叠加）；duck 仍由 audio_player 的混音级决定。
+ *   - 不关麦、不做 duck/叠加（T4.4 定稿走"暂停保留"，duck 留作后续体验模式）。
  *
  * 线程模型：
  *   - 所有播放器调用与状态迁移只在 esp_timer（`ms_play` / `ms_status`）上下文发生；

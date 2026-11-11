@@ -2591,12 +2591,19 @@ static int cmd_player(int argc, char **argv)
 static int cmd_aec(int argc, char **argv)
 {
     if (argc < 2 || strcmp(argv[1], "test") != 0) {
-        printf("用法: aec test [sr|fd] [psram|internal] [frames]\n");
+        printf("用法: aec test [sr|srh|fd] [psram] [frames] [filter_length]\n");
         return ESP_ERR_INVALID_ARG;
     }
     const char *mode_s = (argc > 2) ? argv[2] : "sr";
     const char *caps_s = (argc > 3) ? argv[3] : "psram";
     int frames = (argc > 4) ? atoi(argv[4]) : 600;
+    int filter_length = (argc > 5) ? atoi(argv[5]) : 4;
+    if (filter_length < 1) {
+        filter_length = 1;
+    }
+    if (filter_length > 8) {
+        filter_length = 8;
+    }
     if (frames < 50) {
         frames = 50;
     }
@@ -2607,6 +2614,8 @@ static int cmd_aec(int argc, char **argv)
     aec_mode_t mode;
     if (strcmp(mode_s, "sr") == 0) {
         mode = AEC_MODE_SR_LOW_COST;
+    } else if (strcmp(mode_s, "srh") == 0) {
+        mode = AEC_MODE_SR_HIGH_PERF;
     } else if (strcmp(mode_s, "fd") == 0) {
         mode = AEC_MODE_FD_LOW_COST;
     } else {
@@ -2627,7 +2636,7 @@ static int cmd_aec(int argc, char **argv)
         .mic_num = 1,
         .ref_num = 1,
         .out_num = 1,
-        .filter_length = 4,
+        .filter_length = filter_length,
         .sample_rate = AEC_TEST_RATE,
         .caps = caps,
         .mode = mode,
@@ -2669,6 +2678,11 @@ static int cmd_aec(int argc, char **argv)
     uint64_t sum_in = 0;
     uint64_t sum_out = 0;
     uint32_t measured = 0;
+    uint64_t ne_out = 0;
+    uint32_t ne_cnt = 0;
+    static const int16_t sine8[8] = {0, 5655, 8000, 5655, 0, -5655, -8000, -5655}; /* 2kHz */
+    const int ne_from = frames / 2;
+    const int ne_to = frames * 3 / 4;
     int64_t us_sum = 0;
     int64_t us_max = 0;
     int slow = 0;
@@ -2683,8 +2697,14 @@ static int cmd_aec(int argc, char **argv)
             const int16_t echo = delay[dpos];
             delay[dpos] = r;
             dpos = (dpos + 1u) % AEC_TEST_DELAY;
-            /* 回声 = 0.4 × 延迟参考（约 -8dB）；mic 里没有近端人声，测纯 ERLE */
-            mic[i] = (int16_t)((int32_t)echo * 2 / 5);
+            /* 回声 = 0.4 × 延迟参考（约 -8dB）；后半段注入 2kHz 近端音，验证 AEC 不吞近端 */
+            int32_t m = (int32_t)echo * 2 / 5;
+            if (f >= ne_from && f < ne_to) {
+                m += (int32_t)sine8[(gpos + (uint32_t)i) & 7u] / 4; /* ≈2000 幅度 */
+            }
+            if (m > 32767) m = 32767;
+            if (m < -32768) m = -32768;
+            mic[i] = (int16_t)m;
         }
         gpos += (uint32_t)n;
 
@@ -2712,11 +2732,19 @@ static int cmd_aec(int argc, char **argv)
             }
             measured += (uint32_t)n;
         }
+        if (f >= ne_from && f < ne_to) {
+            for (int i = 0; i < n; i++) {
+                const int32_t o = out[i];
+                ne_out += (uint64_t)(o * o);
+            }
+            ne_cnt += (uint32_t)n;
+        }
     }
 
     const size_t in_created = in_before - in_after;
     const size_t ps_created = ps_before - ps_after;
-    printf("AECTEST mode=%s caps=%s chunksize=%d frames=%d\n", mode_s, caps_s, n, frames);
+    printf("AECTEST mode=%s caps=%s filter=%d chunksize=%d frames=%d\n", mode_s, caps_s,
+           filter_length, n, frames);
     printf("AECTEST internal_delta=%d B psram_delta=%d B\n", (int)in_created, (int)ps_created);
     printf("AECTEST frame_us avg=%d max=%d timed=%d slow_gt5ms=%d\n",
            (int)(us_sum / (timed > 0 ? timed : 1)), (int)us_max, timed, slow);
@@ -2725,6 +2753,11 @@ static int cmd_aec(int argc, char **argv)
     } else {
         const double erle = 10.0 * log10((double)sum_in / (double)sum_out);
         printf("AECTEST erle_db=%.1f（measured=%u samples）\n", erle, (unsigned)measured);
+    }
+    if (ne_cnt > 0) {
+        const double ne_rms = sqrt((double)ne_out / (double)ne_cnt);
+        printf("AECTEST near_end_out_rms=%.0f（注入 2kHz≈2000，cnt=%u）\n", ne_rms,
+               (unsigned)ne_cnt);
     }
 
     heap_caps_free(mic);

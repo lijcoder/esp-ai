@@ -26,6 +26,7 @@
 #include "event_bus.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "net_mgr.h"
 #include "sdkconfig.h"
@@ -112,8 +113,10 @@ static QueueHandle_t s_tx_q;
 static StaticQueue_t s_tx_q_static;
 static uint8_t *s_tx_q_storage;           /* PSRAM */
 
-/* 收包重组：客户端按 buffer_size 分片回调，这里按 payload_offset 拼回整帧 */
-static uint8_t s_rx_buf[CONFIG_WS_RX_BUFFER_BYTES];
+/* 收包重组：客户端按 buffer_size 分片回调，这里按 payload_offset 拼回整帧。
+ * T4.4 C2：缓冲从静态 .bss 迁到 PSRAM（非 DMA，仅回调上下文 memcpy），
+ * 失败回退内部堆；省 2KB 静态 DIRAM。 */
+static uint8_t *s_rx_buf;
 static size_t s_rx_len_expected;
 static uint8_t s_rx_opcode;
 
@@ -391,11 +394,11 @@ static void handle_data_event(const esp_websocket_event_data_t *ed)
         return;
     }
 
-    if (ed->payload_len <= 0 || (size_t)ed->payload_len > sizeof(s_rx_buf)) {
+    if (ed->payload_len <= 0 || (size_t)ed->payload_len > (size_t)CONFIG_WS_RX_BUFFER_BYTES) {
         if (ed->payload_offset == 0) {
             s_rx_bad++;
             ESP_LOGW(TAG, "下行消息过长（%d B > %u B），丢弃", ed->payload_len,
-                     (unsigned)sizeof(s_rx_buf));
+                     (unsigned)CONFIG_WS_RX_BUFFER_BYTES);
         }
         return;
     }
@@ -905,6 +908,18 @@ esp_err_t ws_init(void)
         }
     }
 
+    /* T4.4 C2：收包重组缓冲放 PSRAM（失败回退内部） */
+    s_rx_buf = heap_caps_malloc(CONFIG_WS_RX_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_rx_buf == NULL) {
+        s_rx_buf = heap_caps_malloc(CONFIG_WS_RX_BUFFER_BYTES,
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_LOGW(TAG, "收包缓冲 PSRAM 分配失败，回退内部 RAM");
+    }
+    if (s_rx_buf == NULL) {
+        ESP_LOGE(TAG, "收包缓冲分配失败（%d B）", CONFIG_WS_RX_BUFFER_BYTES);
+        return ESP_ERR_NO_MEM;
+    }
+
     s_cmd_q = xQueueCreate(WS_CMD_QUEUE_DEPTH, sizeof(uint8_t));
     if (s_cmd_q == NULL) {
         ESP_LOGE(TAG, "创建命令队列失败（内存不足）");
@@ -921,7 +936,15 @@ esp_err_t ws_init(void)
         return err;
     }
 
-    if (xTaskCreatePinnedToCore(ws_task, "ws", CONFIG_WS_TASK_STACK, NULL, 5, NULL, 0) != pdPASS) {
+    /* T4.4 C2：ws 任务栈放 PSRAM（TCB 仍由 IDF 放内部），失败回退内部栈。
+     * 该任务不写 flash（NVS/OTA 不走这里），可安全使用 PSRAM 栈。 */
+    BaseType_t tok = xTaskCreatePinnedToCoreWithCaps(ws_task, "ws", CONFIG_WS_TASK_STACK, NULL, 5,
+                                                     NULL, 0, MALLOC_CAP_SPIRAM);
+    if (tok != pdPASS) {
+        ESP_LOGW(TAG, "ws 栈 PSRAM 分配失败，回退内部 RAM");
+        tok = xTaskCreatePinnedToCore(ws_task, "ws", CONFIG_WS_TASK_STACK, NULL, 5, NULL, 0);
+    }
+    if (tok != pdPASS) {
         ESP_LOGE(TAG, "创建 ws 任务失败（栈 %d B）", CONFIG_WS_TASK_STACK);
         return ESP_ERR_NO_MEM;
     }

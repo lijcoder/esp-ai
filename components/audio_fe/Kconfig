@@ -34,4 +34,55 @@ menu "Audio Front-End"
             该值调用 audio_fe_feed_discard_ms()；正常 TTS 收尾走 R2 的 300ms 尾部延时，
             不使用 R5。
 
+    config AUDIO_FE_AEC_ENABLE
+        bool "启用软件参考 AEC（T4.4 C3 spike）"
+        default n
+        help
+            开启后 audio_fe 在 feed 任务里用 esp_aec 处理麦克风：参考取自 audio_player
+            的混音输出（post 音量/duck/限幅），无播放（speaker 未开）或 R1 hold 时旁路。
+            caps 走 PSRAM；**量产默认关闭，需真实声学验证后再评估默认值**。
+
+    choice AUDIO_FE_AEC_MODE
+        prompt "AEC 模式"
+        depends on AUDIO_FE_AEC_ENABLE
+        default AUDIO_FE_AEC_MODE_SR_HIGH_PERF
+        help
+            SR_LOW_COST/SR_HIGH_PERF 面向唤醒；FD_LOW_COST 带 NLP，双讲更好但更重。
+            实测（合成回声，内部 RAM/单帧）：SR filter=2 +6.4KB/0.81ms；
+            SRH filter=2 +4.4KB/1.78ms；FD +12.7KB/6.9ms。
+
+        config AUDIO_FE_AEC_MODE_SR_LOW_COST
+            bool "SR_LOW_COST"
+        config AUDIO_FE_AEC_MODE_SR_HIGH_PERF
+            bool "SR_HIGH_PERF"
+        config AUDIO_FE_AEC_MODE_FD_LOW_COST
+            bool "FD_LOW_COST（双讲）"
+    endchoice
+
+    config AUDIO_FE_AEC_FILTER_LEN
+        int "AEC filter_length"
+        depends on AUDIO_FE_AEC_ENABLE
+        range 1 8
+        default 2
+        help
+            官方推荐 4；实测 2 的内部 RAM/CPU 约减半（+6.4KB/0.81ms @SR），
+            但覆盖的延迟/混响更短，需真实声学验证（C3）。
+
+    config AUDIO_FE_AEC_REF_DELAY_MS
+        int "AEC 参考延迟（毫秒）"
+        depends on AUDIO_FE_AEC_ENABLE
+        range 0 300
+        default 40
+        help
+            参考环读取相对播放写指针的延迟，用于对齐 DMA/功放/声学路径。
+            真机按 ERLE/唤醒率扫描（runtime `aec delay <ms>`）。
+
+    config AUDIO_FE_AEC_BYPASS_WHEN_IDLE
+        bool "无播放时旁路 AEC"
+        depends on AUDIO_FE_AEC_ENABLE
+        default y
+        help
+            speaker 未开（无音乐/TTS/提示音）时直接喂原始麦克风，保持现有安静
+            环境唤醒基线；关闭后全程过 AEC（便于对比）。
+
 endmenu

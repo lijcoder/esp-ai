@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
@@ -28,7 +29,8 @@ static const char *TAG = "PLAYER"; /* 复用 PLAYER TAG：不新增 TAG 清单/�
 #define MUSIC_TASK_STACK     CONFIG_AUDIO_PLAYER_MUSIC_TASK_STACK
 #define MUSIC_TASK_PRIO      4
 #define MUSIC_TASK_CORE      0
-#define MUSIC_HTTP_BUF       4096
+#define MUSIC_HTTP_BUF       4096 /* 读缓冲（T4.4 C2 放 PSRAM） */
+#define MUSIC_HTTP_CLIENT_BUF 1024 /* esp_http_client 内部缓冲（内部 RAM，缩到 1KB） */
 #define MUSIC_OUT_FRAMES     2048   /* 44.1k 1152 样本 → 48k ≈ 1254，留余量 */
 #define MUSIC_PREFILL_FRAMES (AUDIO_IO_SPK_SAMPLE_RATE * 150u / 1000u) /* 起播前预填 ~150ms */
 
@@ -43,6 +45,7 @@ typedef struct {
 
 static char s_url[CONFIG_AUDIO_PLAYER_MUSIC_URL_MAX];
 static volatile bool s_stop_req;
+static bool s_task_with_caps; /* T4.4 C2：任务栈是否在 PSRAM（删除 API 不同） */
 static volatile bool s_running;
 static volatile bool s_paused; /* T4.3：暂停门控（任务不退出、不读 socket） */
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -172,6 +175,8 @@ static size_t music_write_block(const int16_t *pcm, size_t frames, uint32_t time
 static void music_task(void *arg)
 {
     (void)arg;
+    /* 任务启动即固定本实例的删除方式，避免与下一轮 play 的 s_task_with_caps 竞态 */
+    const bool with_caps = s_task_with_caps;
     music_ctx_t ctx = {0};
     esp_http_client_handle_t cli = NULL;
     mp3_stream_t *dec = NULL;
@@ -185,7 +190,12 @@ static void music_task(void *arg)
      * （截断会丢掉该帧后半段，起播处出现可闻缺口） */
     ctx.prefill = heap_caps_malloc((size_t)(MUSIC_PREFILL_FRAMES + MUSIC_OUT_FRAMES) * sizeof(int16_t),
                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    rbuf = heap_caps_malloc(MUSIC_HTTP_BUF, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    /* T4.4 C2：读缓冲放 PSRAM（非 DMA，解码前中转）；失败回退内部 */
+    rbuf = heap_caps_malloc(MUSIC_HTTP_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rbuf == NULL) {
+        rbuf = heap_caps_malloc(MUSIC_HTTP_BUF, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_LOGW(TAG, "音乐读缓冲 PSRAM 分配失败，回退内部 RAM");
+    }
     dec = mp3_stream_create();
     if (!ctx.out || !ctx.prefill || !rbuf || !dec) {
         ESP_LOGE(TAG, "缓冲/解码器分配失败（PSRAM/内部 RAM 不足）");
@@ -195,7 +205,7 @@ static void music_task(void *arg)
     esp_http_client_config_t cfg = {
         .url = s_url,
         .timeout_ms = CONFIG_AUDIO_PLAYER_MUSIC_HTTP_TIMEOUT_MS,
-        .buffer_size = MUSIC_HTTP_BUF,
+        .buffer_size = MUSIC_HTTP_CLIENT_BUF,
         .buffer_size_tx = 512,
         .user_agent = "esp-ai-music/1.0",
         .keep_alive_enable = true,
@@ -370,7 +380,12 @@ done:
     heap_caps_free(ctx.out);
     ESP_LOGI(TAG, "拉流任务退出（%s）", s_stop_req ? "stop" : "eof/error");
     s_running = false;
-    vTaskDelete(NULL);
+    if (with_caps) {
+        /* 栈在 PSRAM：必须用 WithCaps 删除（自删会派生一个临时清理任务） */
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 esp_err_t source_http_play(const char *url)
@@ -399,8 +414,19 @@ esp_err_t source_http_play(const char *url)
     s_stats.content_length = -1;
     portEXIT_CRITICAL(&s_stats_mux);
     s_running = true;
-    if (xTaskCreatePinnedToCore(music_task, "music_http", MUSIC_TASK_STACK, NULL,
-                                MUSIC_TASK_PRIO, NULL, MUSIC_TASK_CORE) != pdPASS) {
+    /* T4.4 C2：任务栈放 PSRAM（TCB 仍内部），失败回退内部栈。
+     * music_http 只做 HTTP/解码/写 ring，不写 flash，可安全使用 PSRAM 栈。 */
+    s_task_with_caps = true;
+    BaseType_t tok = xTaskCreatePinnedToCoreWithCaps(music_task, "music_http", MUSIC_TASK_STACK,
+                                                     NULL, MUSIC_TASK_PRIO, NULL, MUSIC_TASK_CORE,
+                                                     MALLOC_CAP_SPIRAM);
+    if (tok != pdPASS) {
+        ESP_LOGW(TAG, "music_http 栈 PSRAM 分配失败，回退内部 RAM");
+        s_task_with_caps = false;
+        tok = xTaskCreatePinnedToCore(music_task, "music_http", MUSIC_TASK_STACK, NULL,
+                                      MUSIC_TASK_PRIO, NULL, MUSIC_TASK_CORE);
+    }
+    if (tok != pdPASS) {
         s_running = false;
         s_url[0] = '\0';
         return ESP_ERR_NO_MEM;

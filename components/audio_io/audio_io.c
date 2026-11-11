@@ -6,6 +6,7 @@
 #include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 
 static const char *TAG = "AUDIO_IO";
@@ -13,10 +14,21 @@ static const char *TAG = "AUDIO_IO";
 /* 单次读取上限：1024 帧 @16k = 64ms，足够覆盖 AFE feed chunksize */
 #define RX_SCRATCH_FRAMES 1024
 
+/* T4.4 C3：AEC 参考环 512ms @16k（PSRAM） */
+#define REF_RING_SAMPLES 8192u
+#define REF_RING_MASK    (REF_RING_SAMPLES - 1u)
+
 static i2s_chan_handle_t s_rx = NULL;
 static i2s_chan_handle_t s_tx = NULL;
 static int32_t *s_rx_scratch = NULL;
 static bool s_spk_enabled = false;
+
+static int16_t *s_ref_ring = NULL;
+static volatile uint32_t s_ref_wr; /* 单调写样本数 */
+static uint32_t s_ref_written;
+static uint32_t s_ref_read;
+static uint32_t s_ref_underruns;
+static uint32_t s_ref_overwritten;
 
 static esp_err_t rx_init(void)
 {
@@ -69,8 +81,15 @@ static esp_err_t rx_init(void)
         return err;
     }
 
+    /* T4.4 C2：I2S 读暂存放 PSRAM。i2s_channel_read 内部是
+     * 「DMA buffer → memcpy 到用户缓冲」，用户缓冲不参与 DMA；失败回退内部。 */
     s_rx_scratch = heap_caps_malloc((size_t)RX_SCRATCH_FRAMES * sizeof(int32_t),
-                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_rx_scratch) {
+        s_rx_scratch = heap_caps_malloc((size_t)RX_SCRATCH_FRAMES * sizeof(int32_t),
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_LOGW(TAG, "rx scratch PSRAM 分配失败，回退内部 RAM");
+    }
     if (!s_rx_scratch) {
         ESP_LOGE(TAG, "rx scratch alloc failed");
         return ESP_ERR_NO_MEM;
@@ -121,7 +140,88 @@ esp_err_t audio_io_init(void)
     if (err != ESP_OK) {
         return err;
     }
-    return tx_init();
+    err = tx_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+#if CONFIG_AUDIO_FE_AEC_ENABLE
+    /* T4.4 C3：AEC 参考环（PSRAM；分配失败只降级 AEC，不影响播放/唤醒） */
+    s_ref_ring = heap_caps_malloc((size_t)REF_RING_SAMPLES * sizeof(int16_t),
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_ref_ring == NULL) {
+        ESP_LOGW(TAG, "AEC 参考环分配失败（PSRAM），AEC 不可用");
+    } else {
+        memset(s_ref_ring, 0, (size_t)REF_RING_SAMPLES * sizeof(int16_t));
+        ESP_LOGI(TAG, "AEC 参考环：%u 样本（%u ms @16k，PSRAM）", (unsigned)REF_RING_SAMPLES,
+                 (unsigned)(REF_RING_SAMPLES * 1000u / AUDIO_IO_MIC_SAMPLE_RATE));
+    }
+#endif
+    return ESP_OK;
+}
+
+bool audio_io_ref_enabled(void)
+{
+    return s_ref_ring != NULL;
+}
+
+void audio_io_ref_push_stereo48(const int16_t *stereo, size_t frames)
+{
+    if (s_ref_ring == NULL || stereo == NULL) {
+        return;
+    }
+    const size_t n = frames / 3u; /* 48k → 16k（3 点平均） */
+    uint32_t wr = s_ref_wr;
+    for (size_t i = 0; i < n; i++) {
+        const int32_t a = stereo[(3u * i + 0u) * 2u];
+        const int32_t b = stereo[(3u * i + 1u) * 2u];
+        const int32_t c = stereo[(3u * i + 2u) * 2u];
+        s_ref_ring[wr & REF_RING_MASK] = (int16_t)((a + b + c) / 3);
+        wr++;
+    }
+    __atomic_store_n(&s_ref_wr, wr, __ATOMIC_RELEASE);
+    s_ref_written += (uint32_t)n;
+}
+
+int audio_io_ref_read_16k(int16_t *dst, size_t frames, uint32_t delay_ms)
+{
+    if (dst == NULL || frames == 0) {
+        return 0;
+    }
+    if (s_ref_ring == NULL) {
+        memset(dst, 0, frames * sizeof(int16_t));
+        return 0;
+    }
+    const uint32_t wr = __atomic_load_n(&s_ref_wr, __ATOMIC_ACQUIRE);
+    const uint32_t delay = delay_ms * (AUDIO_IO_MIC_SAMPLE_RATE / 1000u);
+    if (wr < delay + (uint32_t)frames) {
+        memset(dst, 0, frames * sizeof(int16_t));
+        s_ref_underruns++;
+        return 0;
+    }
+    const uint32_t start = wr - delay - (uint32_t)frames;
+    if (wr - start > REF_RING_SAMPLES) {
+        memset(dst, 0, frames * sizeof(int16_t));
+        s_ref_overwritten++;
+        return 0;
+    }
+    uint32_t idx = start & REF_RING_MASK;
+    for (size_t i = 0; i < frames; i++) {
+        dst[i] = s_ref_ring[idx];
+        idx = (idx + 1u) & REF_RING_MASK;
+    }
+    s_ref_read += (uint32_t)frames;
+    return (int)frames;
+}
+
+void audio_io_ref_stats_read(audio_io_ref_stats_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->written = s_ref_written;
+    out->read = s_ref_read;
+    out->underruns = s_ref_underruns;
+    out->overwritten = s_ref_overwritten;
 }
 
 int audio_io_read_mic(int16_t *dst, size_t frames, uint32_t timeout_ms)

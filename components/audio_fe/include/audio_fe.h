@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "sdkconfig.h"
 
 /* 语音前端事件（本期只实现唤醒与 VAD 状态迁移） */
 typedef enum {
@@ -149,3 +150,30 @@ typedef struct {
 
 esp_err_t audio_fe_uplink_stats_read(audio_fe_uplink_stats_t *out);
 esp_err_t audio_fe_uplink_stats_reset(void);
+
+#if CONFIG_AUDIO_FE_AEC_ENABLE
+/* ---------------- 软件参考 AEC（T4.4 C3，dev/验收用） ---------------- */
+typedef struct {
+    bool created;        /* AEC 实例创建成功 */
+    bool enabled;        /* 运行期开关（aec on/off） */
+    uint32_t delay_ms;   /* 参考延迟 */
+    uint32_t frames;     /* 已处理帧数（32ms/帧） */
+    uint32_t in_rms;     /* 最近窗口麦克风 RMS */
+    uint32_t out_rms;    /* 最近窗口 AEC 输出 RMS */
+    uint32_t underruns;  /* 参考数据不足次数 */
+    uint32_t chunksize;  /* AEC 帧长（应=AFE feed chunksize） */
+    uint32_t ref_rms;    /* 最近窗口参考 RMS（诊断参考是否有效） */
+} audio_fe_aec_stats_t;
+
+void audio_fe_aec_set_enabled(bool on);
+bool audio_fe_aec_enabled(void);
+void audio_fe_aec_set_delay_ms(uint32_t ms);
+esp_err_t audio_fe_aec_stats_read(audio_fe_aec_stats_t *out);
+
+/* C3 调试：抓两帧（1024 样本）mic/ref 供 host/diag 做互相关，定位真实延迟 */
+#define AUDIO_FE_AEC_CORR_SAMPLES 1024
+bool audio_fe_aec_corr_start(void);
+bool audio_fe_aec_corr_ready(void);
+bool audio_fe_aec_corr_get(int16_t *mic, int16_t *ref);
+
+#endif

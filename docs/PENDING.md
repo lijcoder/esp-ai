@@ -171,8 +171,8 @@
 |---|---|
 | 提出时间 | **2026-11-12 11:3x（采样）**，M2 决策后登记 |
 | 来源 | 用户实测「Hermes 的 chat 接口不返回工具调用」；改走 Responses API + MCP |
-| 现象/问题 | ① 网关 `/responses` 是否按标准返回 `output[].type=mcp_call`（或 `function_call`）——**2026-11-12 真机实测：是元工具形态**（`tool_describe` + `tool_call{calls:[{name:"mcp__music__music_play",...}]}`），已在 `responses_client` 适配；② Hermes 是否能拉起 stdio MCP（`uv run tools/music_mcp_server.py --catalog …`）或配 HTTP——**已拉起并返回真实 `track_id`**；③ 工具结果里的中文/JSON 是否原样回传——已确认；④ 模型是否会在闲聊时误调音乐工具——待多轮观察 |
-| 验收方法 | `curl $LLM_BASE_URL/responses` 发一条「放首歌」，检查 `output` 数组；把 MCP 配到 Hermes 后对设备说「放首歌/暂停/下一首」，看 mock 日志是否出现 `[MUSIC] tool=music_play … → music_track`；同轮 `responses.requests` 里确认**无 URL** |
+| 现象/问题 | ① 网关 `/responses` 是否按标准返回 `output[].type=mcp_call`（或 `function_call`）——**2026-11-12 真机实测：是元工具形态**（`tool_describe` + `tool_call{calls:[{name:"mcp__music__music_play",...}]}`），已在 `responses_client` 适配；② Hermes 是否能拉起 stdio MCP（`uv run tools/music_mcp_server.py --catalog …`）或配 HTTP——**已拉起并返回真实 `track_id`**；③ 工具结果里的中文/JSON 是否原样回传——已确认（含 `function_call_output`，2026-11-12）；④ 模型是否会在闲聊时误调音乐工具——待多轮观察 |
+| 验收方法 | **2026-11-12 已抓真实响应**：`function_call`（name=`tool_call`，内含 `mcp__music__*`）+ `function_call_output`（`<untrusted_tool_result>` 包装，内含工具结果）。确认新版 MCP 结果里带 `url` 后，mock 日志应出现 `[MUSIC] tool=…（用工具结果的 URL）`，且 `music_track.url` 与工具结果一致；`curl $LLM_BASE_URL/responses` 发一条「放首歌」，检查 `output` 数组；把 MCP 配到 Hermes 后对设备说「放首歌/暂停/下一首」，看 mock 日志是否出现 `[MUSIC] tool=music_play … → music_track`；同轮 `responses.requests` 里确认**无 URL** |
 | 关闭条件 | 真实 Hermes 一轮「点歌 + 暂停 + 下一首」全部命中；日志无 URL；闲聊不误调工具 |
 | 关联 | PRODUCT_IDEAS M2；ARCH §6.3；`tools/music_mcp_server.py`、`tools/responses_client.py` |
 

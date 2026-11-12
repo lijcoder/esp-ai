@@ -24,7 +24,7 @@
   - `stream_end`：排空已收数据、解码器无更多数据后标记通道 `closed`，通道包络对残留 ≤100ms 做线性淡出 → 静音冲刷/关 TX → 300ms 尾部延时 → 回调 `ok=true`（T3.3 起不再用独立"收尾环"，淡出由混音通道统一施加）；`decoded_frames==0` 时不使能 I2S、WARN、立即回调 `ok=false`；
   - `stream_abort`：≤20ms 内停止写音频并关 TX、丢弃 ring 剩余、回调 `ok=false`；
   - 流式 active 期间拒绝 `play_pcm`/`play_mp3`，`is_busy()` 返回 true；
-- **远端音乐（T4.1）**：`music play <http(s)://...>` → 独立任务 `music_http`（核 0/优先级 4/栈 6KB，**按需创建/停止销毁**）用 `esp_http_client` 拉流 → **独立 minimp3 实例**（`mp3_stream_*`，PSRAM ~38KB，与 TTS 实例并发互不共享）→ 重采样 44.1k/48k → 48k 单声道 → PSRAM PCM ring（`AUDIO_PLAYER_MUSIC_RING_MS`，默认 1000ms）→ `CH_MUSIC`。起播前预填 150ms；停止 = 丢弃 ring + 100ms 淡出，任务在 HTTP 读超时内退出。URL 只接受 `http(s)`、≤320B；流中采样率变化中止；暂不支持 seek/Range（T4.5）；
+- **远端音乐（T4.1）**：`music play <http(s)://...>` → 独立任务 `music_http`（核 0/优先级 4/栈 6KB，**按需创建/停止销毁**）用 `esp_http_client` 拉流 → **独立 minimp3 实例**（`mp3_stream_*`，PSRAM ~38KB，与 TTS 实例并发互不共享）→ 重采样 44.1k/48k → 48k 单声道 → PSRAM PCM ring（`AUDIO_PLAYER_MUSIC_RING_MS`，默认 1000ms）→ `CH_MUSIC`。起播前预填 **200ms**（`AUDIO_PLAYER_MUSIC_PREFILL_MS`）；停止 = 丢弃 ring + 100ms 淡出，任务在 HTTP 读超时内退出。URL 只接受 `http(s)`、≤320B；流中采样率变化中止；**T4.5**：读失败/提前关闭时按已收字节 `Range: bytes=N-` 重连续播（206 直接续、200 丢弃前 N 字节；最多 3 次、退避 300ms），坏帧 resync，长暂停恢复也走该路径；
 - **音乐暂停/继续（T4.3）**：`audio_player_music_pause(fade_ms)` 在 `mix_loop_run()` 块边界给
   `CH_MUSIC` 做 `fade_ms` 线性淡出，然后走"暂停退出"专用路径结束 PUMP 作业——**保留
   `CH_MUSIC` ring 与 `wr/rd`、保留 `s_music_stats`（`played_frames` 冻结）**，把播放器让给
@@ -175,6 +175,6 @@ duck: on=0 gain_q8=256 out_peak=15563 stop: last_stop_ms=79 stops=1
 
 - 多通道：`CH_TTS` / `CH_PROMPT` / `CH_MUSIC` + 混音 + ducking（T3.3 做混音/限幅，T4.4 做音乐 duck 叠加与恢复；T4.3 的语音抢占走"暂停让路"，不改 duck）；
 - 音源抽象：`source_http`（HTTP 流）/`source_file`（FATFS），P4；
-- T4.5：暂停/续播改 Range 做真续播（当前长暂停后依赖 `music_request` 从头兜底）。
+- **T4.5（2026-11-12）**：暂停/断流后改 Range 做真续播（按已收字节偏移）；重连最终失败仍由 `music_request` 兜底（PV-015 待真机）。
 
 对应架构：[docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) §3.2、§3.7、§9.2、§9.3；验收：[docs/STATUS.md](../../docs/STATUS.md) §5。

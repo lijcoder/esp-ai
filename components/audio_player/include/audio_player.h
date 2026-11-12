@@ -173,6 +173,10 @@ typedef struct {
     uint32_t first_byte_ms;
     uint32_t connect_ms;
     uint32_t decoded_frames;
+    /* T4.5：断流恢复 */
+    uint32_t reconnects;
+    uint32_t range_resumes;
+    uint32_t last_resume_offset;
 } audio_player_music_stats_t;
 
 /* 启动音乐通道（不启动 HTTP；HTTP 在 audio_player 的 source_http 里）。

@@ -8,6 +8,8 @@
 
 #include "source_http.h"
 
+#include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "audio_io.h"
@@ -32,7 +34,7 @@ static const char *TAG = "PLAYER"; /* 复用 PLAYER TAG：不新增 TAG 清单/�
 #define MUSIC_HTTP_BUF       4096 /* 读缓冲（T4.4 C2 放 PSRAM） */
 #define MUSIC_HTTP_CLIENT_BUF 1024 /* esp_http_client 内部缓冲（内部 RAM，缩到 1KB） */
 #define MUSIC_OUT_FRAMES     2048   /* 44.1k 1152 样本 → 48k ≈ 1254，留余量 */
-#define MUSIC_PREFILL_FRAMES (AUDIO_IO_SPK_SAMPLE_RATE * 150u / 1000u) /* 起播前预填 ~150ms */
+#define MUSIC_PREFILL_FRAMES (AUDIO_IO_SPK_SAMPLE_RATE * CONFIG_AUDIO_PLAYER_MUSIC_PREFILL_MS / 1000u)
 
 typedef struct {
     int16_t *out;      /* PSRAM：单帧重采样输出 */
@@ -172,25 +174,83 @@ static size_t music_write_block(const int16_t *pcm, size_t frames, uint32_t time
 
 /* ---------------- 拉流任务 ---------------- */
 
+/* T4.5：打开 HTTP 流；offset>0 时带 Range，返回是否 206（Range 生效）。 */
+static esp_http_client_handle_t http_open_stream(uint64_t offset, int *status_out, int *len_out,
+                                                 bool *range_ok)
+{
+    esp_http_client_config_t cfg = {
+        .url = s_url,
+        .timeout_ms = CONFIG_AUDIO_PLAYER_MUSIC_HTTP_TIMEOUT_MS,
+        .buffer_size = MUSIC_HTTP_CLIENT_BUF,
+        .buffer_size_tx = 512,
+        .user_agent = "esp-ai-music/1.0",
+        .keep_alive_enable = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    *status_out = -1;
+    *len_out = -1;
+    *range_ok = false;
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (cli == NULL) {
+        return NULL;
+    }
+    if (offset > 0) {
+        char range[48];
+        snprintf(range, sizeof(range), "bytes=%" PRIu64 "-", offset);
+        (void)esp_http_client_set_header(cli, "Range", range);
+    }
+    if (esp_http_client_open(cli, 0) != ESP_OK) {
+        esp_http_client_cleanup(cli);
+        return NULL;
+    }
+    const int len = esp_http_client_fetch_headers(cli);
+    const int status = esp_http_client_get_status_code(cli);
+    if (status != 200 && status != 206) {
+        esp_http_client_close(cli);
+        esp_http_client_cleanup(cli);
+        *status_out = status;
+        return NULL;
+    }
+    *status_out = status;
+    *len_out = len;
+    *range_ok = (status == 206);
+    return cli;
+}
+
+/* 服务端忽略 Range（回 200）时，丢弃前 offset 字节以对齐续播位置。 */
+static bool http_skip_bytes(esp_http_client_handle_t cli, uint64_t bytes, uint8_t *buf, size_t cap)
+{
+    while (bytes > 0 && !s_stop_req) {
+        const size_t want = (bytes > cap) ? cap : (size_t)bytes;
+        const int r = esp_http_client_read(cli, (char *)buf, want);
+        if (r <= 0) {
+            return false;
+        }
+        bytes -= (uint64_t)r;
+        STAT_ADD(http_bytes, (uint32_t)r);
+    }
+    return bytes == 0;
+}
+
 static void music_task(void *arg)
 {
     (void)arg;
-    /* 任务启动即固定本实例的删除方式，避免与下一轮 play 的 s_task_with_caps 竞态 */
     const bool with_caps = s_task_with_caps;
     music_ctx_t ctx = {0};
     esp_http_client_handle_t cli = NULL;
     mp3_stream_t *dec = NULL;
     uint8_t *rbuf = NULL;
     bool started = false;
+    int content_len = -1;
+    uint64_t recv_bytes = 0;
+    int reconnect_tries = 0;
+    int decode_errs = 0;
     const int64_t t0 = esp_timer_get_time();
 
     ctx.out = heap_caps_malloc((size_t)MUSIC_OUT_FRAMES * sizeof(int16_t),
                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    /* 预填缓冲多留一帧：解码帧重采样后可能比剩余空位长，整帧写入不能截断
-     * （截断会丢掉该帧后半段，起播处出现可闻缺口） */
     ctx.prefill = heap_caps_malloc((size_t)(MUSIC_PREFILL_FRAMES + MUSIC_OUT_FRAMES) * sizeof(int16_t),
                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    /* T4.4 C2：读缓冲放 PSRAM（非 DMA，解码前中转）；失败回退内部 */
     rbuf = heap_caps_malloc(MUSIC_HTTP_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (rbuf == NULL) {
         rbuf = heap_caps_malloc(MUSIC_HTTP_BUF, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -202,43 +262,36 @@ static void music_task(void *arg)
         goto done;
     }
 
-    esp_http_client_config_t cfg = {
-        .url = s_url,
-        .timeout_ms = CONFIG_AUDIO_PLAYER_MUSIC_HTTP_TIMEOUT_MS,
-        .buffer_size = MUSIC_HTTP_CLIENT_BUF,
-        .buffer_size_tx = 512,
-        .user_agent = "esp-ai-music/1.0",
-        .keep_alive_enable = true,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-    };
-    cli = esp_http_client_init(&cfg);
-    if (!cli) {
-        ESP_LOGE(TAG, "http client init 失败");
-        STAT_ADD(http_errors, 1);
-        goto done;
-    }
-
+    /* T4.5：初始连接也带退避重试（4xx 不重试；5xx/超时重试） */
     log_url_safe(s_url);
     const int64_t t_open = esp_timer_get_time();
-    if (esp_http_client_open(cli, 0) != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP open 失败（%s）", s_url);
+    int status = -1;
+    int hdr_len = -1;
+    bool range_ok = false;
+    for (int attempt = 0;; attempt++) {
+        cli = http_open_stream(0, &status, &hdr_len, &range_ok);
+        if (cli != NULL) {
+            break;
+        }
         STAT_ADD(http_errors, 1);
-        goto done;
+        if (s_stop_req || (status >= 400 && status < 500) ||
+            (attempt + 1) >= CONFIG_AUDIO_PLAYER_MUSIC_RECONNECT_MAX) {
+            ESP_LOGE(TAG, "HTTP open 失败（status=%d，尝试 %d 次）", status, attempt + 1);
+            goto done;
+        }
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_AUDIO_PLAYER_MUSIC_RECONNECT_BACKOFF_MS * (attempt + 1)));
+        if (s_stop_req) {
+            goto done;
+        }
     }
-    const int content_len = esp_http_client_fetch_headers(cli);
-    const int status = esp_http_client_get_status_code(cli);
+    content_len = hdr_len;
     STAT_SET(http_status, status);
     STAT_SET(content_length, content_len);
     STAT_SET(connect_ms, (uint32_t)((esp_timer_get_time() - t_open) / 1000));
     ESP_LOGI(TAG, "HTTP %d，Content-Length=%d，连接 %u ms", status, content_len,
              (unsigned)((esp_timer_get_time() - t_open) / 1000));
-    if (status != 200 && status != 206) {
-        ESP_LOGE(TAG, "HTTP 状态 %d 不可播放", status);
-        STAT_ADD(http_errors, 1);
-        goto done;
-    }
 
-    /* 预填 ~150ms：先不进混音，避免起播时的"空 ring 欠载" */
+    /* 预填 CONFIG_AUDIO_PLAYER_MUSIC_PREFILL_MS（T4.5：200ms） */
     while (!s_stop_req && ctx.prefill_n < MUSIC_PREFILL_FRAMES) {
         gate_if_paused();
         if (s_stop_req) {
@@ -246,20 +299,21 @@ static void music_task(void *arg)
         }
         const int r = esp_http_client_read(cli, (char *)rbuf, MUSIC_HTTP_BUF);
         if (r < 0) {
-            ESP_LOGE(TAG, "HTTP read 失败");
+            ESP_LOGE(TAG, "HTTP read 失败（预填期）");
             STAT_ADD(http_errors, 1);
             goto done;
         }
         if (r == 0) {
             break;
         }
+        recv_bytes += (uint64_t)r;
         if (!s_stats.first_byte_ms) {
             STAT_SET(first_byte_ms, (uint32_t)((esp_timer_get_time() - t0) / 1000));
         }
         STAT_ADD(http_bytes, (uint32_t)r);
         STAT_ADD(read_calls, 1);
         if (mp3_stream_feed(dec, rbuf, (size_t)r) != ESP_OK) {
-            continue; /* pending 溢出：解码器已自行 resync */
+            continue;
         }
         while (ctx.prefill_n < MUSIC_PREFILL_FRAMES) {
             const int16_t *pcm = NULL;
@@ -284,7 +338,6 @@ static void music_task(void *arg)
                 STAT_ADD(http_errors, 1);
                 goto done;
             }
-            /* 整帧重采样后再判断是否够 150ms：cap 固定为单帧上限，避免截断丢样本 */
             const size_t out = resample_frame(&ctx, pcm, samples, ctx.prefill + ctx.prefill_n,
                                               (size_t)MUSIC_OUT_FRAMES);
             ctx.prefill_n += out;
@@ -315,14 +368,71 @@ static void music_task(void *arg)
             break;
         }
         const int r = esp_http_client_read(cli, (char *)rbuf, MUSIC_HTTP_BUF);
-        if (r < 0) {
-            ESP_LOGW(TAG, "HTTP read 失败（流中断）");
-            STAT_ADD(http_errors, 1);
-            break;
+        if (r <= 0) {
+            const bool natural_eof =
+                (r == 0 && content_len > 0 && recv_bytes >= (uint64_t)content_len);
+            if (natural_eof) {
+                ESP_LOGI(TAG, "自然 EOF（%llu/%d B）", (unsigned long long)recv_bytes, content_len);
+                break;
+            }
+            ESP_LOGW(TAG, "流中断（r=%d，%llu/%d B），尝试 Range 续播",
+                     r, (unsigned long long)recv_bytes, content_len);
+
+            /* T4.5：断流重连 + Range 续播（暂停期间不重连，恢复后再试） */
+            bool recovered = false;
+            while (!s_stop_req && reconnect_tries < CONFIG_AUDIO_PLAYER_MUSIC_RECONNECT_MAX) {
+                gate_if_paused();
+                if (s_stop_req) {
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(CONFIG_AUDIO_PLAYER_MUSIC_RECONNECT_BACKOFF_MS *
+                                         (reconnect_tries + 1)));
+                if (s_stop_req) {
+                    break;
+                }
+                const uint64_t off = (content_len > 0) ? recv_bytes : 0;
+                int st = -1;
+                int hl = -1;
+                bool ok = false;
+                esp_http_client_handle_t ncli = http_open_stream(off, &st, &hl, &ok);
+                if (ncli == NULL) {
+                    reconnect_tries++;
+                    STAT_ADD(http_errors, 1);
+                    continue;
+                }
+                if (off > 0 && !ok) {
+                    if (!http_skip_bytes(ncli, off, rbuf, MUSIC_HTTP_BUF)) {
+                        esp_http_client_close(ncli);
+                        esp_http_client_cleanup(ncli);
+                        reconnect_tries++;
+                        STAT_ADD(http_errors, 1);
+                        continue;
+                    }
+                }
+                esp_http_client_close(cli);
+                esp_http_client_cleanup(cli);
+                cli = ncli;
+                mp3_stream_reset(dec);
+                decode_errs = 0;
+                reconnect_tries = 0;
+                recovered = true;
+                STAT_ADD(reconnects, 1);
+                if (ok) {
+                    STAT_ADD(range_resumes, 1);
+                }
+                STAT_SET(last_resume_offset, (uint32_t)off);
+                ESP_LOGW(TAG, "断流恢复：offset=%llu range=%d", (unsigned long long)off, ok ? 1 : 0);
+                break;
+            }
+            if (!recovered) {
+                STAT_ADD(reconnect_fail, 1);
+                ESP_LOGE(TAG, "断流重连失败（%d 次），结束本轮", reconnect_tries);
+                break;
+            }
+            continue;
         }
-        if (r == 0) {
-            break; /* EOF / 服务端关闭 */
-        }
+
+        recv_bytes += (uint64_t)r;
         STAT_ADD(http_bytes, (uint32_t)r);
         STAT_ADD(read_calls, 1);
         gate_if_paused(); /* 暂停请求在 read 期间到达：本块数据留在 rbuf，恢复后再解码 */
@@ -341,10 +451,18 @@ static void music_task(void *arg)
                 break;
             }
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "解码失败：%s", esp_err_to_name(err));
-                s_stop_req = true;
+                /* T4.5 错误恢复：坏帧/坏流先 resync 继续；连续失败才中止 */
+                ESP_LOGW(TAG, "解码失败：%s（resync）", esp_err_to_name(err));
+                STAT_ADD(http_errors, 1);
+                mp3_stream_resync(dec);
+                if (++decode_errs >= 5) {
+                    ESP_LOGE(TAG, "连续解码失败，结束本轮");
+                    s_stop_req = true;
+                    break;
+                }
                 break;
             }
+            decode_errs = 0;
             if (rate != ctx.src_rate) {
                 ESP_LOGE(TAG, "流中采样率变化（%u → %u Hz），本轮中止", (unsigned)ctx.src_rate,
                          (unsigned)rate);
@@ -363,9 +481,9 @@ static void music_task(void *arg)
 done:
     if (started) {
         if (s_stop_req) {
-            audio_player_music_stop(); /* stop() 已调过也没关系（幂等） */
+            audio_player_music_stop();
         } else {
-            audio_player_music_end(); /* 自然 EOF：播完 ring 再收尾 */
+            audio_player_music_end();
         }
     }
     if (cli) {
@@ -381,7 +499,6 @@ done:
     ESP_LOGI(TAG, "拉流任务退出（%s）", s_stop_req ? "stop" : "eof/error");
     s_running = false;
     if (with_caps) {
-        /* 栈在 PSRAM：必须用 WithCaps 删除（自删会派生一个临时清理任务） */
         vTaskDeleteWithCaps(NULL);
     } else {
         vTaskDelete(NULL);

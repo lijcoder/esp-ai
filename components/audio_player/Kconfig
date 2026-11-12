@@ -95,6 +95,32 @@ menu "Audio Player"
         help
             esp_http_client 的连接/读超时。停止时任务最多阻塞这么久后退出。
 
+    config AUDIO_PLAYER_MUSIC_PREFILL_MS
+        int "音乐起播预缓冲（毫秒，48k 单声道）"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 200
+        range 50 1000
+        help
+            T4.5：起播前先解出至少该时长的 PCM 再进混音，避免起播空 ring 欠载。
+            T4.1/T4.3 为 150ms；T4.5 提到 200ms（真机首声仍目标 <1.5s）。
+
+    config AUDIO_PLAYER_MUSIC_RECONNECT_MAX
+        int "音乐断流重连次数（每次断流）"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 3
+        range 0 10
+        help
+            T4.5：HTTP 读失败/服务端提前关闭时，用 Range 从上次字节偏移续播，
+            最多重试该次数（含首次重连）；0=不重连（回退到 T4.1 行为）。
+
+    config AUDIO_PLAYER_MUSIC_RECONNECT_BACKOFF_MS
+        int "音乐重连退避（毫秒，线性递增）"
+        depends on AUDIO_PLAYER_ENABLE_MP3
+        default 300
+        range 50 2000
+        help
+            第 n 次重连前等待 n × 该值；暂停期间不重连（恢复后再试）。
+
     config AUDIO_PLAYER_INTERRUPT_FADE_MS
         int "按键打断淡出时长（毫秒，规则 R4）"
         range 20 100

@@ -2505,6 +2505,9 @@ esp_err_t audio_player_music_stats_read(audio_player_music_stats_t *out)
         out->first_byte_ms = hs.first_byte_ms;
         out->connect_ms = hs.connect_ms;
         out->decoded_frames = hs.decoded_frames;
+        out->reconnects = hs.reconnects;
+        out->range_resumes = hs.range_resumes;
+        out->last_resume_offset = hs.last_resume_offset;
     }
     return ESP_OK;
 }

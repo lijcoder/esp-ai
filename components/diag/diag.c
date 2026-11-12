@@ -2169,10 +2169,12 @@ static int cmd_music(int argc, char **argv)
                (unsigned)st.ring_ms, (unsigned)st.written_frames, (unsigned)st.played_frames,
                (unsigned)st.underruns, (unsigned)st.first_sound_ms);
         printf("MUSICHTTP status=%d content_length=%d bytes=%u first_byte=%ums connect=%ums "
-               "decoded=%u errors=%u\n",
+               "decoded=%u errors=%u reconnects=%u range=%u last_offset=%u\n",
                st.http_status, (int)st.content_length, (unsigned)st.http_bytes,
                (unsigned)st.first_byte_ms, (unsigned)st.connect_ms,
-               (unsigned)st.decoded_frames, (unsigned)st.http_errors);
+               (unsigned)st.decoded_frames, (unsigned)st.http_errors,
+               (unsigned)st.reconnects, (unsigned)st.range_resumes,
+               (unsigned)st.last_resume_offset);
         return ESP_OK;
     }
     printf("用法: music play <http(s)://...> | stop | stat\n");

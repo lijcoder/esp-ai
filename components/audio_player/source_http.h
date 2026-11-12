@@ -26,6 +26,11 @@ typedef struct {
     uint32_t http_errors;
     uint32_t first_byte_ms;
     uint32_t connect_ms;
+    /* T4.5：断流恢复 */
+    uint32_t reconnects;        /* 成功重连次数 */
+    uint32_t range_resumes;     /* 其中用 Range 续播的次数 */
+    uint32_t reconnect_fail;    /* 重连最终失败次数 */
+    uint32_t last_resume_offset;/* 最近一次续播字节偏移 */
 } source_http_stats_t;
 
 /* 启动拉流任务；已有一个在跑时返回 ESP_ERR_INVALID_STATE。 */

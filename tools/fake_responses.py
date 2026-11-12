@@ -66,7 +66,45 @@ class _Handler(BaseHTTPRequestHandler):
         if decision is not None:
             name, arguments = decision
             arg_text = json.dumps(arguments, ensure_ascii=False)
-            if server.style == "hermes":  # type: ignore[attr-defined]
+            if server.style == "hermes_output":  # type: ignore[attr-defined]
+                url = server.tool_url  # type: ignore[attr-defined]
+                result = {
+                    "ok": True,
+                    # 内部命令用短动作名（play/pause/...），与 MCP 服务真实返回一致
+                    "action": name.removeprefix("music_"),
+                    "changed": True,
+                    "state": "playing",
+                    "matched": True,
+                    "message": "远程工具已执行",
+                    "track": {
+                        "track_id": "remote01",
+                        "title": "远程曲目",
+                        "artist": "测试",
+                        "duration_ms": 0,
+                        "url": url,
+                    },
+                }
+                wrapper = {"result": json.dumps(result, ensure_ascii=False)}
+                output.append({
+                    "type": "function_call",
+                    "id": "fc_remote_1",
+                    "call_id": "call_remote_1",
+                    "name": "tool_call",
+                    "arguments": json.dumps({"calls": [{
+                        "name": f"mcp__music__{name}",
+                        "arguments": arguments,
+                    }]}, ensure_ascii=False),
+                })
+                output.append({
+                    "type": "function_call_output",
+                    "call_id": "call_remote_1",
+                    "output": (
+                        '<untrusted_tool_result source="mcp__music__' + name + '">\n'
+                        + json.dumps(wrapper, ensure_ascii=False)
+                        + '\n</untrusted_tool_result>'
+                    ),
+                })
+            elif server.style == "hermes":
                 # Hermes 真机形态：元工具 tool_describe + tool_call，工具名带 mcp__<server>__ 前缀
                 output.append({
                     "type": "mcp_call",
@@ -129,13 +167,15 @@ class FakeResponsesServer:
     """进程内假网关：`decide(text) -> (工具名, 参数) | None`。"""
 
     def __init__(self, decide: Decide, answer: str = "好的，没问题。",
-                 style: str = "mcp", host: str = "127.0.0.1", port: int = 0) -> None:
-        """style: mcp（标准 mcp_call）/ function（function_call）/ hermes（元工具包装）。"""
+                 style: str = "mcp", host: str = "127.0.0.1", port: int = 0,
+                 tool_url: str = "http://127.0.0.1:9009/media/remote.mp3") -> None:
+        """style: mcp / function / hermes（元工具包装）/ hermes_output（带工具结果 URL）。"""
         self.httpd = ThreadingHTTPServer((host, port), _Handler)
         self.httpd.daemon_threads = True
         self.httpd.decide = decide  # type: ignore[attr-defined]
         self.httpd.answer = answer  # type: ignore[attr-defined]
         self.httpd.style = style  # type: ignore[attr-defined]
+        self.httpd.tool_url = tool_url  # type: ignore[attr-defined]
         self.httpd.requests = []  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()

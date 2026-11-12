@@ -221,6 +221,58 @@ def _post(body: bytes, cfg: ResponsesConfig) -> dict[str, Any]:
 # ============================================================================
 
 
+def parse_tool_output(text: str) -> dict[str, Any] | None:
+    """把工具结果文本还原成 dict（我们的 MCP 工具返回 JSON 对象）。
+
+    兼容三种形态：
+      1. 纯 JSON：`{"ok":true,...}`（标准 `mcp_call.output`）；
+      2. Hermes 包装：`<untrusted_tool_result ...>\n{...}\n</untrusted_tool_result>`，
+         外层 JSON 形如 `{"result":"<内层 JSON 字符串>","structuredContent":{...}}`；
+      3. 解析失败返回 None（调用方回退到本地执行器/曲库）。
+    """
+    if not isinstance(text, str):
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+
+    if raw.startswith("<untrusted_tool_result"):
+        start = raw.find("{")
+        if start < 0:
+            return None
+        try:
+            wrapper, _ = json.JSONDecoder().raw_decode(raw[start:])
+        except json.JSONDecodeError:
+            return None
+        return _unwrap_tool_result(wrapper)
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and ("result" in data or "structuredContent" in data):
+        return _unwrap_tool_result(data)
+    return data if isinstance(data, dict) else None
+
+
+def _unwrap_tool_result(wrapper: Any) -> dict[str, Any] | None:
+    if not isinstance(wrapper, dict):
+        return None
+    inner = wrapper.get("result")
+    if inner is None:
+        structured = wrapper.get("structuredContent")
+        if isinstance(structured, dict):
+            inner = structured.get("result")
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except json.JSONDecodeError:
+            return None
+    return inner if isinstance(inner, dict) else None
+
+
+
+
 def _parse_args(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -297,7 +349,12 @@ def parse_response(data: dict[str, Any]) -> ResponsesResult:
     result = ResponsesResult(raw=data, request_id=str(data.get("id", "")))
 
     output = data.get("output")
+    call_outputs: dict[str, str] = {}
     if isinstance(output, list):
+        for item in output:
+            if (isinstance(item, dict) and item.get("type") == "function_call_output"
+                    and item.get("call_id")):
+                call_outputs[str(item["call_id"])] = str(item.get("output") or "")
         for item in output:
             if not isinstance(item, dict):
                 continue
@@ -328,6 +385,12 @@ def parse_response(data: dict[str, Any]) -> ResponsesResult:
                 )
             elif kind == "message":
                 result.text += _message_text(item)
+
+    # Hermes 把 MCP 结果单独放在 function_call_output 里；按 call_id 贴回调用，
+    # 供上层（music_tools.apply_remote）直接拿 URL，不再依赖本地曲库。
+    for call in result.tool_calls:
+        if not call.output and call.call_id in call_outputs:
+            call.output = call_outputs[call.call_id]
 
     # output_text 是汇总字段（可能和 message 重复）
     top_text = data.get("output_text")

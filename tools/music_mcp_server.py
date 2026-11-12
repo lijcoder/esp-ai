@@ -137,7 +137,7 @@ def make_server(session: MusicSession) -> MCPServer:
             LOG.info("tool=%s args=%s → %s（changed）", name, arguments, command.message)
         else:
             LOG.info("tool=%s args=%s → %s", name, arguments, command.message)
-        return _json(command.to_result())
+        return _json(command.to_result(include_url=True))
 
     @server.tool(name=TOOL_SEARCH, description=TOOL_SPECS[TOOL_SEARCH]["description"])
     async def music_search(query: str, limit: int = 5) -> str:

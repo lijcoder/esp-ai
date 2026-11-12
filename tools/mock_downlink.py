@@ -680,12 +680,23 @@ class DownlinkMixin:
                 self._log(logging.DEBUG, f"[MUSIC] 跳过非音乐工具 {call.name!r}")
                 continue
             self.stats.music_intents += 1
-            command = await asyncio.to_thread(
-                music_tools.execute_tool, session, canonical, call.arguments
-            )
-            self._log(logging.INFO,
-                      f"[MUSIC] tool={call.name} args={call.arguments} → "
-                      f"ok={command.ok} state={command.state} {command.message}")
+            # 优先用工具结果（Hermes 的 function_call_output）驱动：里面带 URL，
+            # 这样 mock 不再需要 --music-catalog；结果缺失/不可识别时回退本地执行器。
+            command = None
+            remote = responses_client.parse_tool_output(getattr(call, "output", ""))
+            if remote is not None:
+                command = session.apply_remote(remote)
+                if command is not None:
+                    self._log(logging.INFO,
+                              f"[MUSIC] tool={call.name}（用工具结果的 URL）→ "
+                              f"ok={command.ok} state={command.state} {command.message}")
+            if command is None:
+                command = await asyncio.to_thread(
+                    music_tools.execute_tool, session, canonical, call.arguments
+                )
+                self._log(logging.INFO,
+                          f"[MUSIC] tool={call.name} args={call.arguments} → "
+                          f"ok={command.ok} state={command.state} {command.message}")
             if not command.ok:
                 continue
             if command.action in ("search", "status"):

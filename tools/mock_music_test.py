@@ -171,6 +171,25 @@ def test_tools(check: Checker) -> None:
     check.ok('"state"' in prompt and "music_play" in prompt, "system prompt 注入状态/规则")
     check.ok("http" not in prompt, "system prompt 不含 URL")
 
+    # 工具结果自带 URL：空曲库也能起播（mock 不再依赖 --music-catalog）
+    url = "http://192.168.1.10:9009/media/remote.mp3"
+    payload = {
+        "ok": True, "action": "play", "changed": False, "state": "playing",
+        "matched": True, "message": "远程工具已执行",
+        "track": {"track_id": "remote01", "title": "远程曲目", "artist": "测试",
+                  "duration_ms": 0, "url": url},
+    }
+    bare = music_tools.MusicSession(MusicService(catalog=MusicCatalog()))
+    command = bare.apply_remote(payload)
+    check.ok(command is not None and command.ok and command.changed,
+             "空曲库也能按工具结果 URL 起播")
+    check.eq(command.track.url if command and command.track else None, url, "URL 来自工具结果")
+    again = bare.apply_remote(payload)
+    check.ok(again is not None and again.ok and not again.changed,
+             "同 URL 重复 apply → changed=false")
+    bad = dict(payload, track=dict(payload["track"], url="file:///etc/passwd"))
+    check.ok(bare.apply_remote(bad) is None, "非 http(s) URL 被拒绝")
+
     definitions = music_tools.tool_definitions()
     names = {item["name"] for item in definitions}
     check.ok({"music_search", "music_play", "music_pause", "music_resume",
@@ -506,6 +525,27 @@ def test_responses_parse(check: Checker) -> None:
     check.eq(result.tool_calls[0].arguments.get("track_id"), "abcd1234",
              "output 兜底还原 track_id")
 
+    # Hermes 的 function_call_output：工具结果（含 URL）单独一项，按 call_id 回填
+    inner = {"ok": True, "action": "play", "changed": False, "state": "playing",
+             "matched": True, "message": "开始播放《主角》",
+             "track": {"track_id": "6cec2605", "title": "主角", "artist": "王菲",
+                       "duration_ms": 0, "url": "http://192.168.1.10:9009/z.mp3"}}
+    wrapped = ('<untrusted_tool_result source="mcp__music__music_play">\n'
+               + json.dumps({"result": json.dumps(inner, ensure_ascii=False)},
+                            ensure_ascii=False)
+               + '\n</untrusted_tool_result>')
+    parsed = responses_client.parse_tool_output(wrapped)
+    check.eq(parsed.get("track", {}).get("url") if parsed else None,
+             "http://192.168.1.10:9009/z.mp3", "解析 Hermes 工具结果里的 URL")
+
+    result = responses_client.parse_response({"output": [
+        {"type": "function_call", "call_id": "c9", "name": "tool_call",
+         "arguments": '{"calls":[{"name":"mcp__music__music_play","arguments":{}}]}'},
+        {"type": "function_call_output", "call_id": "c9", "output": wrapped},
+    ]})
+    check.ok(result.tool_calls and result.tool_calls[0].output == wrapped,
+             "function_call_output 按 call_id 贴回调用")
+
     # Hermes 真机形态：tool_describe + tool_call{calls:[mcp__music__music_play]}
     result = responses_client.parse_response({
         "output": [
@@ -803,6 +843,33 @@ async def test_hermes_tool_shape(check: Checker) -> None:
         responses.stop()
 
 
+async def test_remote_url_e2e(check: Checker) -> None:
+    """MCP 结果里直接带 URL：mock 不配置曲库也能下发 music_track。"""
+    check.section("D5. 工具结果自带 URL")
+    url = "http://127.0.0.1:9009/media/remote.mp3"
+    responses = FakeResponsesServer(_decide_e2e, style="hermes_output", tool_url=url)
+    cfg = Config(host="127.0.0.1", port=0, music=True, no_tts=True, think_ms=0, quiet=True,
+                 tts_text="放首晴天",
+                 llm_base_url=responses.base, llm_api_key="test", llm_model="fake")
+    server = MockServer(cfg)
+    ws = None
+    try:
+        ws, _ = await _open(server)
+        msgs = await _collect_round(ws, 1)
+        track_event = _find(msgs, "music_track")
+        check.ok(track_event is not None, "工具结果 URL → 下发 music_track")
+        check.eq(track_event.get("url") if track_event else None, url, "music_track.url 来自工具结果")
+        check.eq(track_event.get("title") if track_event else None, "远程曲目",
+                 "music_track.title 来自工具结果")
+        session = next(iter(server.active.values()))
+        check.eq(session.stats.music_intents, 1, "统计 1 次工具调用")
+    finally:
+        if ws is not None:
+            await ws.close()
+        await server.stop()
+        responses.stop()
+
+
 async def test_music_with_llm_pipeline(check: Checker) -> None:
     """`--llm --llm-tts-stream` 同开时，音乐意图必须短路 LLM 流水线（不能重复回答/报 LLM 错）。"""
     check.section("D. --llm-tts-stream 同开")
@@ -955,6 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
         test_session_tracking(check)
         asyncio.run(test_inline_tools(check))
         asyncio.run(test_hermes_tool_shape(check))
+        asyncio.run(test_remote_url_e2e(check))
         asyncio.run(test_e2e(check))
         asyncio.run(test_e2e_search(check))
         asyncio.run(test_music_with_llm_pipeline(check))

@@ -100,7 +100,7 @@ class Command:
     message: str = ""
     items: list[dict[str, Any]] = field(default_factory=list)
 
-    def to_result(self) -> dict[str, Any]:
+    def to_result(self, include_url: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {
             "ok": self.ok,
             "action": self.action,
@@ -110,20 +110,37 @@ class Command:
             "message": self.message,
         }
         if self.track is not None:
-            result["track"] = track_public(self.track)
+            result["track"] = track_public(self.track, include_url=include_url)
         if self.items:
             result["tracks"] = self.items
         return result
 
 
-def track_public(track: MusicTrack) -> dict[str, Any]:
-    """给模型看的曲目信息：**只有 track_id，没有 URL**（URL 由客户端按 id 取）。"""
-    return {
+def is_playable_url(url: str) -> bool:
+    """设备侧只接受 http(s) 且长度 < 320（端侧 MUSIC_URL_MAX 含 NUL）。"""
+    return (
+        isinstance(url, str)
+        and 0 < len(url) < 320
+        and url.startswith(("http://", "https://"))
+    )
+
+
+def track_public(track: MusicTrack, include_url: bool = False) -> dict[str, Any]:
+    """给模型/客户端看的曲目信息。
+
+    `include_url=False`（默认）只给 track_id，客户端回曲库取 URL；
+    `include_url=True` 时额外带 url——MCP 结果走这条路，客户端可不再依赖曲库。
+    是否带 URL 由调用方决定（MCP 服务带，内部执行器不带）。
+    """
+    data: dict[str, Any] = {
         "track_id": track_id_of(track.url),
         "title": track.title,
         "artist": track.artist,
         "duration_ms": int(track.duration_ms),
     }
+    if include_url:
+        data["url"] = track.url
+    return data
 
 
 class MusicSession:
@@ -258,6 +275,77 @@ class MusicSession:
                        items=[track_public(t) for t in self.queue],
                        message=f"当前状态 {self.state}")
 
+    # ---- 远程结果（MCP/Responses 的 function_call_output） ----
+
+    def apply_remote(self, payload: dict[str, Any]) -> Command | None:
+        """用工具返回的结果更新本地状态；返回 None 表示无法识别、由调用方本地执行。
+
+        URL 只来自**工具结果**（MCP 服务产出），不接受模型在 arguments 里塞的 URL：
+        模型可以看到工具结果，但无法伪造服务端返回。
+        `changed` 一律按**本地**状态算（MCP 进程的状态可能来自别的会话/更早的测试）。
+        """
+        if not isinstance(payload, dict):
+            return None
+        action = str(payload.get("action") or "")
+        message = str(payload.get("message") or "")
+        track = _track_from_public(payload.get("track"))
+
+        if action == "search":
+            tracks = payload.get("tracks")
+            parsed = [t for t in (_track_from_public(item) for item in tracks or [])
+                      if t is not None]
+            if not parsed:
+                return None
+            self.queue, self.index = parsed, 0
+            return Command(ok=True, action="search", state=self.state, matched=True,
+                           items=[track_public(t) for t in parsed],
+                           message=message or f"找到 {len(parsed)} 首候选")
+
+        if action == "status":
+            return self.status()
+
+        if action in (ACTION_PLAY, ACTION_NEXT, ACTION_PREV):
+            if track is None:
+                return None
+            changed = self.current is None or self.current.url != track.url
+            self.current = track
+            self.state = STATE_PLAYING
+            self.queue = []
+            self.index = -1
+            self.service.last_url = track.url
+            return Command(ok=True, action=action, changed=changed, state=self.state,
+                           track=track, matched=bool(payload.get("matched", True)),
+                           message=message or f"开始播放《{track.title}》")
+
+        if action == ACTION_PAUSE:
+            if self.state == STATE_PAUSED:
+                return Command(ok=True, action=action, changed=False, state=self.state,
+                               track=self.current, message=message or "已经是暂停状态")
+            if self.state != STATE_PLAYING:
+                return None
+            self.state = STATE_PAUSED
+            return Command(ok=True, action=action, changed=True, state=self.state,
+                           track=self.current, message=message or "已暂停")
+
+        if action == ACTION_RESUME:
+            if self.state != STATE_PAUSED:
+                return None
+            self.state = STATE_PLAYING
+            return Command(ok=True, action=action, changed=True, state=self.state,
+                           track=self.current, message=message or "继续播放")
+
+        if action == ACTION_STOP:
+            if self.state == STATE_IDLE and self.current is None:
+                return Command(ok=True, action=action, changed=False, state=self.state,
+                               message=message or "当前没有在播放")
+            self.state = STATE_IDLE
+            self.current = None
+            self.queue = []
+            self.index = -1
+            return Command(ok=True, action=action, changed=True, state=self.state,
+                           message=message or "已停止播放")
+        return None
+
     # ---- 内部 ----
 
     def _step(self, direction: int) -> Command:
@@ -315,6 +403,21 @@ class MusicSession:
 # ============================================================================
 # 参数校验 + 工具分发
 # ============================================================================
+
+
+def _track_from_public(data: Any) -> MusicTrack | None:
+    """工具结果里的 track 对象 → MusicTrack；URL 非法则丢弃。"""
+    if not isinstance(data, dict):
+        return None
+    url = str(data.get("url") or "")
+    if not is_playable_url(url):
+        return None
+    return MusicTrack(
+        title=str(data.get("title") or "远程曲目"),
+        url=url,
+        duration_ms=int(data.get("duration_ms") or 0),
+        artist=str(data.get("artist") or ""),
+    )
 
 
 def _as_str(value: Any) -> str:

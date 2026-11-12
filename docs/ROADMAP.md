@@ -159,7 +159,7 @@
 | T4.2 | **`music_cloud`（2026-11-10 真机验收）**：`music_track`/`music_control` 解析、`mid` 过滤、`music_status` 每 5s 上报；**`music_request`（端侧主动点歌）与 `pause/resume` 执行移入 T4.3**（ARCH §6.3 边界） | 音乐协议闭环（`music_e2e_test` 62/62 + `music_proto_test` 22/22） |
 | T4.3 | **`music_session`（2026-11-10 真机验收）**：状态机 + 起播/切歌重试、**暂停/继续（保 ring 从暂停点续播）**、`music_request`（含 resume 失败兜底）、**语音抢占**（语音活跃 auto-pause、回 IDLE 仅语音抢占才 auto-resume（**T4.4 C1 起改为保持暂停**）、用户暂停 latch 优先）；`music_cloud` 收敛为纯协议；host 单测 76/76 | 音乐控制完整（`music_e2e_test` 62/62 + `music_proto_test` 22/22；长暂停兜底拆 PV-015→T4.5） |
 | T4.4 | **音乐暂停保留 + 按键打断（2026-11-12 收口）**：C1（音乐打断=暂停保留、会话结束不恢复、按键=语音丢弃/音乐暂停）+ C2（PSRAM 内存优化）已交付；**C3 AEC 未采用**（人声歌曲 ERLE 0~3.6dB）；但**用户真机实测音乐中唤醒可暂停/交互（近场/正常音量）**，AEC 不是必需；边界（音量/距离/误唤醒）归 T5.2 | C1/C2 已上板；音乐中语音唤醒可用（近场），边界待 T5.2 量化 |
-| T4.5 | **播放稳定性（2026-11-12 构建完成，待 PV-018 真机）**：预缓冲 **200ms**、断流重连 + **Range 续播**（按已收字节偏移）、初始连接退避重试、坏帧 resync、长暂停恢复 | 长播不中断（代码完成；真机晚上验） |
+| T4.5 | **播放稳定性（2026-11-12 真机验收通过）**：预缓冲 **200ms**、断流重连 + **Range 续播**（按已收字节偏移）、初始连接退避重试、坏帧 resync、长暂停恢复 | 长播不中断（30min `/stream/`、underruns 0、0 复位；PV-018 关闭） |
 
 > **T4.2 完成（2026-11-10，真机验收通过；PV-013 关闭）**：真机 `music_e2e_test`/`music_proto_test` 覆盖点歌出声、5s `music_status`、stop、切歌、重复/过期 `mid` 丢弃、非 http(s)/非 mp3 丢弃；新增 `music_cloud`（L3，不建任务）——WS 附加订阅槽解析 `music_track`/`music_control`，按连接内 `mid` 过滤（track 只收更新的、control 允许等于当前曲目），起播/切歌在 `esp_timer` 串行执行（切歌先 stop 再 play，120ms×15 重试），播放中每 5s 上行 `music_status{state,mid,progress_ms}` + 状态变化立即一次，周期定时器兼任 EOF/失败探测；`pause/resume` 只解析计数（执行归 T4.3）；`voice_cloud` 对音乐事件静默跳过；`diag` 增 `mc status|report|reset`。构建：bin 1,982,880 B / 总镜像 1,982,760 B / 静态 DIRAM 201,046 B（+784 B），无新任务。数据见 [STATUS.md](STATUS.md) §5。
 

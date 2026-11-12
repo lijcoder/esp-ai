@@ -155,6 +155,17 @@
 | 关联 | STATUS §1 阻塞项、PV-009（历史 BOD）、HARDWARE §5 电源、`docs/PENDING.md` 时间线 |
 | 处置 | 电源修复后已恢复 C2/C3（`c3a7e89`），音量 60；复测通过后关闭 |
 
+### PV-018 · T4.4 收口 + T4.5 真机验收（开发板不在手边，用户晚上测）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-12 10:2x（采样）**，用户明确“开发板不在身边，晚上回家测，记录待办” |
+| 来源 | T4.4 收口（C1/C2 已上板、C3 no-go）+ T4.5 播放稳定性开发（构建口径） |
+| 待验证（T4.4） | ① 音乐播放中按键/`evt post BUTTON` → 暂停保留；回 IDLE 保持暂停；`ms resume` 从暂停点续播；② 新歌替换、停止丢弃；③ 连续播放 30 分钟无卡顿/欠载/复位；④ 无 BOD；⑤ `sys heap`/`sys tasks` 与 §5 基线一致 |
+| 待验证（T4.5） | ① 起播预缓冲 200ms（首声与欠载）；② 播放中 kill HTTP/断流 → 自动重连 + Range 续播（进度不回到 0；`MUSICHTTP reconnects/range` 计数）；③ 暂停 > 服务端 idle 超时后 `ms resume` → Range 从暂停点续播（PV-015）；④ 404/500/非 mp3 收敛；⑤ 30 分钟连续播放；⑥ 重连 3 次失败后收敛（不 panic、任务退出） |
+| 验收方法 | 用户晚上接板，按 `tools/music_play_test.py` / `music_e2e_test.py` / `music_proto_test.py` + 手动串口步骤执行；失败项记录串口日志/`ms status`/`music stat` |
+| 关闭条件 | T4.4 ①~⑤、T4.5 ①~⑤ 全过并记入 STATUS §5；若 T4.5 未实现项单独登记 |
+| 关联 | STATUS §2 T4.4/T4.5、PV-015、PV-017（BOD 已关闭）、build/t44_contract.md |
+
 ## 3. 待决定 / 已被暂缓（PD）
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）
@@ -206,7 +217,7 @@
 | 验证/关闭条件 | 真机 **PV-014 ⑥**（语音中说"下一首"）确认端侧行为可接受；**后端确认**按 `state+progress` 判活后关闭（或登记协议改进任务） |
 | 关联 | `components/music_session/music_session.c`（`s_track_pending`/`s_defer_pause_reason`）、ARCH §8.3「已知限制」、STATUS §3 T4.3 行、PV-014 |
 
-### PD-007 · T4.4b AEC 方案与内部 RAM 预算（spike 后拍板）
+### PD-007 · T4.4b AEC 方案与内部 RAM 预算（**已决定：暂不做，延后硬件升级**）
 | 项 | 内容 |
 |---|---|
 | 提出时间 | **2026-11-11 20:5x（采样）**，T4.4 方案定稿（语音打断依赖 AEC）时登记 |
@@ -215,8 +226,9 @@
 | 已获得的部分证据（2026-11-11 spike） | `diag aec test`（合成回声，590 帧计入耗时）：**SR_LOW_COST + PSRAM caps：内部 +12,576 B / PSRAM +69,716 B / avg 2.64ms、max 4.82ms（无 >5ms 帧）/ ERLE 59.7dB**；**FD_LOW_COST：内部 +12,660 B / PSRAM +108,692 B / avg 6.90ms、max 10.80ms（590/590 帧 >5ms）/ ERLE 65.2dB**；**caps=INTERNAL 实测 OOM→重启，不可用**。销毁后内部/PSRAM 均回落（无泄漏）。结论：AEC 必须 PSRAM caps，但内部仍要 ~12.6KB → **必须先做 C2 PSRAM 搬迁**（`music_http`/`ws` 栈 + `rbuf` + WS RX + HTTP buffer ≈21KB）才能进预算；SR 的 CPU 可接受，FD 需在真实音乐/TTS 负载下复测 |
 | C2 后状态（2026-11-11） | 已搬 ~24KB 内部到 PSRAM（含 2 个任务栈）；音乐期内部水位 **37,203 B**、free 43,947 B。AEC 候选实测：**SR_LOW_COST filter=2：内部 +6,440 B / 0.81ms**（AEC 后水位 ~30.8KB，余量仅 43B）；**SR_HIGH_PERF filter=2：内部 +4,388 B / 1.78ms**（水位 ~32.8KB，较稳）；SR filter=4 内部 +12,576 B（水位 ~24.6KB，破线）；FD avg 6.9ms（需负载复测）。近端 2kHz 经 AEC 后 RMS≈1409（注入≈2000，未吞近端）；合成 ERLE inf/59.7dB 仅证链路。 |
 | C3 结论（2026-11-11） | 真实参考链路已打通（tone 18.8dB），但**人声歌曲 ERLE 仅 0~3.6dB**；唤醒实测：music vol0 5/5、vol10 0/3（同曲暂停 3/3）、vol20 0/5、vol30 0/10（AEC on/off 均 0）。**音乐中唤醒 no-go**（单麦 + 软件参考 + WakeNet 的边界）。 |
-| 待决定 | ① 继续调参（filter=8/FD high-perf/近场大声/仅器乐）是否值得；② 接受按键兜底、放弃语音唤醒打断；③ 硬件升级（第二颗麦/带 ADC 回采 codec，H1/H2）；② 是否允许放宽 440KB/30KB 预算；③ 若真实参考（C3）go/no-go 不达标，接受“仅近场/仅音乐/仅按键”的哪一种降级；④ C2 是否搬 `vc` 栈（8KB，Opus 实时路径，风险较高） |
+| 待决定（已收口） | 决定见下方“决定”行：**暂不做，延后硬件升级**；不再继续调参/C4。 |
 | 关闭条件 | C3 spike 产出内部/PSRAM 增量、单帧耗时、ERLE、音乐/TTS 中唤醒成功率（≥8/10）后，用户拍板并回写 ARCH §1/§5、CONVENTIONS §4、PRODUCT_IDEAS F5 |
+| **决定（2026-11-12 10:2x 采样）** | **暂不做**：现有单麦 + 软件参考 + WakeNet 的 C3 实测（tone 18.8dB，人声歌曲 0~3.6dB，音乐中唤醒 0/5~0/10）判定 no-go；C4（R1 修订/TTS 打断）不启动。音乐中语音唤醒延后到硬件升级（第二颗麦/带 ADC 回采 codec，PRODUCT_IDEAS H1/H2）；当前交互 = 按键/语音暂停。 |
 | 关联 | `build/t44_contract.md` §5/§5.3、ARCH §3.3 R1/R3、STATUS §1 阻塞项、PV-015（T4.5） |
 
 ### PD-002 · 断网没有独立的视觉/听觉反馈（设计缺口）

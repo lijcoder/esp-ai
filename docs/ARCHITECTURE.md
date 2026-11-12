@@ -517,10 +517,10 @@ music_session ──music_request──> 服务端 ──music_track{url}──>
 
 > **实现状态（2026-11-10，T4.1–T4.3 真机验收通过）**：T4.1 `source_http` + `music play/stop/stat` 探针、T4.2 `music_cloud` 协议、
 > T4.3 `music_session` 状态机与暂停/继续/切歌/`music_request`/语音抢占均已交付并上板验证（`music_e2e_test` 62/62、`music_proto_test` 22/22）。
-> **T4.4 C1（2026-11-11 已上板）**：删除“语音回 IDLE 自动恢复”，音乐被语音/按键打断后**保持暂停**；按键打断语音=丢弃、只有音乐=暂停保留。**尚未实现**：语音打断（需 AEC，T4.4b）、duck 叠加（后续体验模式）、seek/Range/断流重连（T4.5）、域名白名单。
+> **T4.4 C1（2026-11-11 已上板）**：删除“语音回 IDLE 自动恢复”，音乐被语音/按键打断后**保持暂停**；按键打断语音=丢弃、只有音乐=暂停保留。**T4.5（2026-11-12 构建完成，待真机）**：预缓冲 200ms、断流重连 + **Range 按字节偏移续播**、初始连接退避重试、坏帧 resync；语音打断（需 AEC）/duck 叠加仍不做（C3 no-go），域名白名单未做。
 > `music_cloud` 与 `music_session` 都**不建任务**：解析在 `ws_client` 上下文，播放决策/重试/周期上报在两个 `esp_timer`。
 > **语音期间的动作一律排队到 IDLE**（2026-11-10 真机修复）：新 `music_track` 排队起播；`music_control{resume}` 也排队——若立即 `audio_player_music_resume()` 会占用单作业播放器，紧接着的确认语 TTS 直接 `tts-fail`（真机日志 `VS: state THINKING -> ERROR（原因=tts-fail）`）。排队只在 `LISTENING/FOLLOW_UP`（新一轮）清空，`THINKING/SPEAKING` 期间保留；暂停/停止/切歌会丢弃排队项。
-> **已知限制**：暂停超过服务端 idle 超时（或 TCP 断）后"继续"可能拿不到数据 → 转 ERROR/STOPPED 并发一次 `music_request` 兜底（从头播；Range 续播归 T4.5；兜底路径真机未稳定触发，登记 **PV-015** 归 T4.5）；**语音活跃期间到达的新 `music_track` 排队到语音回 IDLE 才起播**，期间 `music_status` 可能先带新 `mid`（PENDING **PD-006**）。
+> **已知限制**：暂停超过服务端 idle 超时（或 TCP 断）后"继续"：T4.5 起 `source_http` 用 `Range: bytes=N-` 从暂停点续播（206 直接续、200 丢弃前 N 字节；最多 3 次、退避 300ms）；重连失败仍转 ERROR/STOPPED 并发一次 `music_request` 兜底（PV-015 待真机验证）；**语音活跃期间到达的新 `music_track` 排队到语音回 IDLE 才起播**，期间 `music_status` 可能先带新 `mid`（PENDING **PD-006**）。
 
 ### 8.4 音乐播放中唤醒
 

@@ -158,14 +158,14 @@
 | T4.1 | 源抽象：`source_http`（流式拉取、超时/重试；**只做远端 URL，不做 `source_file`**，2026-11-10 用户决定） | 远端 URL 可播放（**真机验收 2026-11-10**：`music_play_test` 16/16 + 60s 直播流 16/16） |
 | T4.2 | **`music_cloud`（2026-11-10 真机验收）**：`music_track`/`music_control` 解析、`mid` 过滤、`music_status` 每 5s 上报；**`music_request`（端侧主动点歌）与 `pause/resume` 执行移入 T4.3**（ARCH §6.3 边界） | 音乐协议闭环（`music_e2e_test` 62/62 + `music_proto_test` 22/22） |
 | T4.3 | **`music_session`（2026-11-10 真机验收）**：状态机 + 起播/切歌重试、**暂停/继续（保 ring 从暂停点续播）**、`music_request`（含 resume 失败兜底）、**语音抢占**（语音活跃 auto-pause、回 IDLE 仅语音抢占才 auto-resume（**T4.4 C1 起改为保持暂停**）、用户暂停 latch 优先）；`music_cloud` 收敛为纯协议；host 单测 76/76 | 音乐控制完整（`music_e2e_test` 62/62 + `music_proto_test` 22/22；长暂停兜底拆 PV-015→T4.5） |
-| T4.4 | **语音打断（barge-in）+ 音乐暂停保留（2026-11-11 定稿）**：播放音乐/TTS 时唤醒词打断（需 AEC）；音乐=暂停保留、TTS=丢弃；按键打断=暂停；会话结束**不自动恢复**；AEC spike 前置 | 语音优先体验（C1 按键/暂停语义已上板；语音打断待 AEC） |
-| T4.5 | 播放稳定性：预缓冲 200ms、断流重试、错误恢复 | 长播不中断 |
+| T4.4 | **音乐暂停保留 + 按键打断（2026-11-12 收口）**：C1（音乐打断=暂停保留、会话结束不恢复、按键=语音丢弃/音乐暂停）+ C2（PSRAM 内存优化）已交付；**C3 真实参考 AEC 实测 no-go**（人声歌曲 ERLE 0~3.6dB、音乐中唤醒 0/5~0/10），语音打断（barge-in）延后到硬件升级（H1/H2） | C1/C2 已上板；音乐中语音唤醒暂不支持（按键/语音暂停可用） |
+| T4.5 | **播放稳定性（2026-11-12 构建完成，待 PV-018 真机）**：预缓冲 **200ms**、断流重连 + **Range 续播**（按已收字节偏移）、初始连接退避重试、坏帧 resync、长暂停恢复 | 长播不中断（代码完成；真机晚上验） |
 
 > **T4.2 完成（2026-11-10，真机验收通过；PV-013 关闭）**：真机 `music_e2e_test`/`music_proto_test` 覆盖点歌出声、5s `music_status`、stop、切歌、重复/过期 `mid` 丢弃、非 http(s)/非 mp3 丢弃；新增 `music_cloud`（L3，不建任务）——WS 附加订阅槽解析 `music_track`/`music_control`，按连接内 `mid` 过滤（track 只收更新的、control 允许等于当前曲目），起播/切歌在 `esp_timer` 串行执行（切歌先 stop 再 play，120ms×15 重试），播放中每 5s 上行 `music_status{state,mid,progress_ms}` + 状态变化立即一次，周期定时器兼任 EOF/失败探测；`pause/resume` 只解析计数（执行归 T4.3）；`voice_cloud` 对音乐事件静默跳过；`diag` 增 `mc status|report|reset`。构建：bin 1,982,880 B / 总镜像 1,982,760 B / 静态 DIRAM 201,046 B（+784 B），无新任务。数据见 [STATUS.md](STATUS.md) §5。
 
 > **T4.3 完成（2026-11-10，真机验收通过；PV-014 关闭）**：真机验证暂停 318ms/progress 冻结、继续从暂停点、唤醒 auto-pause+会后 auto-resume（**T4.4 C1 起改为会后保持暂停**）、用户 latch、切歌/停止、10 次暂停继续无泄漏；**修复**语音期 resume 抢播放器导致 `tts-fail`（改为排队到 IDLE）；新增 `music_session`（L4，不建任务）——状态机、暂停/继续（**保 ring 与读写位置、从暂停点续播**，`source_http` 暂停期不读 socket 靠 TCP 背压）、**与语音抢占**（语音活跃 auto-pause、回 IDLE 仅语音抢占才 auto-resume、用户暂停 latch 优先）、`music_request` 兜底、`music_status` 增 `paused`；`music_cloud` 收敛为纯协议（不调播放器/无定时器），`voice_session` 删除 T3.2 音乐淡出分支。构建：bin 1,993,152 B / 总镜像 1,993,028 B / 静态 DIRAM 200,870 B（**−176 B**），无新任务、无堆分配。数据见 [STATUS.md](STATUS.md) §5。
 
-**验收**：连续播放 30 分钟无卡顿；起播 < 1.5s；按键/语音打断 → 停声 ≤200ms；音乐打断后保持暂停、说“继续”从暂停点续播；AEC go/no-go 达标（音乐/TTS 中唤醒 ≥8/10）。
+**验收**：连续播放 30 分钟无卡顿；起播 < 1.5s；按键打断 → 停声 ≤100ms；音乐打断后保持暂停、说“继续”从暂停点续播；**音乐中语音唤醒暂不要求**（C3 no-go，硬件升级后重评）。
 
 > **T4.4 定稿（2026-11-11）**：放弃“duck 叠加”，改为 **pause 模式**——打断音乐=暂停保留、会话结束不自动恢复；打断 TTS=丢弃；按键打断保留。**C1（按键/暂停语义）已上板**；语音打断依赖 `esp_aec`（先 spike，go/no-go 见 `build/t44_contract.md` §5）；**30 分钟连续播放**归 T4.5。
 

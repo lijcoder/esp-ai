@@ -16,6 +16,7 @@ import asyncio
 import logging
 import threading
 import time
+from typing import Any
 
 from websockets.exceptions import ConnectionClosed
 
@@ -31,7 +32,10 @@ from mock_core import (
     parse_mp3_frames,
 )
 from mock_pipeline import LlmTtsPipeline, PipelineConfig, SegmenterConfig
-from mock_music import ACTION_NEXT, ACTION_PLAY, TRACK_ACTIONS, build_control_event
+import music_tools
+import responses_client
+from mock_music import (ACTION_NEXT, ACTION_PLAY, ACTION_PREV, CONTROL_ACTIONS,
+                        build_control_event)
 
 
 def module_speakable(text: str) -> bool:
@@ -582,70 +586,126 @@ class DownlinkMixin:
             "（码表见 PROTOCOL.md §4：3001/3002=TTS 失败，其余=通用/服务异常）",
         )
 
-    async def _music_flow(self, text: str) -> str | None:
-        """M1 双通道：ASR 文本 → 音乐意图（暂停/继续/下一首/停止/点歌）。
+    # ---- 音乐：LLM 工具调用（Responses API / MCP），不再有关键词规则表 ----
 
-        命中：直接下发 `music_track`（曲目，含 URL）或 `music_control`（暂停/继续/停止），
-        返回固定确认语给 TTS 播；**不进 LLM**——控制指令要快且确定，LLM 也不该看到/输出 URL。
-        未命中：返回 None，本轮照旧交给 LLM/Hermes。
-        """
-        music = getattr(self.server, "music", None)
-        if music is None:
-            return None
-        intent = music.parser.parse(text)
-        if intent is None:
-            return None
-
-        self.stats.music_intents += 1
-        if intent.action in TRACK_ACTIONS:
-            track = None
-            matched = False
-            if intent.action == ACTION_PLAY and intent.query:
-                # 点歌：搜索源优先（HTTP，放线程）；失败/无结果回退本地曲库
-                tracks = await asyncio.to_thread(music.search_tracks, intent.query, 5)
-                if tracks:
-                    self.music_queue, self.music_index = tracks, 0
-                    track, matched = tracks[0], True
-                else:
-                    track, matched = music.catalog.resolve(intent.query)
-            elif intent.action == ACTION_PLAY:      # "放首歌"（无 query）：曲库浏览（单条搜索结果不困住）
-                if len(self.music_queue) > 1:
-                    self.music_index = max(0, self.music_index)
-                    track, matched = self.music_queue[self.music_index], True
-                else:
-                    track, matched = music.catalog.resolve("")
-            elif len(self.music_queue) > 1:         # 下一首/上一首：多结果时先在搜索结果里游标移动
-                step = 1 if intent.action == ACTION_NEXT else -1
-                self.music_index = (self.music_index + step) % len(self.music_queue)
-                track, matched = self.music_queue[self.music_index], True
-            else:
-                track, matched = music.track_for(intent)   # 回退曲库游标
-            if track is None:
-                self._log(logging.WARNING, f"[MUSIC] 意图={intent.action} 但曲库/搜索都没有结果")
-                return "抱歉，没找到这首歌。"
-            self.music_mid = (self.music_mid + 1) & 0xFFFF
-            await self._send_json(track.as_event(self.music_mid))
-            music.last_url = track.url
-            self.stats.music_tracks += 1
-            detail = (
-                f"（搜索结果 {len(self.music_queue)} 首 / 当前 {self.music_index + 1}）"
-                if self.music_queue
-                else ("" if matched else "（曲库未匹配，回退当前曲目）")
-            )
-            self._log(
-                logging.INFO,
-                f"[MUSIC] 意图={intent.action} 规则={intent.rule!r} query={intent.query!r} → "
-                f"《{track.title}》mid={self.music_mid}{detail}",
-            )
-            return music.confirm_text(intent.action, track)
-
-        await self._send_json(build_control_event(self.music_mid, intent.action))
-        self.stats.music_controls += 1
-        self._log(
-            logging.INFO,
-            f"[MUSIC] 控制 action={intent.action} 规则={intent.rule!r} mid={self.music_mid}",
+    def _responses_config(self) -> responses_client.ResponsesConfig:
+        cfg = self.cfg
+        return responses_client.ResponsesConfig.from_env(
+            base_url=cfg.llm_base_url or None,
+            api_key=cfg.llm_api_key or None,
+            model=cfg.llm_model or None,
         )
-        return music.confirm_text(intent.action, None)
+
+    async def _apply_music_command(self, command: Any) -> None:
+        """把执行器返回的命令变成设备事件（play/next/prev → track；pause/resume/stop → control）。"""
+        if not command.changed:
+            self._log(logging.DEBUG,
+                      f"[MUSIC] {command.action} 无状态变化（{command.message}），不下发事件")
+            return
+        if command.track is not None and command.action in (ACTION_PLAY, ACTION_NEXT, ACTION_PREV):
+            self.music_mid = (self.music_mid + 1) & 0xFFFF
+            await self._send_json(command.track.as_event(self.music_mid))
+            self.stats.music_tracks += 1
+            self.server.music.last_url = command.track.url
+            self._log(logging.INFO,
+                      f"[MUSIC] 工具 {command.action} → music_track mid={self.music_mid} "
+                      f"《{command.track.title}》")
+            return
+        if command.action in CONTROL_ACTIONS:
+            await self._send_json(build_control_event(self.music_mid, command.action))
+            self.stats.music_controls += 1
+            self._log(logging.INFO,
+                      f"[MUSIC] 工具 {command.action} → music_control mid={self.music_mid}")
+            return
+        self._log(logging.DEBUG, f"[MUSIC] 工具 {command.action} 不需要下发事件")
+
+    async def _music_flow(self, text: str) -> tuple[bool, str | None]:
+        """ASR 文本 → Responses API → 工具调用 → 设备事件 + 模板确认语。
+
+        返回 `(handled, answer)`：
+          - `handled=True`：已执行音乐动作，`answer` 是固定确认语（不再走 LLM 复述）；
+          - `handled=False, answer=None`：模型没给文本也没调工具（调用方照旧走 LLM/复读）；
+          - `handled=False, answer="..."`：模型给了普通回答（本轮已调过模型，不要再调一次）。
+        """
+        music = self.server.music
+        session = getattr(self, "music_session", None)
+        if music is None or session is None:
+            return False, None
+
+        cfg = self.cfg
+        mode = getattr(cfg, "music_tool_mode", "mcp")
+        try:
+            rcfg = self._responses_config()
+            rcfg.require_ready()
+        except Exception as exc:  # noqa: BLE001 - 缺配置只降级，不拖垮语音链路
+            if not getattr(self, "_music_llm_warned", False):
+                self._music_llm_warned = True
+                self._log(logging.WARNING,
+                          f"[MUSIC] 未配置 Responses API（{exc}）；本轮音乐不执行"
+                          "（export LLM_BASE_URL / LLM_MODEL / LLM_API_KEY）")
+            self.stats.music_llm_errors += 1
+            return False, None
+
+        tools = music_tools.tool_definitions() if mode == "inline" else None
+        # 基础人设（--llm-system / 默认语音助手）+ 音乐工具规则；音乐轮外也走同一次调用，
+        # 避免「开了 --music 之后普通问答失去助手口径」。
+        base_system = (cfg.llm_system or "").strip() or llm_client.DEFAULT_SYSTEM
+        system = base_system + "\n\n" + music_tools.system_prompt_for(session)
+        try:
+            result = await asyncio.to_thread(
+                responses_client.responses_call, text, rcfg,
+                system=system, tools=tools, max_output_tokens=256,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+                raise
+            self.stats.music_llm_errors += 1
+            self._log(logging.WARNING, f"[MUSIC] Responses 调用失败（本轮不执行音乐）：{exc}")
+            return False, None
+
+        calls = responses_client.parse_tool_calls(result)
+        if not calls:
+            answer = result.text.strip()
+            self._log(logging.INFO,
+                      f"[MUSIC] 模型未调用音乐工具（mode={mode}）"
+                      + (f"，回答：{answer[:40]!r}" if answer else ""))
+            return False, (answer or None)
+
+        handled = False
+        confirm: str | None = None
+        for call in calls:
+            canonical = music_tools.canonical_tool_name(call.name)
+            if canonical not in music_tools.TOOL_NAMES:
+                # 网关可能夹带其它 MCP 工具（日历/文件系统…）：静默跳过，不计数
+                self._log(logging.DEBUG, f"[MUSIC] 跳过非音乐工具 {call.name!r}")
+                continue
+            self.stats.music_intents += 1
+            command = await asyncio.to_thread(
+                music_tools.execute_tool, session, canonical, call.arguments
+            )
+            self._log(logging.INFO,
+                      f"[MUSIC] tool={call.name} args={call.arguments} → "
+                      f"ok={command.ok} state={command.state} {command.message}")
+            if not command.ok:
+                continue
+            if command.action in ("search", "status"):
+                continue  # 只读工具：不下发设备事件
+            if handled:
+                self._log(logging.DEBUG,
+                          f"[MUSIC] 一轮只执行第一个动作，忽略 {command.action}")
+                continue
+            await self._apply_music_command(command)
+            handled = True
+            confirm = music.confirm_text(command.action, command.track)
+
+        if handled:
+            return True, confirm
+        # 只调了 search/status：用模型文本，没有文本就给一句候选提示
+        answer = result.text.strip()
+        if not answer and session.queue:
+            titles = "、".join(t.title for t in session.queue[:3])
+            answer = f"找到 {len(session.queue)} 首：{titles}。"
+        return False, (answer or None)
 
     async def _tts_flow(self, asr_packets: list[bytes] | None = None) -> None:
         sid = self.sid
@@ -673,15 +733,16 @@ class DownlinkMixin:
             await self._send_json({"t": "asr_partial", "sid": sid, "text": text[: max(1, len(text) // 2)]})
             await self._send_json({"t": "asr_final", "sid": sid, "text": text})
 
-            # 2026-11-10 M1：ASR 文本先过确定性音乐意图表（云端双通道的"控制通道"）。
-            # 命中就不走 Hermes/LLM：曲目/控制事件直接下发，回答用固定确认语。
-            music_confirm = await self._music_flow(text)
+            # 2026-11-12：音乐意图交给 LLM 工具调用（Responses API / MCP）。
+            # 命中后直接下发 music_track / music_control，并用固定确认语（不二次调模型）。
+            music_handled, music_answer = await self._music_flow(text)
 
             # LLM 流式 → TTS 流水线（2026-11-10，默认路径）：
             # 不等 LLM 整段回答，切出第一段就开始合成/下发；回答较长时首声明显提前。
             # 默认走旧路径（整段回答后合成，语音更连贯）；`--llm-tts-stream` 才启用流水线。
             if (
-                music_confirm is None          # 音乐意图已处理：不能再走 LLM（否则会重复回答）
+                music_answer is None           # 本轮已调过 Responses（含音乐/普通回答）：不再重复调模型
+                and not music_handled
                 and self.cfg.llm
                 and self.cfg.llm_tts_stream
                 and self.server.tts_qwen_module is not None
@@ -693,9 +754,11 @@ class DownlinkMixin:
                 return
 
             # 回答来源：音乐确认语（M1）/ --llm（大模型流式）/ 复读（默认，llm_delta 是识别文本切片）
+            if music_handled:
+                self._log(logging.INFO, "[MUSIC] 音乐动作已执行，跳过 LLM 复述")
             answer = text
-            if music_confirm is not None:
-                answer = music_confirm
+            if music_answer is not None:
+                answer = music_answer
                 await self._send_json({"t": "llm_delta", "sid": sid, "text": answer})
             elif self.cfg.llm:
                 try:

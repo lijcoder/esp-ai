@@ -13,6 +13,9 @@
 + 确认语的 `tts_start`/`tts_end`。默认 `--no-tts`（只发 JSON，不出音频帧），所以不需要
 ASR/TTS 模型，也不用连设备。
 
+音乐意图自 2026-11-12 起由 LLM 工具调用决定；本脚本内置一个**假 Responses 网关**，
+用几行“模拟模型决策”（`_decide`）把整句映射成工具调用——它只服务于演示，不是产品规则表。
+
 真正的"出声播放"要等端侧 T4.1（source_http）+ T4.2（music_cloud）；本脚本只验证云端侧协议。
 """
 
@@ -25,15 +28,35 @@ import sys
 
 from websockets.asyncio.client import connect
 
+from fake_responses import FakeResponsesServer
 from mock_core import Config
 from mock_server import MockServer
 
 DEFAULT_ROUNDS = ["放首周杰伦的晴天", "暂停", "下一首", "今天天气如何", "继续播放", "停止播放"]
 
 
+def _decide(text: str) -> tuple[str, dict] | None:
+    """演示用的“模拟模型决策”：整句 → 工具调用（产品路径由 Hermes/LLM 决定）。"""
+    if "暂停" in text:
+        return "music_pause", {}
+    if "继续" in text:
+        return "music_resume", {}
+    if "下一首" in text:
+        return "music_next", {}
+    if "上一首" in text:
+        return "music_prev", {}
+    if "停止" in text or "别放" in text:
+        return "music_stop", {}
+    if "晴天" in text or "放" in text:
+        return "music_play", {"query": "晴天" if "晴天" in text else ""}
+    return None
+
+
 async def main(rounds: list[str], search_url: str) -> int:
+    fake = FakeResponsesServer(_decide)
     cfg = Config(host="127.0.0.1", port=0, music=True, no_tts=True, think_ms=0, quiet=True,
-                 music_search_url=search_url)
+                 music_search_url=search_url,
+                 llm_base_url=fake.base, llm_api_key="fake", llm_model="fake")
     server = MockServer(cfg)
     port = await server.start()
     if server.music.demo_url:
@@ -62,6 +85,7 @@ async def main(rounds: list[str], search_url: str) -> int:
                 print()
     finally:
         await server.stop()
+        fake.stop()
     return 0
 
 

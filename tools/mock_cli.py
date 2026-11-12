@@ -156,11 +156,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help='tts_start 用 codec="pcm" 后发 tts_end、不发音频帧（触发设备侧 TTS 无法播放 → 失败提示音）',
     )
-    # ---- 2026-11-10：M1 音乐（mock 侧意图/曲库/内置 HTTP；不需要 Hermes 支持 tools） ----
+    # ---- 2026-11-10：M1 音乐；2026-11-12 起改由 LLM 工具调用（MCP / Responses） ----
     parser.add_argument(
         "--music",
         action="store_true",
-        help="启用音乐意图：ASR 文本命中控制/点歌规则时下发 music_track / music_control（不进 LLM）",
+        help="启用音乐：曲库/搜索可用，音乐意图由 LLM 工具调用决定（不再是关键词规则表）",
+    )
+    parser.add_argument(
+        "--music-tools",
+        choices=("mcp", "inline"),
+        default=None,
+        help="mcp=工具已配在 Hermes（默认；解析响应的 mcp_call）；"
+             "inline=本地把 function tools 传给 Responses API",
     )
     parser.add_argument(
         "--music-url",
@@ -265,6 +272,8 @@ def _validate_args(args: argparse.Namespace) -> int:
         max_tts_frames = 0 if (args.tts_mp3 or args.tts_qwen) else 100
     if (args.music_url or args.music_catalog) and not args.music:
         raise SystemExit("--music-url / --music-catalog 需要配合 --music 一起用")
+    if args.music_tools and not args.music:
+        raise SystemExit("--music-tools 需要配合 --music 一起用")
     if args.music_title and not args.music_url:
         raise SystemExit("--music-title 只对 --music-url 生效（曲库里的标题请写在 JSON 里）")
     if args.music_search_url and not args.music:
@@ -342,6 +351,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         error_stage=args.error_stage,
         tts_bad_codec=args.tts_bad_codec,
         music=args.music,
+        music_tool_mode=args.music_tools or "mcp",
         music_url=args.music_url,
         music_title=args.music_title,
         music_catalog=args.music_catalog,

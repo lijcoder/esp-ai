@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""mock_music —— 云端音乐意图与曲库（M1「双通道」方案的 mock 侧）。
+"""mock_music —— 音乐曲库 / 检索 / 内置 HTTP（M1 音乐能力的“数据层”）。
 
 ## 为什么需要它
 
 端侧（ESP32）不做任何 NLU：它只会「唤醒 → 上行音频」，以及按**结构化事件**
-播放/暂停。所以「用户说暂停」怎么变成设备动作，是云端的事。两条通道：
+播放/暂停。所以「用户说要放歌」怎么变成设备动作，是云端的事。
 
-  1. 控制通道（本文件）：ASR 文本先过一张确定性规则表（暂停/继续/下一首/停止…），
-     命中就直接下发 `music_control`，**不进 LLM**——否则说「暂停」要等一次 LLM 往返；
-  2. 内容通道：没命中控制词的句子照旧交给 LLM/Hermes 回答，URL 由曲库检索给出。
+**2026-11-12 起意图判断交给 LLM（工具调用 / MCP），本文件不再有规则表**：
+  - 工具定义与执行器：`tools/music_tools.py`（`MusicSession` + 8 个工具）
+  - MCP 服务：`tools/music_mcp_server.py`（可独立启动，也可配到 Hermes agent）
+  - 云端解析：`tools/responses_client.py`（Responses API 的 `function_call`/`mcp_call`）
 
-LLM/Hermes **不参与传 URL**：URL 只出现在下行 `music_track` 里（契约见 ARCH §6.3、
-PROTOCOL §3）。这样既不需要网关支持 tool calling，也不会出现「TTS 把 URL 念出来」。
+LLM/Hermes **不参与传 URL**：工具结果只给 `track_id/title/artist`，URL 只出现在下行
+`music_track` 里（契约见 ARCH §6.3、PROTOCOL §3）。这样既不会出现「TTS 把 URL 念出来」，
+也能挡住模型幻觉出来的非法地址。
 
 ## 职责
 
-  - `MusicIntentParser`：ASR 文本 → 意图（play/pause/resume/next/prev/stop + query）
   - `MusicCatalog`：query → 曲目（JSON 曲库 / `--music-url` 固定曲目 / 内置示例曲目）
   - `MusicHttpServer`：内置 HTTP 静态服务，给示例曲目一个**真机可播**的 URL
-  - `MusicService`：把上面三件事装在一起，供 mock_server 的会话调用
+  - `MusicService`：把上面几件事装在一起，供 mock_server / MCP 服务共用
+  - `track_id_of()`：曲目短 id（工具结果里指代曲目，不含 URL）
 
 纯标准库（不依赖 websockets），可单独单测；HTTP 服务用守护线程，mock 退出即结束。
 
@@ -35,6 +37,7 @@ PROTOCOL §3）。这样既不需要网关支持 tool calling，也不会出现�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -62,132 +65,15 @@ CONTROL_ACTIONS = (ACTION_PAUSE, ACTION_RESUME, ACTION_STOP)  # 只改播放状�
 MUSIC_CODEC = "mp3"
 
 
-# ============================================================================
-# 1. 意图解析：一张确定性规则表（控制指令必须快且确定）
-# ============================================================================
-
-# 归一化时丢掉的标点/空白（保留中英文数字）
+# 归一化时丢掉的标点/空白（保留中英文数字）；曲库检索复用
 _STRIP_CHARS = set(
     " \t\r\n，。！？、；：,.!?;:~…\"'“”‘’（）()【】[]《》<>·-—_/\\|+*=&%$#@^`~"
 )
-
-# 口语前缀：先剥掉再判断「放/播/来/听…」，这样「你能放首歌吗」也能命中。
-# 长词在前，避免「我想听」被「我」截断。
-_LEADS = (
-    "帮我", "麻烦你", "麻烦", "请", "给我", "我想", "能不能", "可不可以", "可以", "能",
-    "你", "再", "那就", "就", "现在", "我",
-)
-
-# 「我想听稻香」这类：先把「想听」并成播放入口「听」，否则会被前缀吃掉后找不到入口词
-_INTENT_PREFIX_MAP = (
-    ("我想听", "听"), ("我要听", "听"), ("想听", "听"),
-    ("我想放", "放"), ("我要放", "放"), ("想放", "放"),
-)
-
-# 播放入口词（长词在前：「播放」要先于「放」，「来一首」要先于「来」）
-_PLAY_HEADS = (
-    "播放", "放一首", "放首", "放个", "放点", "放",
-    "来一首", "来首", "来一曲", "来点", "来",
-    "听一首", "听首", "听点", "听",
-    "点一首", "点歌", "点个",
-    "唱一首", "唱首", "唱",
-)
-
-# 只有「整句就是这些泛称」时才清空 query；不做「去尾字」——否则「情歌」会被削成「情」
-_EMPTY_QUERIES = ("这首歌", "一首歌", "首歌", "歌曲", "音乐", "曲子", "歌")
-# 尾部语气词反复剥离（「放首歌吧」→「放首歌」）
-_EXPLETIVES = ("好吗", "可以吗", "行吗", "吧", "吗", "谢谢", "呀", "啊", "呢")
-
-# 控制类规则：顺序即优先级（stop → pause → resume → next → prev）
-_CONTROL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (ACTION_STOP, ("停止播放", "停止音乐", "关掉音乐", "关闭音乐", "把音乐关掉",
-                   "别放了", "别放", "不要放了", "别唱了", "退出音乐", "停止")),
-    (ACTION_PAUSE, ("暂停播放", "暂停音乐", "暂停", "先停一下", "停一下", "停一停", "别播了")),
-    (ACTION_RESUME, ("继续播放", "继续放", "接着放", "接着听", "恢复播放", "继续")),
-    (ACTION_NEXT, ("下一首歌", "下一首", "下一曲", "换一首", "换一曲", "换首歌",
-                   "换个歌", "再换一首", "切歌", "下一首吧")),
-    (ACTION_PREV, ("上一首歌", "上一首", "上一曲", "前一首", "返回上一首")),
-)
-
-_BAD_QUERY_PREFIX = ("不", "没", "别")   # 「听不懂」这类误命中：query 以否定词开头就丢弃
 
 
 def _normalize(text: str) -> str:
     """去空白/标点并转小写；保留中文、字母、数字。"""
     return "".join(ch.lower() for ch in text if ch not in _STRIP_CHARS)
-
-
-@dataclass(frozen=True)
-class MusicIntent:
-    """一条音乐意图；`rule` 是命中的关键词，日志与断言用。"""
-
-    action: str
-    query: str = ""
-    rule: str = ""
-
-
-class MusicIntentParser:
-    """ASR 文本 → 音乐意图；非音乐语句返回 None（继续走 LLM/Hermes）。"""
-
-    def parse(self, text: str | None) -> MusicIntent | None:
-        raw = (text or "").strip()
-        norm = _normalize(raw)
-        if len(norm) < 2:
-            return None
-        # 音量/声音类指令（T4.3 才定契约）：这里不猜，交给 LLM 通道，避免「放大音量」被当点歌
-        if "音量" in norm or "声音" in norm:
-            return None
-
-        # 1) 控制词优先：「别放了」含「放」，必须先判 stop
-        for action, rules in _CONTROL_RULES:
-            for rule in rules:
-                if rule in norm:
-                    return MusicIntent(action=action, query="", rule=rule)
-
-        # 2) 「想听/想放」并入播放入口，再剥口语前缀，最后必须以播放入口词开头
-        stripped = norm
-        for phrase, head_word in _INTENT_PREFIX_MAP:
-            if stripped.startswith(phrase):
-                stripped = head_word + stripped[len(phrase):]
-                break
-        changed = True
-        while changed:
-            changed = False
-            for lead in _LEADS:
-                if stripped.startswith(lead) and len(stripped) > len(lead):
-                    stripped = stripped[len(lead):]
-                    changed = True
-                    break
-
-        head = next((w for w in _PLAY_HEADS if stripped.startswith(w)), None)
-        if head is None:
-            return None
-        query = stripped[len(head):]
-
-        # 3) 剥尾部语气词；只有整句是「歌/歌曲/音乐…」这类泛称才清空 query
-        changed = True
-        while changed and query:
-            changed = False
-            for suffix in _EXPLETIVES:
-                if query.endswith(suffix) and len(query) > len(suffix):
-                    query = query[: -len(suffix)]
-                    changed = True
-                    break
-        # "播放一首主角" / "播放首晴天"：head 只吃掉"播放"，这里再吃掉量词
-        for prefix in ("一首", "首", "个", "支"):
-            if query.startswith(prefix) and len(query) > len(prefix):
-                query = query[len(prefix):]
-                break
-        if query in _EMPTY_QUERIES:
-            query = ""
-
-        if query.startswith(_BAD_QUERY_PREFIX):
-            return None
-        if query and len(query) <= 1 and len(norm) <= 2:
-            return None      # 「放屁」这类两个字的口语：不点歌
-        if len(query) > 40:  # 明显不是歌名：交给 LLM，不要瞎点歌
-            return None
-        return MusicIntent(action=ACTION_PLAY, query=query, rule=head)
 
 
 # ============================================================================
@@ -224,6 +110,11 @@ def _redact(url: str) -> str:
     except ValueError:
         return "<非法 URL>"
     return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+def track_id_of(url: str) -> str:
+    """曲目短 id（8 位 sha1）：MCP/工具结果里只用它指代曲目，**绝不下发 URL 给模型**。"""
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
 
 
 def _valid_url(url: str) -> bool:
@@ -559,7 +450,7 @@ class MusicSearchHttp:
 
     也接受裸数组 `[...]` 或 `{"data":[...]}`；取第一条 URL 合法的记录。
     失败（超时/非 2xx/JSON 坏/没有合法 URL）只 WARN 并返回 None，
-    由 `MusicService.track_for()` 回退到本地曲库——不打断本轮对话。
+    由 `MusicService.resolve_query()` / `MusicSession` 回退到本地曲库——不打断本轮对话。
 
     注意：这是**通用适配器**，不含任何站点专用的签名/反爬实现；接哪个源由部署方决定。
     """
@@ -635,13 +526,11 @@ class MusicService:
 
     def __init__(
         self,
-        parser: MusicIntentParser | None = None,
         catalog: MusicCatalog | None = None,
         http_port: int = 0,
         need_demo: bool = False,
         search: MusicSearchHttp | None = None,
     ) -> None:
-        self.parser = parser or MusicIntentParser()
         self.catalog = catalog or MusicCatalog()
         self.search = search
         self._http_port_req = int(http_port)
@@ -727,24 +616,33 @@ class MusicService:
             return []
         return self.search.search_tracks(query, limit=limit)
 
-    def track_for(self, intent: MusicIntent) -> tuple[MusicTrack | None, bool]:
-        # 下一首/上一首：先把游标对齐当前曲目（搜索/重载后游标可能漂移）
-        if intent.action in (ACTION_NEXT, ACTION_PREV):
-            self.catalog.maybe_reload()
-            if self.last_url:
-                self.catalog.seek(self.last_url)
-        # 点歌：先问搜索源（可能在网络上，调用方用 to_thread 包住），失败/无结果回退曲库
-        if intent.action == ACTION_PLAY and intent.query and self.search is not None:
-            track = self.search.search(intent.query)
+    def resolve_query(self, query: str, search_first: bool = True) -> tuple[MusicTrack | None, bool]:
+        """query → 曲目；先问搜索源（调用方负责放线程），失败/无结果回退本地曲库。
+
+        返回 `(曲目, 是否命中)`；`matched=False` 表示回退到了当前/第一首。
+        """
+        if query and search_first and self.search is not None:
+            track = self.search.search(query)
             if track is not None:
                 return track, True
-        if intent.action == ACTION_NEXT:
-            track = self.catalog.next_track()
-            return track, track is not None
-        if intent.action == ACTION_PREV:
-            track = self.catalog.prev_track()
-            return track, track is not None
-        return self.catalog.resolve(intent.query)
+        return self.catalog.resolve(query)
+
+    def search_many(self, query: str, limit: int = 5) -> list[MusicTrack]:
+        """搜索源的多结果（点歌候选/下一首用）；无搜索源时退回本地曲库单结果。"""
+        tracks = self.search_tracks(query, limit=limit)
+        if tracks:
+            return tracks
+        track, _ = self.catalog.resolve(query)
+        return [track] if track is not None else []
+
+    def resolve_id(self, track_id: str) -> MusicTrack | None:
+        """按 track_id 找回本地曲库曲目（搜索源结果由调用方队列负责）。"""
+        if not track_id:
+            return None
+        for track in self.catalog.tracks:
+            if track_id_of(track.url) == track_id:
+                return track
+        return None
 
     def confirm_text(self, action: str, track: MusicTrack | None) -> str:
         """固定确认语：控制指令不进 LLM，保证「说暂停 0.3s 内响应」的口径。"""
@@ -763,7 +661,7 @@ class MusicService:
             return "好的，已停止播放。"
         return "好的。"
 
-    def banner_line(self) -> str:
+    def banner_line(self, tool_mode: str = "") -> str:
         parts = [f"曲库 {len(self.catalog)} 首"]
         if self.demo_url:
             parts.append(f"示例 {self.demo_url}")
@@ -771,6 +669,8 @@ class MusicService:
             parts.append("、".join(track.url for track in self.catalog.tracks[:2]))
         if self.search is not None:
             parts.append(f"搜索 {_redact(self.search.url_template)}")
+        if tool_mode:
+            parts.append(f"工具={tool_mode}")
         return "音乐(M1): 开 | " + " | ".join(parts)
 
 

@@ -41,6 +41,7 @@ from mock_core import (
 from mock_downlink import DownlinkMixin
 from mock_fixtures import embedded_real_mp3_frames
 from mock_music import MusicService
+from music_tools import MusicSession
 
 
 class Session(DownlinkMixin):
@@ -54,8 +55,8 @@ class Session(DownlinkMixin):
         self.stats = Stats()
         self.sid: int | None = None          # 当前轮 sid（端侧生成，mock 原样回填）
         self.music_mid = 0                    # 音乐事件独立计数（契约 P-3：不复用语音 sid）
-        self.music_queue: list[Any] = []      # 搜索源返回的结果列表（next/prev 用）
-        self.music_index = -1
+        # 音乐状态机（2026-11-12：工具调用的执行结果落在这里；每台设备一份）
+        self.music_session = MusicSession(server.music) if server.music is not None else None
         self.seq_out = 0                      # 下行二进制帧 seq
         self.up_seq_expected: int | None = None
         self.up_round_frames = 0              # 本轮（audio_start 起）上行帧数
@@ -220,17 +221,19 @@ class Session(DownlinkMixin):
                 logging.INFO,
                 f"<-- music_request action={msg.get('action')} id={msg.get('id')} index={msg.get('index')}",
             )
-            # 端侧主动点歌（T4.3 起用）：有曲库就回真实曲目，否则保持旧骨架。
-            if self.server.music is not None:
-                track = self.server.music.catalog.next_track()
-                if track is not None:
+            # 端侧主动点歌（T4.3 起用）：走同一套会话状态机（next），保证序列与工具调用一致。
+            if self.music_session is not None:
+                command = self.music_session.next()
+                if command.ok and command.track is not None:
                     self.music_mid = (self.music_mid + 1) & 0xFFFF
-                    await self._send_json(track.as_event(self.music_mid))
-                    self.server.music.last_url = track.url
+                    await self._send_json(command.track.as_event(self.music_mid))
+                    self.server.music.last_url = command.track.url
                     self.stats.music_tracks += 1
-                    self._log(logging.INFO, f"music_request → 曲目《{track.title}》{track.url}")
+                    self._log(logging.INFO,
+                              f"music_request → 曲目《{command.track.title}》mid={self.music_mid}")
                 else:
-                    self._log(logging.WARNING, "music_request：曲库为空，未回 music_track")
+                    self._log(logging.WARNING,
+                              f"music_request：没有可回的点播曲目（{command.message}）")
             elif self.cfg.scenario == "music":
                 self.music_mid = (self.music_mid + 1) & 0xFFFF
                 await self._send_json(
@@ -521,7 +524,7 @@ def _print_banner(server: MockServer) -> None:
         "传输: 每条 accept 连接 TCP_NODELAY=1（关 Nagle；避免 delayed ACK 攒批造成端侧假欠载）",
     ]
     if server.music is not None:
-        lines.append(server.music.banner_line())
+        lines.append(server.music.banner_line(getattr(cfg, "music_tool_mode", "")))
     lines += [
         "直连 URL（设备端填 CONFIG_AI_WS_URL）：",
     ]

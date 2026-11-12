@@ -6,10 +6,10 @@
 """mock_music_test —— M1 音乐（mock 侧）离线自测，不接开发板、不需要 ASR/TTS 模型。
 
 覆盖四层：
-  A. 意图规则表：控制词/点歌/误命中防护（「今天天气如何」不能被当成点歌）
+  A. 音乐工具：MusicSession 状态机 / 幂等 / track_id 往返 / 工具 schema
   B. 曲库：检索优先级、next/prev 游标、JSON 加载、URL 校验
   C. 内置 HTTP：200/206/404、Content-Type、示例曲目可解码（MP3 帧同步）
-  D. 假设备 e2e：真实 WS 协议跑一轮，断言 asr_final → music_track / music_control →
+  D. 假设备 e2e（假 Responses 网关模拟模型决策）：真实 WS 协议跑一轮，断言 asr_final → music_track / music_control →
      固定确认语 TTS，并验证「未启用 --music 时不产生音乐事件」
 
 跑法：
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -36,6 +37,10 @@ from websockets.asyncio.client import connect
 
 from mock_cli import config_from_args, parse_args
 from mock_core import Config
+import llm_client
+import music_tools
+from fake_responses import FakeResponsesServer
+import responses_client
 from mock_music import (
     ACTION_NEXT,
     ACTION_PAUSE,
@@ -45,8 +50,6 @@ from mock_music import (
     ACTION_STOP,
     MusicCatalog,
     MusicHttpServer,
-    MusicIntent,
-    MusicIntentParser,
     MusicSearchHttp,
     MusicService,
     MusicTrack,
@@ -96,68 +99,84 @@ class Checker:
 
 
 # ============================================================================
-# A. 意图规则表
+# A. 音乐工具（LLM tool calling 的唯一执行层）
 # ============================================================================
 
-_INTENT_CASES: tuple[tuple[str, str | None, str], ...] = (
-    ("放首周杰伦的晴天", ACTION_PLAY, "周杰伦的晴天"),
-    ("播放孤勇者", ACTION_PLAY, "孤勇者"),
-    ("来首歌", ACTION_PLAY, ""),
-    ("放首歌", ACTION_PLAY, ""),
-    ("放首歌吧", ACTION_PLAY, ""),
-    ("你能放首歌吗", ACTION_PLAY, ""),
-    ("我想听稻香", ACTION_PLAY, "稻香"),
-    ("我要听晴天", ACTION_PLAY, "晴天"),
-    ("放首情歌", ACTION_PLAY, "情歌"),
-    ("放首晴天吧", ACTION_PLAY, "晴天"),
-    ("播放一首主角", ACTION_PLAY, "主角"),
-    ("播放首晴天", ACTION_PLAY, "晴天"),
-    ("放一首王菲", ACTION_PLAY, "王菲"),
-    ("放电台", ACTION_PLAY, "电台"),
-    ("听广播", ACTION_PLAY, "广播"),
-    ("播放", ACTION_PLAY, ""),
-    ("暂停", ACTION_PAUSE, ""),
-    ("暂停一下", ACTION_PAUSE, ""),
-    ("先停一下", ACTION_PAUSE, ""),
-    ("暂停播放这首歌", ACTION_PAUSE, ""),
-    ("继续播放", ACTION_RESUME, ""),
-    ("接着放", ACTION_RESUME, ""),
-    ("继续", ACTION_RESUME, ""),
-    ("下一首", ACTION_NEXT, ""),
-    ("换一首", ACTION_NEXT, ""),
-    ("换一首歌", ACTION_NEXT, ""),
-    ("上一首", ACTION_PREV, ""),
-    ("前一首", ACTION_PREV, ""),
-    ("停止播放", ACTION_STOP, ""),
-    ("别放了", ACTION_STOP, ""),
-    ("关掉音乐", ACTION_STOP, ""),
-    # 误命中防护
-    ("今天天气如何", None, ""),
-    ("你好", None, ""),
-    ("我听不懂", None, ""),
-    ("放", None, ""),
-    ("放屁", None, ""),
-    ("", None, ""),
-    ("放大音量", None, ""),
-    ("把音量调大", None, ""),
-)
 
+def test_tools(check: Checker) -> None:
+    check.section("A. 音乐工具")
+    service = MusicService(catalog=MusicCatalog(_tracks()))
+    session = music_tools.MusicSession(service)
 
-def test_parser(check: Checker) -> None:
-    check.section("A. 意图规则")
-    parser = MusicIntentParser()
-    for text, want_action, want_query in _INTENT_CASES:
-        intent = parser.parse(text)
-        got_action = intent.action if intent else None
-        got_query = intent.query if intent else ""
-        check.eq(got_action, want_action, f"action({text!r})")
-        if want_action is not None:
-            check.eq(got_query, want_query, f"query({text!r})")
+    check.eq(music_tools.execute_tool(session, "music_status", {}).state, "idle", "初始状态 idle")
+    check.ok(not music_tools.execute_tool(session, "music_pause", {}).ok,
+             "空闲时 pause → ok=false（不编造事件）")
 
-    check.ok(parser.parse(None) is None, "None 输入 → None")
-    # 控制词优先于播放词：「别放了」含「放」，必须是 stop 而不是 play
-    intent = parser.parse("这首歌别放了")
-    check.eq(intent.action if intent else None, ACTION_STOP, "控制词优先（别放 > 放）")
+    command = music_tools.execute_tool(session, "music_play", {"query": "晴天"})
+    check.ok(command.ok and command.changed, "play 命中并改变状态")
+    check.eq(command.state, "playing", "play 后 playing")
+    check.eq(command.track.title if command.track else None, "晴天", "play 选中《晴天》")
+    payload = json.dumps(command.to_result(), ensure_ascii=False)
+    check.ok("url" not in payload, "工具结果不含 URL（模型看不到链接）")
+    check.ok("track_id" in payload, "工具结果含 track_id")
+
+    command = music_tools.execute_tool(session, "music_play", {"query": "晴天"})
+    check.ok(command.ok and not command.changed, "同一首重复 play → changed=false")
+
+    command = music_tools.execute_tool(session, "music_pause", {})
+    check.ok(command.changed and command.state == "paused", "pause → paused")
+    command = music_tools.execute_tool(session, "music_pause", {})
+    check.ok(command.ok and not command.changed, "重复 pause 幂等（不下发事件）")
+    command = music_tools.execute_tool(session, "music_resume", {})
+    check.ok(command.changed and command.state == "playing", "resume → playing")
+
+    command = music_tools.execute_tool(session, "music_next", {})
+    check.ok(command.changed and command.track is not None, "next 切歌")
+    next_title = command.track.title if command.track else ""
+    command = music_tools.execute_tool(session, "music_prev", {})
+    check.eq(command.track.title if command.track else None, "晴天", "prev 回到上一首")
+    check.ok(next_title != "晴天", "next 确实换了曲目")
+
+    command = music_tools.execute_tool(session, "music_stop", {})
+    check.ok(command.changed and command.state == "idle", "stop → idle")
+    command = music_tools.execute_tool(session, "music_stop", {})
+    check.ok(command.ok and not command.changed, "重复 stop 幂等")
+    check.ok(not music_tools.execute_tool(session, "music_resume", {}).ok,
+             "空闲时 resume → ok=false（应改用 play）")
+
+    command = music_tools.execute_tool(session, "play", {"query": "孤勇者"})
+    check.ok(command.ok and command.track.title == "孤勇者", "play 短名兼容")
+    command = music_tools.execute_tool(session, "music.play", {"query": "稻香"})
+    check.ok(command.ok and command.track.title == "稻香", "music.play 兼容")
+    check.ok(not music_tools.execute_tool(session, "music_nope", {}).ok, "未知工具 → ok=false")
+
+    # search → track_id → play
+    session = music_tools.MusicSession(service)
+    command = music_tools.execute_tool(session, "music_search", {"query": "周杰伦", "limit": 5})
+    check.ok(command.ok and len(command.items) >= 1, "search 返回候选")
+    track_id = command.items[0]["track_id"] if command.items else ""
+    command = music_tools.execute_tool(session, "music_play", {"track_id": track_id})
+    check.ok(command.ok and command.track is not None, "track_id 可回放")
+    check.ok(not music_tools.execute_tool(session, "music_play", {"track_id": "deadbeef"}).ok,
+             "未知 track_id → ok=false")
+
+    # 旧搜索结果不能污染后续点歌：新查询清空队列，“下一首”回到曲库游标
+    session = music_tools.MusicSession(service)
+    session.queue = list(service.catalog.tracks[:2])
+    session.index = 0
+    command = music_tools.execute_tool(session, "music_play", {"query": "孤勇者"})
+    check.ok(command.ok and not session.queue, "新查询清空旧候选队列")
+
+    prompt = music_tools.system_prompt_for(session)
+    check.ok('"state"' in prompt and "music_play" in prompt, "system prompt 注入状态/规则")
+    check.ok("http" not in prompt, "system prompt 不含 URL")
+
+    definitions = music_tools.tool_definitions()
+    names = {item["name"] for item in definitions}
+    check.ok({"music_search", "music_play", "music_pause", "music_resume",
+              "music_next", "music_prev", "music_stop"} <= names,
+             "inline tools 定义齐全")
+    check.ok(all(item["type"] == "function" for item in definitions), "tool 定义形态正确")
 
 
 # ============================================================================
@@ -349,9 +368,8 @@ def test_search_http(check: Checker) -> None:
         service = MusicService.from_config(cfg)
         check.ok(service is not None and service.search is not None, "Config 搜索源 → MusicService")
         check.ok(service is not None and not service._need_demo, "有搜索源时不再起示例 HTTP")
-        intent = MusicIntent(action=ACTION_PLAY, query="晴天")
-        track, matched = service.track_for(intent) if service else (None, False)
-        check.eq(track.title if track else None, "搜索结果:晴天", "track_for 走搜索源")
+        track, matched = service.resolve_query("晴天") if service else (None, False)
+        check.eq(track.title if track else None, "搜索结果:晴天", "resolve_query 走搜索源")
         check.ok(matched, "搜索命中 matched=True")
 
         fallback = MusicService.from_config(Config(
@@ -359,7 +377,7 @@ def test_search_http(check: Checker) -> None:
             music_search_url=server.base + "/fail?q={query}",
             music_url="http://music.example/fallback.mp3",
         ))
-        track, _ = fallback.track_for(intent) if fallback else (None, False)
+        track, _ = fallback.resolve_query("晴天") if fallback else (None, False)
         check.eq(track.url if track else None, "http://music.example/fallback.mp3",
                  "搜索失败回退本地曲库")
 
@@ -381,8 +399,10 @@ async def test_e2e_search(check: Checker) -> None:
     """搜索源接入后，WS 上仍只下发普通 music_track（端侧无感知）。"""
     check.section("D2. 搜索源 e2e")
     search_server = _SearchServer()
+    responses = FakeResponsesServer(_decide_search)
     cfg = Config(host="127.0.0.1", port=0, music=True, no_tts=True, think_ms=0, quiet=True,
-                 tts_text="放首晴天", music_search_url=search_server.base + "/search?q={query}")
+                 tts_text="放首晴天", music_search_url=search_server.base + "/search?q={query}",
+                 llm_base_url=responses.base, llm_api_key="test", llm_model="fake")
     server = MockServer(cfg)
     ws = None
     try:
@@ -414,6 +434,162 @@ async def test_e2e_search(check: Checker) -> None:
             await ws.close()
         await server.stop()
         search_server.stop()
+        responses.stop()
+
+
+# ============================================================================
+# B3. 假 Responses 网关（模拟“模型决定调哪个音乐工具”；实现见 fake_responses.py）
+# ============================================================================
+
+
+def _decide_e2e(text: str) -> tuple[str, dict[str, Any]] | None:
+    """测试用“模型”：把整句映射成工具调用（模拟 LLM 决策，不参与产品路径）。"""
+    if "暂停" in text:
+        return "music_pause", {}
+    if "继续" in text:
+        return "music_resume", {}
+    if "下一首" in text:
+        return "music_next", {}
+    if "上一首" in text:
+        return "music_prev", {}
+    if "停止" in text or "别放" in text:
+        return "music_stop", {}
+    if "晴天" in text:
+        return "music_play", {"query": "晴天"}
+    return None
+
+
+def _decide_search(text: str) -> tuple[str, dict[str, Any]] | None:
+    if "下一首" in text:
+        return "music_next", {}
+    if "上一首" in text:
+        return "music_prev", {}
+    if "晴天" in text:
+        return "music_play", {"query": "晴天"}
+    return None
+
+
+# ============================================================================
+# B4. Responses 解析 / inline 工具链
+# ============================================================================
+
+
+def test_responses_parse(check: Checker) -> None:
+    check.section("B4. Responses 解析")
+    cfg = responses_client.ResponsesConfig(base_url="https://gw.example/v1", api_key="k",
+                                           model="m")
+    check.eq(cfg.endpoint, "https://gw.example/v1/responses", "endpoint 自动补 /responses")
+
+    result = responses_client.parse_response({
+        "id": "resp_1",
+        "output": [
+            {"type": "function_call", "name": "music_play", "call_id": "c1",
+             "arguments": '{"query":"晴天"}'},
+            {"type": "mcp_call", "id": "mcp1", "name": "music_next",
+             "arguments": "{}", "output": '{"ok":true}'},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "好的"}]},
+        ],
+    })
+    check.eq(len(result.tool_calls), 2, "解析出两条工具调用")
+    check.eq(result.tool_calls[0].name, "music_play", "function_call 名字")
+    check.eq(result.tool_calls[0].arguments, {"query": "晴天"}, "function_call 参数 JSON")
+    check.eq(result.tool_calls[0].source, "function", "来源 function")
+    check.eq(result.tool_calls[1].source, "mcp", "来源 mcp")
+    check.eq(result.text, "好的", "message 文本")
+
+    # 有些网关只在 output 里回工具结果：从 output 还原参数（优先 track_id）
+    result = responses_client.parse_response({
+        "output": [{"type": "mcp_call", "name": "music_play",
+                    "output": '{"ok":true,"action":"play","track":{"track_id":"abcd1234","title":"晴天"}}'}],
+    })
+    check.eq(result.tool_calls[0].arguments.get("track_id"), "abcd1234",
+             "output 兜底还原 track_id")
+
+    # Hermes 真机形态：tool_describe + tool_call{calls:[mcp__music__music_play]}
+    result = responses_client.parse_response({
+        "output": [
+            {"type": "mcp_call", "name": "tool_describe",
+             "arguments": '{"names":["mcp__music__music_search","mcp__music__music_play"]}'},
+            {"type": "mcp_call", "name": "tool_call",
+             "arguments": '{"calls":[{"name":"mcp__music__music_search",'
+                          '"arguments":{"query":"7686","limit":5}}]}'},
+            {"type": "mcp_call", "name": "tool_call",
+             "arguments": '{"calls":[{"name":"mcp__music__music_play",'
+                          '"arguments":{"track_id":"6cec2605"}}]}'},
+            {"type": "message", "content": [{"type": "output_text", "text": "好了"}]},
+        ],
+    })
+    check.eq([c.name for c in result.tool_calls], ["music_search", "music_play"],
+             "Hermes 元工具展开 + 剥 mcp__ 前缀")
+    check.eq(result.tool_calls[1].arguments.get("track_id"), "6cec2605",
+             "Hermes 内层参数解析")
+    check.eq(result.text, "好了", "Hermes 最终回答")
+
+    # chat 风格兜底
+    result = responses_client.parse_response({
+        "choices": [{"message": {"content": "天气不错",
+                                 "tool_calls": [{"id": "c9", "function": {
+                                     "name": "music_stop", "arguments": "{}"}}]}}],
+    })
+    check.eq(result.text, "天气不错", "chat 兜底文本")
+    check.eq(result.tool_calls[0].name, "music_stop", "chat 兜底 tool_calls")
+
+    missing = responses_client.ResponsesConfig(base_url="", api_key="", model="")
+    try:
+        missing.require_ready()
+        check.ok(False, "缺配置必须报错")
+    except responses_client.ResponsesError:
+        check.ok(True, "缺配置报 ResponsesError")
+
+
+async def test_inline_tools(check: Checker) -> None:
+    """inline 模式：把 function tools 发给网关，解析 function_call 后本地执行。"""
+    check.section("B5. inline function tools")
+    responses = FakeResponsesServer(_decide_e2e, style="function")
+    cfg = Config(host="127.0.0.1", port=0, music=True, music_tool_mode="inline",
+                 no_tts=True, think_ms=0, quiet=True, tts_text="放首晴天",
+                 llm_base_url=responses.base, llm_api_key="test", llm_model="fake")
+    server = MockServer(cfg)
+    ws = None
+    try:
+        ws, _ = await _open(server)
+        msgs = await _collect_round(ws, 1)
+        check.ok(_find(msgs, "music_track") is not None, "inline function_call → music_track")
+        check.ok(len(responses.requests) == 1, "调用一次 Responses")
+        request = responses.requests[0]
+        check.ok(isinstance(request.get("tools"), list), "inline 模式带 tools 字段")
+        names = {item.get("name") for item in request.get("tools", [])}
+        check.ok("music_play" in names, "tools 里包含 music_play")
+        check.eq(request.get("tool_choice"), "auto", "tool_choice=auto")
+    finally:
+        if ws is not None:
+            await ws.close()
+        await server.stop()
+        responses.stop()
+
+
+def test_session_tracking(check: Checker) -> None:
+    """LLM_SESSION_ID → 请求头 X-Hermes-Session-Id + body.conversation（两者并存）。"""
+    check.section("F. 会话追踪")
+    cfg = responses_client.ResponsesConfig(base_url="https://gw.example/v1", api_key="k",
+                                           model="m", session_id="sess-123")
+    body = json.loads(responses_client._request_body(
+        "你好", cfg, tools=None, system="", history=None, max_output_tokens=32))
+    check.eq(body.get("conversation"), "sess-123", "Responses body 带 conversation")
+    check.eq(body.get("model"), "m", "body 仍带 model")
+
+    empty = responses_client.ResponsesConfig(base_url="https://gw.example/v1", api_key="k",
+                                            model="m")
+    body = json.loads(responses_client._request_body(
+        "你好", empty, tools=None, system="", history=None, max_output_tokens=32))
+    check.ok("conversation" not in body, "未配置 LLM_SESSION_ID 时不带 conversation")
+
+    lcfg = llm_client.LlmConfig(base_url="https://gw.example/v1", api_key="k", model="m",
+                                session_id="sess-123")
+    body = json.loads(llm_client._request_body(
+        [{"role": "user", "content": "你好"}], lcfg, False))
+    check.eq(body.get("conversation"), "sess-123", "chat body 也带 conversation")
 
 
 # ============================================================================
@@ -508,8 +684,10 @@ async def _open(server: MockServer) -> tuple[Any, list[dict[str, Any]]]:
 
 async def test_e2e(check: Checker) -> None:
     check.section("D. 假设备 e2e")
+    responses = FakeResponsesServer(_decide_e2e)
     cfg = Config(host="127.0.0.1", port=0, music=True, no_tts=True, think_ms=0,
-                 quiet=True, max_tts_frames=0)
+                 quiet=True, max_tts_frames=0,
+                 llm_base_url=responses.base, llm_api_key="test", llm_model="fake")
     server = MockServer(cfg)
     ws = None
     try:
@@ -542,32 +720,32 @@ async def test_e2e(check: Checker) -> None:
             check.eq(control.get("url"), None, "music_control 不带 url")
         check.ok(_find(msgs, "music_track") is None, "暂停不重复下发 music_track")
 
-        # 第 3 轮：下一首 → 新的 music_track（end 侧无播放列表）
-        cfg.tts_text = "下一首"
+        # 第 3 轮：继续 → music_control resume
+        cfg.tts_text = "继续播放"
         msgs = await _collect_round(ws, 3)
+        control = _find(msgs, "music_control")
+        check.eq(control.get("action") if control else None, "resume", "继续 → action=resume")
+
+        # 第 4 轮：下一首 → 新的 music_track（端侧无播放列表）
+        cfg.tts_text = "下一首"
+        msgs = await _collect_round(ws, 4)
         track_event = _find(msgs, "music_track")
         check.ok(track_event is not None, "下一首 → 新 music_track")
         if track_event:
             check.eq(track_event.get("mid"), 2, "下一首 mid=2")
 
-        # 第 4 轮：普通聊天 → 不得产生音乐事件
+        # 第 5 轮：普通聊天 → 不得产生音乐事件
         cfg.tts_text = "今天天气如何"
-        msgs = await _collect_round(ws, 4)
+        msgs = await _collect_round(ws, 5)
         check.ok(_find(msgs, "music_track") is None, "普通聊天不下发 music_track")
         check.ok(_find(msgs, "music_control") is None, "普通聊天不下发 music_control")
-        check.ok(_find(msgs, "llm_delta") is not None, "普通聊天仍有 llm_delta（复读路径）")
+        check.ok(_find(msgs, "llm_delta") is not None, "普通聊天仍有 llm_delta（模型回答）")
 
-        # 第 5 轮：停止 → music_control stop
+        # 第 6 轮：停止 → music_control stop
         cfg.tts_text = "停止播放"
-        msgs = await _collect_round(ws, 5)
-        control = _find(msgs, "music_control")
-        check.eq(control.get("action") if control else None, "stop", "停止 → action=stop")
-
-        # 第 6 轮：继续 → music_control resume
-        cfg.tts_text = "继续播放"
         msgs = await _collect_round(ws, 6)
         control = _find(msgs, "music_control")
-        check.eq(control.get("action") if control else None, "resume", "继续 → action=resume")
+        check.eq(control.get("action") if control else None, "stop", "停止 → action=stop")
 
         # 端侧主动 music_request（T4.3 起用）→ 也回真实曲目
         await ws.send(json.dumps({"t": "music_request", "action": "play", "index": 0}))
@@ -586,33 +764,97 @@ async def test_e2e(check: Checker) -> None:
             check.eq(got_track.get("mid"), 3, "music_request 的 mid 继续自增")
 
         session = next(iter(server.active.values()))
-        check.eq(session.stats.music_intents, 5, "统计：5 条音乐意图（点歌/暂停/下一首/停止/继续）")
+        check.eq(session.stats.music_intents, 5,
+                 "统计：5 次工具调用（点歌/暂停/继续/下一首/停止）")
         check.eq(session.stats.music_tracks, 3, "统计：3 条 music_track（点歌/下一首/music_request）")
-        check.eq(session.stats.music_controls, 3, "统计：3 条 music_control（暂停/停止/继续）")
+        check.eq(session.stats.music_controls, 3, "统计：3 条 music_control（暂停/继续/停止）")
+        check.ok(len(responses.requests) >= 5, "每轮都走了 Responses API")
+        check.ok(all("tools" not in req for req in responses.requests),
+                 "mcp 模式不向网关传 tools 字段")
     finally:
         if ws is not None:
             await ws.close()
         await server.stop()
+        responses.stop()
 
 
-async def test_music_with_llm_pipeline(check: Checker) -> None:
-    """`--llm --llm-tts-stream` 同开时，音乐意图必须短路 LLM 流水线（不能重复回答/报 LLM 错）。"""
-    check.section("D. --llm-tts-stream 同开")
+async def test_hermes_tool_shape(check: Checker) -> None:
+    """Hermes 实际返回形态（tool_describe + tool_call + mcp__music__ 前缀）也要能驱动设备。"""
+    check.section("D4. Hermes 工具形态")
+    responses = FakeResponsesServer(_decide_e2e, style="hermes")
     cfg = Config(host="127.0.0.1", port=0, music=True, no_tts=True, think_ms=0, quiet=True,
-                 tts_text="暂停", llm=True, llm_tts_stream=True)
+                 tts_text="放首晴天",
+                 llm_base_url=responses.base, llm_api_key="test", llm_model="fake")
     server = MockServer(cfg)
     ws = None
     try:
         ws, _ = await _open(server)
         msgs = await _collect_round(ws, 1)
-        check.ok(_find(msgs, "music_control") is not None, "命中音乐意图仍下发 music_control")
-        check.eq(sum(1 for m in msgs if m.get("t") == "music_control"), 1,
-                 "只下发一次 music_control")
-        check.ok(_find(msgs, "error") is None, "不因 LLM 未配置而报 error")
+        track_event = _find(msgs, "music_track")
+        check.ok(track_event is not None, "元工具包装 → 仍下发 music_track")
+        check.eq(track_event.get("mid") if track_event else None, 1, "music_track mid=1")
+        session = next(iter(server.active.values()))
+        check.eq(session.stats.music_intents, 1, "tool_describe 不计数，只算 music_play")
+        check.ok(_find(msgs, "error") is None, "无 error")
     finally:
         if ws is not None:
             await ws.close()
         await server.stop()
+        responses.stop()
+
+
+async def test_music_with_llm_pipeline(check: Checker) -> None:
+    """`--llm --llm-tts-stream` 同开时，音乐意图必须短路 LLM 流水线（不能重复回答/报 LLM 错）。"""
+    check.section("D. --llm-tts-stream 同开")
+    responses = FakeResponsesServer(_decide_e2e)
+    cfg = Config(host="127.0.0.1", port=0, music=True, no_tts=True, think_ms=0, quiet=True,
+                 tts_text="放首晴天", llm=True, llm_tts_stream=True,
+                 llm_base_url=responses.base, llm_api_key="test", llm_model="fake")
+    server = MockServer(cfg)
+    ws = None
+    try:
+        ws, _ = await _open(server)
+        msgs = await _collect_round(ws, 1)
+        check.ok(_find(msgs, "music_track") is not None, "命中音乐工具仍下发 music_track")
+        check.eq(sum(1 for m in msgs if m.get("t") == "music_track"), 1,
+                 "只下发一次 music_track（不重复）")
+        check.ok(_find(msgs, "error") is None, "不因 LLM 流水线配置而报 error")
+        check.ok(len(responses.requests) == 1, "音乐轮只调 1 次 Responses（模板确认语）")
+    finally:
+        if ws is not None:
+            await ws.close()
+        await server.stop()
+        responses.stop()
+
+
+async def test_music_without_llm(check: Checker) -> None:
+    """未配置 Responses API：音乐不执行，但语音链路必须照常走完（不能报 error/静默丢轮）。"""
+    check.section("D3. 未配置 Responses API")
+    saved = {key: os.environ.get(key) for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL")}
+    try:
+        for key in saved:
+            os.environ.pop(key, None)
+        cfg = Config(host="127.0.0.1", port=0, music=True, no_tts=True, think_ms=0,
+                     quiet=True, tts_text="放首晴天")
+        server = MockServer(cfg)
+        ws = None
+        try:
+            ws, _ = await _open(server)
+            msgs = await _collect_round(ws, 1)
+            check.ok(_find(msgs, "music_track") is None, "缺配置时不下发 music_track")
+            check.ok(_find(msgs, "tts_end") is not None, "缺配置时语音链路仍收尾")
+            session = next(iter(server.active.values()))
+            check.eq(session.stats.music_llm_errors, 1, "统计：Responses 失败 1 次")
+        finally:
+            if ws is not None:
+                await ws.close()
+            await server.stop()
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 async def test_music_disabled(check: Checker) -> None:
@@ -645,6 +887,9 @@ def test_cli(check: Checker) -> None:
     args = parse_args(["--music"])
     cfg = config_from_args(args)
     check.ok(cfg.music, "--music → Config.music")
+    check.eq(cfg.music_tool_mode, "mcp", "默认工具模式 mcp（工具配在 Hermes 侧）")
+    cfg_inline = config_from_args(parse_args(["--music", "--music-tools", "inline"]))
+    check.eq(cfg_inline.music_tool_mode, "inline", "--music-tools inline 透传")
 
     args = parse_args(["--music", "--music-url", "http://192.168.1.5:9000/x.mp3"])
     cfg = config_from_args(args)
@@ -667,6 +912,7 @@ def test_cli(check: Checker) -> None:
 
     for argv in (
         ["--music-url", "http://x/y.mp3"],              # 缺 --music
+        ["--music-tools", "inline"],                    # 缺 --music
         ["--music", "--music-url", "ftp://x/y.mp3"],     # 非 http(s)
         ["--music", "--music-catalog", "/no/such.json"],  # 文件不存在
         ["--music", "--music-title", "电台"],             # 缺 --music-url
@@ -689,13 +935,18 @@ def main(argv: list[str] | None = None) -> int:
     verbose = "--verbose" in (argv or sys.argv[1:])
     check = Checker(verbose=verbose)
     with tempfile.TemporaryDirectory(prefix="mock_music_test_") as tmp:
-        test_parser(check)
+        test_tools(check)
         test_catalog(check, Path(tmp))
         test_search_http(check)
         test_http(check)
+        test_responses_parse(check)
+        test_session_tracking(check)
+        asyncio.run(test_inline_tools(check))
+        asyncio.run(test_hermes_tool_shape(check))
         asyncio.run(test_e2e(check))
         asyncio.run(test_e2e_search(check))
         asyncio.run(test_music_with_llm_pipeline(check))
+        asyncio.run(test_music_without_llm(check))
         asyncio.run(test_music_disabled(check))
         test_cli(check)
     return 0 if check.summary() else 1

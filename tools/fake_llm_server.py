@@ -9,9 +9,15 @@
 「SSE 增量 → 分句 → TTS 流水线 → 设备边出字边播」整条链路，并且可以精确控制
 首包延迟/出字速度/标点，复现"LLM 很慢、回答很长"的场景。
 
-只实现 mock/llm_client 用到的两个字段：`/v1/chat/completions`（stream=true 的 SSE），
-以及 `/health`。回答固定由 `--answer` 指定，按 `--chunk-chars` 切块、每块间隔
-`--chunk-delay-ms` 吐出，首块前等 `--first-delay-ms`。
+实现 mock 用到的三块：`/v1/chat/completions`（stream=true 的 SSE）、
+`/v1/responses`（非流式；**可返回工具调用**，用来离线验证音乐工具链路），以及 `/health`。
+回答固定由 `--answer` 指定，按 `--chunk-chars` 切块、每块间隔 `--chunk-delay-ms` 吐出，
+首块前等 `--first-delay-ms`。
+
+音乐工具（2026-11-12）：
+  --tool-mode mcp        → output 里给一条 mcp_call（Hermes 已配 MCP 时的形态）
+  --tool-mode function   → output 里给一条 function_call（本地 inline tools 形态）
+  --tool-name / --tool-args 指定工具与参数；--tool-match 只在用户文本包含该子串时触发
 
 用法：
   # 终端 A：假 LLM（打印 FAKE_LLM_LISTENING <base_url>）
@@ -42,6 +48,24 @@ DEFAULT_ANSWER = (
 )
 
 
+def _responses_user_text(items: object) -> str:
+    """从 Responses 的 input（字符串或 item 数组）里取最后一条 user 文本。"""
+    if isinstance(items, str):
+        return items
+    text = ""
+    for item in items or []:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content", "")
+        if isinstance(content, str):
+            text = content
+        else:
+            text = "".join(
+                str(block.get("text", "")) for block in content if isinstance(block, dict)
+            )
+    return text
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "fake-llm/1.0"
@@ -65,6 +89,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path.rstrip("/").endswith("/responses"):
+            self._responses()
+            return
         if not self.path.rstrip("/").endswith("/chat/completions"):
             self._json({"error": "not found"}, 404)
             return
@@ -124,6 +151,75 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             print("[fake-llm] 客户端断开，停止本轮", flush=True)
 
+    # ---- Responses API：可返回工具调用（音乐工具链路离线测试） ----
+
+    def _responses(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            request = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json({"error": {"message": "bad json"}}, 400)
+            return
+        cfg = self.server.cfg  # type: ignore[attr-defined]
+        user_text = _responses_user_text(request.get("input"))
+        answer = cfg.answer
+        if cfg.echo_user and user_text:
+            answer = f"你刚才说的是：{user_text}。{answer}"
+
+        output: list[dict] = []
+        mode = cfg.tool_mode
+        name = cfg.tool_name
+        args_text = cfg.tool_args
+        triggered = mode != "none" and (not cfg.tool_match or cfg.tool_match in user_text)
+        # --tool-map：按子串映射到不同工具（真机回归脚本用；顺序即优先级）
+        if not triggered and cfg.tool_map:
+            for keyword, mapped in cfg.tool_map.items():
+                if keyword in user_text:
+                    mode, name, args_text, triggered = "mcp", mapped, "{}", True
+                    break
+        if triggered:
+            try:
+                arguments = json.loads(args_text or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            arg_text = json.dumps(arguments, ensure_ascii=False)
+            if mode == "mcp":
+                output.append({
+                    "type": "mcp_call",
+                    "id": "mcp_1",
+                    "server_label": "music",
+                    "name": name,
+                    "arguments": arg_text,
+                    "output": json.dumps({"ok": True}, ensure_ascii=False),
+                })
+            else:
+                output.append({
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": name,
+                    "arguments": arg_text,
+                })
+        output.append({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": answer}],
+        })
+        print(
+            f"[fake-llm] responses 请求：user={user_text!r} → tool={name if triggered else '-'} "
+            f"args={args_text if triggered else '-'}",
+            flush=True,
+        )
+        self._json({
+            "id": "resp_fake_1",
+            "object": "response",
+            "status": "completed",
+            "model": request.get("model", "fake"),
+            "output": output,
+            "output_text": answer,
+        })
+
     def _sse(self, obj: dict) -> None:
         payload = json.dumps(obj, ensure_ascii=False)
         self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
@@ -147,7 +243,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--chunk-delay-ms", type=int, default=70, help="块间隔毫秒（模拟 LLM 出字速度）")
     parser.add_argument("--first-delay-ms", type=int, default=600, help="首块前的首包延迟")
     parser.add_argument("--echo-user", action="store_true", help="回答前先复述用户问题（便于确认请求内容）")
+    parser.add_argument("--tool-mode", choices=("none", "mcp", "function"), default="none",
+                        help="Responses 返回的工具调用形态（none=只回答）")
+    parser.add_argument("--tool-name", default="music_play", help="工具名")
+    parser.add_argument("--tool-args", default='{"query":""}',
+                        help='工具参数 JSON（如 {"query":"晴天"}）')
+    parser.add_argument("--tool-match", default="",
+                        help="仅在用户文本包含该子串时返回工具调用（空=总是）")
+    parser.add_argument("--tool-map", default="",
+                        help='JSON：{"子串":"工具名"}，按子串顺序匹配（真机回归用，如 {"暂停":"music_pause"}）')
     args = parser.parse_args(argv)
+    if args.tool_map:
+        try:
+            parsed = json.loads(args.tool_map)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"--tool-map 不是合法 JSON：{exc}") from exc
+        if not isinstance(parsed, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+        ):
+            raise SystemExit("--tool-map 必须是 {子串: 工具名} 的对象")
+        args.tool_map = parsed
+    else:
+        args.tool_map = {}
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True

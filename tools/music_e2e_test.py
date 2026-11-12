@@ -37,6 +37,7 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import sys
 import tempfile
 import time
@@ -89,9 +90,9 @@ END_TASKS = re.compile(r"共 \d+ 个任务")
 RE_HEAP_RAM = re.compile(r"内部 RAM:.*?剩余 (\d+) B.*?最大块 (\d+) B.*?最低水位 (\d+) B.*?峰值占用 (\d+) B")
 
 # ---------------- mock 侧日志 ----------------
-RE_MOCK_INTENT = re.compile(r"\[MUSIC\] 意图=(\w+) .*mid=(\d+)")
+RE_MOCK_INTENT = re.compile(r"\[MUSIC\] (?:意图=|工具 )(\w+).*?mid=(\d+)")
 RE_MOCK_STATUS = re.compile(r"\[(\d\d):(\d\d):(\d\d\.\d+)\].*<-- music_status state=(\w+) progress_ms=(\d+)")
-RE_MOCK_TRACK_SENT = re.compile(r"<-- music_track mid=(\d+)")
+RE_MOCK_TRACK_SENT = re.compile(r"music_track mid=(\d+)")
 RE_MOCK_REQUEST = re.compile(r"<-- music_request action=(\w+)")
 
 END_CMD = re.compile(r"MSSTOP|MSPAUSE|MSRESUME|MSPLAY|MSREQUEST|MCSTAT|MSSTAT|MIXVOL")
@@ -167,12 +168,53 @@ def parse_heap(lines: list[str]) -> dict | None:
 
 # ---------------------------------------------------------------- mock
 
+class FakeTools:
+    """进程内假 Responses 网关：把常见中文指令映射成音乐工具（无需 token/Hermes）。
+
+    只用于「手边没有真实模型」时跑通链路；它模拟的是**模型决策**，不是产品规则表。
+    """
+
+    TOOL_MAP = {
+        "停止": "music_stop", "别放": "music_stop", "关掉": "music_stop",
+        "暂停": "music_pause", "继续": "music_resume",
+        "下一首": "music_next", "上一首": "music_prev",
+        "放": "music_play", "播放": "music_play",
+    }
+
+    def __init__(self) -> None:
+        from types import SimpleNamespace
+        from http.server import ThreadingHTTPServer
+        from fake_llm_server import Handler
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.httpd.cfg = SimpleNamespace(  # type: ignore[attr-defined]
+            answer="好的。", chunk_chars=3, chunk_delay_ms=0, first_delay_ms=0,
+            echo_user=False, tool_mode="none", tool_name="music_play",
+            tool_args="{}", tool_match="", tool_map=self.TOOL_MAP,
+        )
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.httpd.server_address[1]
+        print(f"[TEST] 假 Responses 网关：http://127.0.0.1:{self.port}/v1（模拟模型决策）")
+
+    @property
+    def base(self) -> str:
+        return f"http://127.0.0.1:{self.port}/v1"
+
+    def stop(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
 class Mock:
-    def __init__(self, port: int, music_url: str, music_title: str, tts_qwen: bool) -> None:
+    def __init__(self, port: int, music_url: str, music_title: str, tts_qwen: bool,
+                 llm_base_url: str = "") -> None:
         self.port = port
         self.music_url = music_url
         self.music_title = music_title
         self.tts_qwen = tts_qwen
+        self.llm_base_url = llm_base_url
         self.proc: subprocess.Popen | None = None
         self.log_path = os.path.join(tempfile.gettempdir(), f"music_e2e_mock_{port}.log")
 
@@ -188,6 +230,9 @@ class Mock:
             cmd += ["--music-url", self.music_url, "--music-title", self.music_title]
         if self.tts_qwen:
             cmd.append("--tts-qwen")
+        if self.llm_base_url:
+            cmd += ["--llm-base-url", self.llm_base_url,
+                    "--llm-model", "fake", "--llm-api-key", "fake"]
         log = open(self.log_path, "w", encoding="utf-8", buffering=1)
         self.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
         deadline = time.time() + 45
@@ -554,6 +599,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tts-qwen", action="store_true", help="mock 用 Qwen3-TTS 真实语音（较慢）")
     parser.add_argument("--skip-reset", action="store_true", help="不复位设备")
     parser.add_argument("--dry-run", action="store_true", help="只做素材/串口检查")
+    parser.add_argument("--fake-tools", action="store_true",
+                        help="用进程内假 Responses 网关模拟音乐工具调用（无需 LLM token/Hermes）")
     parser.add_argument("--log", default="", help="把设备日志写入文件（排障用）")
     parser.add_argument("--only", default="", help="只跑指定场景，逗号分隔：a,b,c,d,e,f,g")
     args = parser.parse_args(argv)
@@ -578,7 +625,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     dev = Device(port)
-    mock = Mock(args.mock_port, args.music_url, args.music_title, args.tts_qwen)
+    fake_tools = FakeTools() if args.fake_tools else None
+    mock = Mock(args.mock_port, args.music_url, args.music_title, args.tts_qwen,
+                llm_base_url=fake_tools.base if fake_tools else "")
     old_volume = get_system_volume()
     try:
         mock.start()
@@ -634,6 +683,8 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as exc:
                 print(f"[TEST] 写日志失败：{exc}")
         mock.stop()
+        if fake_tools is not None:
+            fake_tools.stop()
         dev.close()
         if old_volume is not None:
             try:

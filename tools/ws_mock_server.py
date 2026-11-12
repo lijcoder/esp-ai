@@ -82,7 +82,7 @@ TTS 帧攒成 ~200ms 一批，造成「mock 均匀发、端侧却 underrun」的
   mock_pipeline.py  LLM 增量 → 自然分句 → TTS 的线程编排（仅标准库，可单测）
   mock_server.py    Session + MockServer + TCP_NODELAY + 启动横幅
   mock_cli.py       命令行参数、校验、Config 装配、ASR/Qwen3-TTS 后端加载
-  mock_music.py     M1 音乐：意图规则表 / 曲库 / 内置 HTTP（示例曲目真机可播）
+  mock_music.py     音乐曲库 / 搜索 / 内置 HTTP（示例曲目真机可播）
   mock_self_test.py 19 项进程内自测（`--self-test`）
   mock_fixtures.py  自测/错误注入共用的内嵌真实 MP3
 """

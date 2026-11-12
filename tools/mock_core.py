@@ -243,8 +243,9 @@ class Config:
     error_code: int = 1                   # --scenario error 下发的 error.code（默认 1=通用）
     error_stage: str = "after-audio-end"  # audio_end 后 / asr_final 后 / tts_start+真实 MP3 帧后
     tts_bad_codec: bool = False           # tts_start 用 codec="pcm" 且不发音频帧（设备侧 TTS 失败）
-    # ---- 2026-11-10：M1 音乐（mock 侧意图/曲库/内置 HTTP；见 tools/mock_music.py） ----
-    music: bool = False            # --music：ASR 文本识别音乐意图 → music_track / music_control
+    # ---- 2026-11-10：M1 音乐；2026-11-12 起意图由 LLM 工具调用决定 ----
+    music: bool = False            # --music：启用音乐（曲库/搜索/MCP 工具语义）
+    music_tool_mode: str = "mcp"   # --music-tools：mcp=Hermes 侧已配 MCP；inline=本地传 function tools
     music_url: str = ""            # 固定曲目 URL（真机联调）；空则用内置 HTTP 示例曲目
     music_title: str = ""          # --music-url 的显示名（电台/直播流用，确认语里会念）
     music_catalog: str = ""        # JSON 曲库文件（track 列表）
@@ -291,8 +292,9 @@ class Stats:
     tts_first_audio_ms: int = 0  # 从 audio_end 到首声的毫秒数
     tts_llm_overlap_ms: int = 0  # 首声比 LLM 完成早多少 ms（>0 = 流水线生效）
     tts_prebuffer_ms: int = 0    # 实际预缓冲毫秒数
-    # ---- 2026-11-10：M1 音乐（mock 侧意图/曲库） ----
-    music_intents: int = 0       # 命中的音乐意图数（含控制）
+    # ---- 2026-11-10：M1 音乐；2026-11-12 起统计的是“实际执行的音乐工具调用” ----
+    music_intents: int = 0       # 执行的音乐工具调用数（含控制/查询）
+    music_llm_errors: int = 0    # Responses/MCP 调用失败轮数（音乐不执行，语音链路继续）
     music_tracks: int = 0        # 下发的 music_track 数
     music_controls: int = 0      # 下发的 music_control 数
 

@@ -16,8 +16,9 @@
   LLM_MAX_TOKENS  默认 256
   LLM_TEMPERATURE 默认 0.6
   LLM_TIMEOUT_S   默认 20（首包超时/整体读超时）
-  LLM_SESSION_ID  可选：网关会话追踪头 `X-Hermes-Session-Id`（空=不带该头），
-                  便于在网关侧把 mock/真机的一轮轮请求串成同一个会话
+  LLM_SESSION_ID  可选：网关会话追踪——**同时**放进请求头 `X-Hermes-Session-Id` 与
+                  body 的 `conversation` 字段（空=都不带），便于网关把 mock/真机的一轮轮
+                  请求串成同一个会话
 
 接口：
   cfg = LlmConfig.from_env()
@@ -105,16 +106,17 @@ class LlmConfig:
 
 
 def _request_body(messages: list[dict], cfg: LlmConfig, stream: bool) -> bytes:
-    return json.dumps(
-        {
-            "model": cfg.model,
-            "messages": messages,
-            "stream": stream,
-            "max_tokens": cfg.max_tokens,
-            "temperature": cfg.temperature,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+    body: dict = {
+        "model": cfg.model,
+        "messages": messages,
+        "stream": stream,
+        "max_tokens": cfg.max_tokens,
+        "temperature": cfg.temperature,
+    }
+    if cfg.session_id:
+        # 会话追踪：与请求头 X-Hermes-Session-Id 并存（2026-11-12）
+        body["conversation"] = cfg.session_id
+    return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
 def _build_request(messages: list[dict], cfg: LlmConfig, stream: bool) -> urllib.request.Request:

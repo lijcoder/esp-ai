@@ -77,6 +77,7 @@ typedef enum {
     VS_REASON_FOLLOWUP_OFF = 22,     /* 运行期关闭连续对话，退出续听窗口 */
     VS_REASON_NET_OFFLINE = 23,      /* 网络未连接/链路不可用 → 错误反馈（T3.6） */
     VS_REASON_TTS_FAIL = 24,         /* 设备侧/云端 TTS 播放失败 → 错误反馈（T3.6） */
+    VS_REASON_MUSIC_START = 25,      /* 音乐开始播放 → 退出续听窗口（T4.4） */
 } vs_reason_t;
 
 /* 观测统计（diag `vs status` / 测试脚本断言用；累计值，临界区内合并） */

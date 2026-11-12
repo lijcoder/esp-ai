@@ -110,6 +110,7 @@ const char *vs_reason_name(vs_reason_t reason)
     case VS_REASON_FOLLOWUP_OFF: return "followup-off";
     case VS_REASON_NET_OFFLINE: return "net-offline";
     case VS_REASON_TTS_FAIL: return "tts-fail";
+    case VS_REASON_MUSIC_START: return "music-start";
     default: return "unknown";
     }
 }
@@ -403,7 +404,12 @@ static void vs_round_completed(vs_reason_t reason, bool ok)
 {
     int entered = -1;
 #if CONFIG_VS_FOLLOWUP_ENABLE
-    if (ok && s_followup_enabled && vs_get_state() == VS_STATE_SPEAKING) {
+    /* 音乐已经在出声：续听窗口没有意义（麦克风只会拾取音乐），直接回 IDLE。
+     * 排队的曲目/续播在 SPEAKING→FOLLOW_UP 时由 music_session 提前起播，
+     * 起播后本组件会收到 MUSIC_STATE_CHANGED(PLAYING) 再退出续听（见 vs_on_app_evt）。 */
+    const bool music_playing =
+        audio_player_music_active() && !audio_player_music_paused();
+    if (ok && s_followup_enabled && vs_get_state() == VS_STATE_SPEAKING && !music_playing) {
         uint32_t used;
         portENTER_CRITICAL(&s_mux);
         used = s_followup_rounds;
@@ -879,6 +885,15 @@ static void vs_on_app_evt(void *arg, app_evt_t evt, const app_evt_data_t *data)
         break;
     case APP_EVT_NET_DOWN:
         vs_on_net_down(data);
+        break;
+    case APP_EVT_MUSIC_STATE_CHANGED:
+        /* T4.4：音乐起播 = 用户要听歌，不是要继续对话；立刻退出续听窗口，
+         * 避免麦克风拾取音乐、也避免“继续播放”要等 5s 窗口超时才生效。 */
+        if (data != NULL && data->music_state.to == 1 /* MC_STATE_PLAYING */ &&
+            vs_get_state() == VS_STATE_FOLLOW_UP) {
+            ESP_LOGI(TAG, "音乐开始播放 → 退出续听窗口（原因=music-start）");
+            (void)vs_transition(VS_STATE_FOLLOW_UP, VS_STATE_IDLE, VS_REASON_MUSIC_START);
+        }
         break;
     case APP_EVT_BUTTON: {
         /* T3.2 定稿 payload；T3.4 起由 dev_ctrl 做 GPIO 扫描/去抖与投递。

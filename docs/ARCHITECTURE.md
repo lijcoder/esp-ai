@@ -432,7 +432,7 @@ esp-ai/
 | `LISTENING` | 上行音频，VAD 判停 | 唤醒/按键 | 静音 800ms 或 8s 超时 → `THINKING` |
 | `THINKING` | 等 ASR/TTS，播放提示音可配置 | `LISTENING` 结束 | `tts_start` → `SPEAKING`；10s 超时 → `ERROR` |
 | `SPEAKING` | 播放 TTS，关闭麦克风输入（R1） | `tts_start` | `tts_end` → 延时 300ms 恢复 feed → `FOLLOW_UP`（连续对话开启，T3.7）或 `IDLE`（关闭）；按键 → `IDLE` |
-| `FOLLOW_UP` | 续听窗口：麦克风保持开启，等用户直接说话（不播提示音）；VAD 人声经 250ms 确认 → `LISTENING`（新 sid，免唤醒）；窗口内唤醒词 → 重开一轮（播提示音、轮数清零） | TTS 排空后（连续对话开启） | 窗口静音超时 / 续听轮数上限 / 按键 / 断网 → `IDLE` |
+| `FOLLOW_UP` | 续听窗口：麦克风保持开启，等用户直接说话（不播提示音）；VAD 人声经 250ms 确认 → `LISTENING`（新 sid，免唤醒）；窗口内唤醒词 → 重开一轮（播提示音、轮数清零） | TTS 排空后（连续对话开启） | 窗口静音超时 / 续听轮数上限 / 按键 / 断网 / **音乐起播（`music-start`，T4.4b）** → `IDLE` |
 | `ERROR` | 异常反馈中：`feedback` 播放对应提示音（语音通道）+ 上报日志；同轮不重试 | 网络未连接 / 云端 error / THINKING 超时 / TTS 失败（§8.6） | 提示音完成 → `IDLE`；`CONFIG_VS_ERROR_HOLD_MS` 超时（看门狗）→ 强制 `IDLE`；按键 → 中止反馈回 `IDLE` |
 
 规则：
@@ -443,7 +443,8 @@ esp-ai/
 5. **按键（T3.2/T3.4）**：任意活跃状态短按 = R4 打断 → `IDLE`（`FOLLOW_UP` 窗口内短按 = 退出续听回 `IDLE`）；`IDLE` 短按 = `vs_start()` 直接进 `LISTENING`（不播应答提示音）；长按 = 静音切换（由 `dev_ctrl` 自己处理，`voice_session` 忽略；静音无 LED 指示，见 PENDING PD-003）。按键来源自 T3.4 起是真实 GPIO0（`dev_ctrl` 的 10ms 扫描 + 30ms 去抖），console `evt post BUTTON` 保留为注入探针。
 6. **连续对话（T3.7）**：`FOLLOW_UP` 续听窗口默认 5s、最多 5 轮续听、人声确认 250ms；窗口内直接说话免唤醒且不播提示音；窗口内唤醒词 = 重开一轮；静音超时/轮数上限/按键/断网退出；Kconfig `VS_FOLLOWUP_*` + 运行期 `vs followup on|off`。
 7. **异常反馈（T3.6）**：四类异常（网络未连接 / 云端 error / THINKING 超时 / TTS 失败）→ `ERROR` + `feedback` 提示音；**唤醒时云端未 READY 不播"我在呢"，直接播"网络未连接"**（避免两段提示音连播）；**会话中途断网也出声**；`ERROR` 期间按键 = 中止反馈回 `IDLE`；同轮不重试。详细映射与扩展点见 §8.6。
-8. **音乐与语音抢占（T4.3）**：音乐状态由 `music_session` 独占，`voice_session` 不直接操作音乐播放器。`music_session` 订阅 `APP_EVT_VOICE_STATE_CHANGED`：语音进入 `LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR` → **auto-pause**（100ms 淡出，让出播放器给提示音/TTS）；回 `IDLE` 时**保持暂停、不自动恢复**（T4.4 pause 模式：等用户明确说“继续”）。云端 `music_control{pause}` = **用户暂停 latch**，会话结束不自动恢复；`resume` 清 latch 并从暂停点续播。音乐播放中唤醒**不丢弃**（R3：音乐不关麦）。
+8. **音乐与语音抢占（T4.3，T4.4b 补时序）**：音乐状态由 `music_session` 独占，`voice_session` 不直接操作音乐播放器。`music_session` 订阅 `APP_EVT_VOICE_STATE_CHANGED`：语音进入 `LISTENING/THINKING/SPEAKING/FOLLOW_UP/ERROR` → **auto-pause**（100ms 淡出，让出播放器给提示音/TTS）；回 `IDLE` 时**保持暂停、不自动恢复**（T4.4 pause 模式：等用户明确说“继续”）。云端 `music_control{pause}` = **用户暂停 latch**，会话结束不自动恢复；`resume` 清 latch 并从暂停点续播。音乐播放中唤醒**不丢弃**（R3：音乐不关麦）。
+   **T4.4b（2026-11-12 真机修复）**：TTS 播完进入 `FOLLOW_UP` 时播放器已空闲，**排队曲目/显式续播立即执行**（不再等续听窗口 5s）；音乐起播后 `voice_session` 收到 `APP_EVT_MUSIC_STATE_CHANGED(PLAYING)` 主动退出续听窗口（原因 `music-start`），避免麦克风拾取音乐、也避免窗口内再次唤醒把排队动作清掉。
 
 > **T3.1 实现状态（2026-11-01）**：
 > - 状态机在 `components/voice_session`（L4）。迁移统一经 `vs_transition()`/`vs_begin_session()` 的 CAS（期望状态 → 目标状态），并发来源（`evt` 任务、`ws_client`、`player` 完成回调、console/timer）不会打乱状态；
@@ -519,7 +520,7 @@ music_session ──music_request──> 服务端 ──music_track{url}──>
 > T4.3 `music_session` 状态机与暂停/继续/切歌/`music_request`/语音抢占均已交付并上板验证（`music_e2e_test` 62/62、`music_proto_test` 22/22）。
 > **T4.4 C1（2026-11-11 已上板）**：删除“语音回 IDLE 自动恢复”，音乐被语音/按键打断后**保持暂停**；按键打断语音=丢弃、只有音乐=暂停保留。**T4.5（2026-11-12 构建完成，待真机）**：预缓冲 200ms、断流重连 + **Range 按字节偏移续播**、初始连接退避重试、坏帧 resync；语音打断（需 AEC）/duck 叠加仍不做（C3 no-go），域名白名单未做。
 > `music_cloud` 与 `music_session` 都**不建任务**：解析在 `ws_client` 上下文，播放决策/重试/周期上报在两个 `esp_timer`。
-> **语音期间的动作一律排队到 IDLE**（2026-11-10 真机修复）：新 `music_track` 排队起播；`music_control{resume}` 也排队——若立即 `audio_player_music_resume()` 会占用单作业播放器，紧接着的确认语 TTS 直接 `tts-fail`（真机日志 `VS: state THINKING -> ERROR（原因=tts-fail）`）。排队只在 `LISTENING/FOLLOW_UP`（新一轮）清空，`THINKING/SPEAKING` 期间保留；暂停/停止/切歌会丢弃排队项。
+> **语音期间的动作排队到 TTS 结束**（2026-11-10 真机修复，2026-11-12 T4.4b 调时序）：新 `music_track` 排队起播；`music_control{resume}` 也排队——若立即 `audio_player_music_resume()` 会占用单作业播放器，紧接着的确认语 TTS 直接 `tts-fail`（真机日志 `VS: state THINKING -> ERROR（原因=tts-fail）`）。**排队动作在 `SPEAKING → FOLLOW_UP`（TTS 结束、播放器空闲）执行**，随后退出续听窗口；仅在 `LISTENING`（真正的新一轮）清空排队，暂停/停止/切歌会丢弃排队项。
 > **已知限制**：暂停超过服务端 idle 超时（或 TCP 断）后"继续"：T4.5 起 `source_http` 用 `Range: bytes=N-` 从暂停点续播（206 直接续、200 丢弃前 N 字节；最多 3 次、退避 300ms）；重连失败仍转 ERROR/STOPPED 并发一次 `music_request` 兜底（PV-015 待真机验证）；**语音活跃期间到达的新 `music_track` 排队到语音回 IDLE 才起播**，期间 `music_status` 可能先带新 `mid`（PENDING **PD-006**）。
 
 ### 8.4 音乐播放中唤醒
@@ -530,6 +531,7 @@ music_session ──music_request──> 服务端 ──music_track{url}──>
                                   ▼
             一律保持暂停（T4.4 pause 模式）；用户说“继续”→ 从暂停点续播
             新 music_track → 替换暂停曲目；说“停止”→ 丢弃 ring
+            续播/新曲目在 TTS 结束（SPEAKING→FOLLOW_UP）立即执行；起播后退出续听窗口
 ```
 
 > **T4.4 定稿（2026-11-11 用户拍板，pause 模式）**：

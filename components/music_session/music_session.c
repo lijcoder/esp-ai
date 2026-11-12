@@ -857,11 +857,52 @@ static void ms_on_voice_state(void *arg, app_evt_t evt, const app_evt_data_t *da
     reason = s_pause_reason;
     portEXIT_CRITICAL(&s_mux);
 
+    /* T4.4 补充：TTS 播完进入 FOLLOW_UP 时，播放器已空闲。
+     * 把"语音期间排队的曲目/显式续播"提前到这里执行（原来要等续听窗口 5s 超时回 IDLE），
+     * 并让 voice_session 在收到 MUSIC_STATE_CHANGED(PLAYING) 时退出续听窗口。
+     * 否则用户说“继续播放”后要等 5s，且在窗口内再次唤醒会把排队动作清掉（真机复现）。 */
+    if (to == 5 /* FOLLOW_UP */) {
+        bool pending;
+        bool defer;
+        mc_state_t st;
+        portENTER_CRITICAL(&s_mux);
+        pending = s_track_pending;
+        s_track_pending = false;
+        defer = s_defer_resume;
+        s_defer_resume = false;
+        if (pending) {
+            defer = false;
+        }
+        st = s_state;
+        if (pending || (defer && st == MC_STATE_PAUSED)) {
+            s_voice_active = false; /* TTS 已结束，音乐可以立即出声 */
+        }
+        portEXIT_CRITICAL(&s_mux);
+
+        if (pending) {
+            const bool need_stop =
+                audio_player_music_active() || st == MC_STATE_PLAYING || st == MC_STATE_PAUSED;
+            ESP_LOGI(TAG, "TTS 结束 → 起播排队曲目（mid=%u，不等续听窗口）",
+                     (unsigned)mc_current_mid());
+            ms_schedule(MS_CMD_PLAY, MS_REASON_START, 0, need_stop ? 1 : 0, 0, MS_CMD_DELAY_US);
+            return;
+        }
+        if (defer && st == MC_STATE_PAUSED) {
+            ESP_LOGI(TAG, "TTS 结束 → 执行排队中的续播（不等续听窗口）");
+            ms_schedule(MS_CMD_RESUME, MS_REASON_USER_RESUME, 0, 0, 0, MS_CMD_DELAY_US);
+            return;
+        }
+        /* 没有排队动作：恢复语音活跃语义 */
+        portENTER_CRITICAL(&s_mux);
+        s_voice_active = voice_active;
+        portEXIT_CRITICAL(&s_mux);
+    }
+
     if (voice_active) {
         /* 新的一轮开始（LISTENING/FOLLOW_UP）才撤回排队中的续播；THINKING/SPEAKING
          * 期间必须保留——"继续"指令正是在 THINKING 到达的（真机首跑：每次状态迁移都清，
          * 排队续播永远丢失）。 */
-        if (to == 1 /* LISTENING */ || to == 4 /* FOLLOW_UP */) {
+        if (to == 1 /* LISTENING */) {
             portENTER_CRITICAL(&s_mux);
             s_defer_resume = false;
             portEXIT_CRITICAL(&s_mux);

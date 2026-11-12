@@ -701,6 +701,8 @@ static void vs_on_play_done(audio_player_src_t src, bool ok, void *arg)
      * 完成回调释放，这里不能抢先 release，否则错误提示音播放期间麦克风会被打开。 */
     const bool error_owns_prompt = (vs_get_state() == VS_STATE_ERROR);
     if (!error_owns_prompt) {
+        /* R5：提示音尾音（I2S DMA + 房间混响）不要进入第一帧上行 */
+        audio_fe_feed_discard_ms(CONFIG_AUDIO_FE_RESUME_DISCARD_MS);
         audio_fe_feed_release(AUDIO_FE_HOLD_PROMPT);
         ESP_LOGI(TAG, "prompt done, feed resumed");
     } else {

@@ -117,7 +117,7 @@ TTS(MP3 流/整段) ─┐
 > **T3.2 实现状态（2026-11-01）**：
 > - **R1/R2**：提示音与 TTS 统一经原因位仲裁（`hold_mask` 在 `mic stat` 可观测：提示音期 `0x1`、TTS 期 `0x2`、恢复后 `0x0`）；300ms 尾部延时仍在 `audio_player`（PCM 与流式一致），完成回调 → 各自 `release` 自己那一位。
 > - **R4**：`voice_session() → vs_interrupt()`：语音类内容在播时 `audio_player_fade_out_and_stop(80ms)`（输出级线性淡出，`player stat` 的 `last_stop_ms` 真机实测 64~80ms；80ms 淡出被 10ms 输出块量化，故只设上界 <100ms）→ `vc_interrupt()` 发 `{"t":"interrupt","sid":N}` 并 `vc_cancel()` → `audio_fe_feed_discard_ms(50)` → 回 `IDLE`。播放完成回调以 `ok=false` 上报。淡出期间 `vc_cancel` 的立即 abort 不会截断淡出（`run_stream` 里"有淡出请求时忽略 abort_req"）。**T4.4 补充**：若 `audio_player_voice_active()==false` 且音乐在播（例如会话中音乐被显式恢复），则走 `audio_player_music_pause(80ms)` **暂停保留**，不发音乐相关报文；正常路径下音乐在语音进入活跃态时已 auto-pause。按键来源：`APP_EVT_BUTTON`（payload 见 §4.2），**自 T3.4 起由 `dev_ctrl` 扫描真实 GPIO0 投递**；console 仍可用 `vs interrupt` / `evt post BUTTON` 注入验证。**停声口径**：从按键/命令到输出静音 ≤100ms（80ms 淡出 + 一个 10ms 输出块）。
-> - **R5**：`audio_fe_feed_discard_ms()` 在恢复后把最早 50ms 的麦克风数据喂零并计数（`mic stat` 的 `discard_samples=800`）；只在打断/断链恢复路径使用，正常 TTS 收尾由 R2 的 300ms 覆盖、**不叠加** R5。
+> - **R5**：`audio_fe_feed_discard_ms()` 在恢复后把最早 50ms 的麦克风数据喂零并计数（`mic stat` 的 `discard_samples=800`）；打断/断链恢复路径使用；**T4.4b 起提示音/TTS 收尾也先置 50ms 丢弃再 release**（避免尾音被第一帧上行/续听预录取到；R2 的 300ms 尾部延时仍保留）。
 > - **R3（T4.4 定稿：pause 模式）**：音乐播放中不关麦；打断命中后 100ms 内**暂停并保留**（保 ring/进度），会话结束**不自动恢复**，等用户明确说"继续"；`duck`（CH_MUSIC 通道增益，-12dB/100ms 斜坡）仍保留为探针/后续体验模式，本轮不做叠加。T3.3 的混音链路（音乐 ring 持续供数 + 提示音/TTS 叠加 + 自动 duck）为后续 duck 模式预留，当前不使用。真机探针：T3.2 的 `out_peak` 15563→3890（0.250）；T3.3 用 `player mix` 三通道复验 1760Hz 峰 8000→2000、440Hz 峰 8000→4000。
 
 > **T3.7 连续对话**：`FOLLOW_UP` 窗口建立在 TTS 的 R2（feed 已恢复）之后；窗口内起轮不再 hold PROMPT（不播提示音），直接进入上行；窗口内按键/断网按 R4/R5 退出。窗口的"人声确认"只依赖 VAD 事件，不改变 R1–R5 语义。

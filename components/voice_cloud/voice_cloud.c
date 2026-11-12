@@ -554,6 +554,8 @@ static void vc_stream_done_cb(audio_player_src_t src, bool ok, void *arg)
         ESP_LOGD(TAG, "stream done 但新流已开始，跳过 R2");
         return;
     }
+    /* R5：TTS 尾音不要被续听预录/下一轮上行收进去 */
+    audio_fe_feed_discard_ms(CONFIG_AUDIO_FE_RESUME_DISCARD_MS);
     audio_fe_feed_release(AUDIO_FE_HOLD_TTS);
     ESP_LOGI(TAG, "stream done → feed resumed（ok=%d）", (int)ok);
 }

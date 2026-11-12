@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import sys
 import time
@@ -19,6 +20,22 @@ from pathlib import Path
 from typing import Any
 
 LOG = logging.getLogger("ws_mock")
+
+
+def llm_env_ready(base_url: str = "", model: str = "", api_key: str = "") -> bool:
+    """回答是否会走 LLM/Responses：CLI 值优先，缺省读 LLM_* 环境变量。
+
+    注意：`--music` 不要求 `--llm`——音乐轮直接用 Responses（工具调用），
+    所以横幅/提示不能用 `cfg.llm` 单一判断，否则会误报“复读模式”。
+    """
+    return all(
+        value.strip()
+        for value in (
+            base_url or os.environ.get("LLM_BASE_URL", ""),
+            model or os.environ.get("LLM_MODEL", ""),
+            api_key or os.environ.get("LLM_API_KEY", ""),
+        )
+    )
 
 # ---------------- 协议常量（ARCHITECTURE §6.2，禁止私改） ----------------
 

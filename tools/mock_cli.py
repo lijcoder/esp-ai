@@ -11,6 +11,7 @@ from mock_core import (
     FRAME_HEADER_LEN,
     LOG,
     Config,
+    llm_env_ready,
 )
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -420,12 +421,20 @@ def load_tts_qwen(args: argparse.Namespace) -> object | None:
             raise
         raise SystemExit(f"Qwen3-TTS 加载失败：{exc}") from exc
     mode = "流式" if not args.no_tts_stream else "整句"
-    if args.llm:
-        pipeline = "流水线（边出字边合成/下发）" if args.llm_tts_stream else "整段回答后合成（默认，语音更连贯）"
-        LOG.info("TTS 回答已启用：LLM 回答 → Qwen3-TTS %s（%s；%s；模型 %s）",
-                 args.tts_voice, mode, pipeline, args.llm_model or os.environ.get("LLM_MODEL", ""))
+    llm_ready = llm_env_ready(args.llm_base_url, args.llm_model, args.llm_api_key)
+    via_llm = args.llm or (args.music and llm_ready)
+    if via_llm:
+        source = "Responses 音乐工具" if (args.music and not args.llm) else "LLM"
+        pipeline = "流水线（边出字边合成/下发）" if (args.llm and args.llm_tts_stream) else "整段回答后合成"
+        LOG.info("TTS 回答已启用：%s 回答 → Qwen3-TTS %s（%s；%s；模型 %s）",
+                 source, args.tts_voice, mode, pipeline,
+                 args.llm_model or os.environ.get("LLM_MODEL", ""))
     else:
         LOG.info("TTS 复读已启用：ASR 文本 → Qwen3-TTS %s（%s下发）", args.tts_voice, mode)
-        LOG.info("提示：当前是【复读模式】（回答 = 识别文本）。要大模型回答请加 --llm "
-                 "并配置 LLM_BASE_URL/LLM_MODEL/LLM_API_KEY 环境变量")
+        if args.music:
+            LOG.warning("音乐已启用但未配置 Responses（LLM_BASE_URL/LLM_MODEL/LLM_API_KEY）："
+                        "音乐不会执行，回答保持复读")
+        else:
+            LOG.info("提示：当前是【复读模式】（回答 = 识别文本）。要大模型回答请加 --llm "
+                     "并配置 LLM_BASE_URL/LLM_MODEL/LLM_API_KEY 环境变量")
     return mock_tts

@@ -1810,7 +1810,7 @@ uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc
   按 `t` 分流。URL 只出现在 `music_track`，且只接受 `http(s)`。
 - **一条命令看事件流**：`uv run tools/music_demo.py`（进程内起 mock + 假设备 + 假模型，打印 6 轮 JSON，不接板）；
   `--rounds "放首晴天" "暂停"` 只跑指定句子；加 `--search-url 'http://127.0.0.1:9009/search?q={query}'` 走本机搜索源。
-- **离线自测**：`uv run tools/mock_music_test.py`（**170 项**：工具状态机/幂等/track_id 往返/曲库/搜索适配器/
+- **离线自测**：`uv run tools/mock_music_test.py`（**173 项**：工具状态机/幂等/track_id 往返/曲库/搜索适配器/
   HTTP Range/Responses 解析/inline 与 mcp 两种工具调用/e2e 假设备/未配置 LLM 降级/CLI）。
 
 > 曲库/HTTP 都在 mock 进程内；**唯一真机依赖**是设备能访问到 `music_track.url` 的局域网地址

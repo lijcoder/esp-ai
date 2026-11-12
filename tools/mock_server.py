@@ -19,7 +19,7 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 from mock_core import (
-    CLOSE_BAD_DEVICE,
+    CLOSE_BAD_DEVICE, llm_env_ready,
     CLOSE_BAD_TOKEN,
     ERROR_TTS_FRAMES,
     FRAME_VER,
@@ -499,6 +499,8 @@ def _print_banner(server: MockServer) -> None:
     else:
         hosts = [cfg.host]
 
+    via_llm = cfg.llm or (cfg.music and llm_env_ready(
+        cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key))
     lines = [
         "=" * 78,
         "ws_mock_server —— 本地云端模拟（T1.5 / T2.4）",
@@ -516,7 +518,7 @@ def _print_banner(server: MockServer) -> None:
             else "ASR 模式: 关闭（asr_final 固定用 --tts-text 文案）"
         ),
         (
-            f"TTS {'回答' if cfg.llm else '复读'}: 开（{'LLM 回答' if cfg.llm else 'ASR 文本'} → Qwen3-TTS {cfg.tts_voice} 合成；"
+            f"TTS {'回答' if via_llm else '复读'}: 开（{'Responses/LLM 回答' if via_llm else 'ASR 文本'} → Qwen3-TTS {cfg.tts_voice} 合成；"
             f"{'流式' if cfg.tts_stream else '整句'}下发）"
             if server.tts_qwen_module is not None
             else "TTS 复读: 关"
@@ -525,6 +527,11 @@ def _print_banner(server: MockServer) -> None:
     ]
     if server.music is not None:
         lines.append(server.music.banner_line(getattr(cfg, "music_tool_mode", "")))
+        if not via_llm:
+            lines.append("提示：音乐已启用但未配置 Responses（LLM_BASE_URL/LLM_MODEL/LLM_API_KEY）"
+                         "→ 音乐不执行、回答复读")
+        elif not cfg.llm:
+            lines.append("回答模式: Responses（音乐工具调用）——--music 会自动使用 LLM_*，不要求 --llm")
     lines += [
         "直连 URL（设备端填 CONFIG_AI_WS_URL）：",
     ]

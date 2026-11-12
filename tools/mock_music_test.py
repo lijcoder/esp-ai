@@ -36,7 +36,7 @@ from typing import Any
 from websockets.asyncio.client import connect
 
 from mock_cli import config_from_args, parse_args
-from mock_core import Config
+from mock_core import Config, llm_env_ready
 import llm_client
 import music_tools
 from fake_responses import FakeResponsesServer
@@ -926,6 +926,18 @@ def test_cli(check: Checker) -> None:
     service = MusicService.from_config(Config(music=True, music_url="http://x/y.mp3"))
     check.ok(service is not None and len(service.catalog) == 1, "单曲 URL 建曲库（1 首）")
     check.ok(MusicService.from_config(Config(music=False)) is None, "未启用 → 不创建服务")
+
+    # 横幅/提示判断：--music 不要求 --llm，只要 LLM_* 齐全就按 Responses 回答显示
+    check.ok(llm_env_ready("http://gw/v1", "m", "k"), "LLM 配置齐全 → 走 Responses")
+    saved = {key: os.environ.pop(key, None)
+             for key in ("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")}
+    try:
+        check.ok(not llm_env_ready(), "无 LLM_* → 不走 Responses")
+        check.ok(not llm_env_ready("http://gw/v1", "", "k"), "缺 model → 不走 Responses")
+    finally:
+        for key, value in saved.items():
+            if value is not None:
+                os.environ[key] = value
 
 
 # ============================================================================

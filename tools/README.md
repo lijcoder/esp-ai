@@ -8,6 +8,12 @@
 | `mock_pipeline.py` | **LLM→TTS 流水线**（2026-11-10）：LLM 流式增量 → 自然分句 → Qwen3-TTS 边合成边下发（纯标准库、可单测） | 被 `ws_mock_server.py --llm --tts-qwen` 使用 |
 | `mock_pipeline_test.py` | 流水线/分句离线自测（22 项，不需要设备/模型） | `uv run tools/mock_pipeline_test.py` |
 | `fake_llm_server.py` | 本地假 OpenAI 兼容流式 LLM（无 token 也能验证 mock 流水线） | `uv run tools/fake_llm_server.py --port 8799` |
+| `music_tools.py` | **音乐工具层（2026-11-12）**：`MusicSession` 状态机 + 8 个工具（search/play/pause/resume/next/prev/stop/status）的唯一执行器；工具结果**不含 URL** | 被 MCP 服务与 mock 共用 |
+| `music_mcp_server.py` | **音乐 MCP 服务**：可独立 stdio/HTTP 启动，也可配到 Hermes agent 当工具 | `uv run tools/music_mcp_server.py --catalog tools/music_catalog.example.json --self-test`，见下文 |
+| `responses_client.py` | **Responses API 客户端**（纯标准库）：解析 `function_call`/`mcp_call`，替代 chat 接口的工具调用 | 被 `mock_downlink` 使用 |
+| `fake_responses.py` | 进程内假 Responses 网关（测试/演示用：模拟“模型决定调哪个工具”） | 被 `mock_music_test.py` / `music_demo.py` 使用 |
+| `mock_music.py` | 曲库/搜索/内置 HTTP/确认语（**规则表已于 2026-11-12 删除**） | 见下文「音乐工具链」 |
+| `music_demo.py` | 一条命令看音乐事件流（进程内 mock + 假设备 + 假模型，不需要开发板） | `uv run tools/music_demo.py`，见下文 |
 | `voice_test.py` | 语音链路真机自动自测：唤醒 + 交互语音回放 + 串口断言 | `uv run tools/voice_test.py --volume 50`，见下文 |
 | `lexin.wav` | 唤醒词"嗨，乐鑫"测试音频，**替代人工喊话** | `afplay tools/lexin.wav`，见下文 |
 | `今天天气如何.wav` | 交互语音素材（模拟用户提问），**替代人工说话** | `afplay tools/今天天气如何.wav`，见下文 |
@@ -1048,10 +1054,15 @@ PV-012 关闭）。真机首跑修了 4 个脚本 bug：`sys heap` 解析、`fir
 
 ## music_e2e_test.py —— T4.2/T4.3 真机音乐回归（真实 mock + 语音）
 
+> **2026-11-12 起**：音乐意图改由 LLM 工具调用决定，mock 需要 Responses API 配置
+> （`export LLM_BASE_URL/LLM_MODEL/LLM_API_KEY`）。手边没有 token 时加 `--fake-tools`，
+> 脚本会在进程内起一个假 Responses 网关，把常见中文指令映射成工具调用
+> （**只验证链路，不验证真实模型的命中率**）。
+
 ```bash
 # 需要一条能长期播的曲目/直播流（local_music_server 的 /stream/ 最稳），mock 端口要与设备 ws URL 一致
 uv run tools/local_music_server.py --dir ~/Music --port 9009
-uv run tools/music_e2e_test.py \
+uv run tools/music_e2e_test.py --fake-tools \
   --music-url 'http://192.168.1.15:9009/stream/test41.mp3' \
   --http-base http://192.168.1.15:9009 --tts-qwen
 ```
@@ -1300,11 +1311,12 @@ export LLM_MODEL=<模型名>                    # 必填
 export LLM_API_KEY=sk-...                    # 必填
 export LLM_SYSTEM_PROMPT="..."               # 可选：覆盖默认语音助手口径
 export LLM_MAX_TOKENS=256 LLM_TEMPERATURE=0.6 LLM_TIMEOUT_S=20 LLM_RETRIES=2
-export LLM_SESSION_ID=curl-test-001          # 可选：请求头 X-Hermes-Session-Id（空=不带）
+export LLM_SESSION_ID=curl-test-001          # 可选：请求头 + body.conversation（空=都不带）
 ```
 
-`LLM_SESSION_ID` 会作为 `X-Hermes-Session-Id` 请求头发给网关（mock `--llm` 与 `llm_test.py` 共用），
-用于在网关侧把同一会话的多轮请求串起来；`llm_test.py --session-id <id>` 可按次覆盖。
+`LLM_SESSION_ID` 会**同时**放进请求头 `X-Hermes-Session-Id` 和 body 的 `conversation` 字段
+（chat `/chat/completions` 与 Responses `/responses` 都带，两个字段并存），用于在网关侧把同一会话的
+多轮请求串起来；`llm_test.py --session-id <id>` 可按次覆盖。
 
 ```bash
 uv run tools/llm_test.py --text "今天天气怎么样？"
@@ -1632,7 +1644,8 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 | `--error-code N` | 1 | **T3.6**：`--scenario error` 下发的 `error.code`（3001/3002 映射 tts-fail 提示音） |
 | `--error-stage S` | `after-audio-end` | **T3.6**：报错时机 `after-audio-end`（现状）/ `after-asr`（先 asr_final）/ `after-tts-start`（先 tts_start + 3~5 帧真实 MP3，测 SPEAKING 中报错） |
 | `--tts-bad-codec` | 关 | **T3.6**：`tts_start` 用 `codec:"pcm"` 后发 `tts_end`、**不发音频帧**（触发设备侧 TTS 无法播放 → tts-fail 提示音）；与 `--scenario error` 互斥 |
-| `--music` | 关 | **M1（2026-11-10）**：ASR 文本先过确定性音乐意图表，命中就下发 `music_track` / `music_control`，**不进 LLM**（见下节） |
+| `--music` | 关 | **启用音乐**（曲库/搜索/MCP 工具语义）；音乐意图由 LLM 工具调用决定（2026-11-12 起，原规则表已删除）。需要配置 `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY`（Responses API），否则只 WARN 不执行音乐 |
+| `--music-tools` | `mcp` | `mcp`=工具已配在 Hermes（解析响应的 `mcp_call`）；`inline`=本地把 function tools 传给 Responses API（解析 `function_call`） |
 | `--music-url URL` | 空 | 固定曲目/电台流 URL（真机联调，**不用准备 MP3**）；缺省时 mock 自带 HTTP 服务下发示例 MP3 |
 | `--music-title T` | 空 | `--music-url` 的显示名（电台/直播流用；缺省取 URL 文件名） |
 | `--music-catalog FILE` | 空 | JSON 曲库：`{"tracks":[{"title","artist","url","duration_ms","keywords"}]}` |
@@ -1642,13 +1655,80 @@ mock → 设备:  （--think-ms 延时，模拟云端思考）
 | `--verbose` | 关 | 打印上行 payload 前 16 字节（库自身的握手 DEBUG 已压到 WARNING） |
 | `--self-test` | — | 进程内自测，不需要硬件 |
 
-## M1 音乐（mock 侧，2026-11-10）—— 不接 Hermes 工具也能"说暂停就暂停"
+## 音乐工具链（2026-11-12：LLM 工具调用 / MCP，规则表已删除）
 
-**为什么这样做**：端侧 ESP32 不做 NLU；「暂停/下一首」必须在云端被识别成结构化事件。
-Hermes 网关不支持 tool calling，而 LLM 文本里塞 URL 会被 TTS 念出来、也挡不住 prompt 注入。
-所以 mock（代表后端）加一张**确定性规则表**：控制指令不过 LLM，点歌的 URL 由曲库给，
-LLM 只负责"说话"。端侧 P4 只依赖 `music_track` / `music_control` 两个事件，后续换成
-Hermes 工具/意图路由都不返工。
+**为什么改**：关键词规则表真机实测命中率低（同义改写、模糊指代覆盖不了）。现在由 LLM 决策：
+
+```
+设备 ──上行音频──▶ mock ──ASR 文本──▶ Responses API（Hermes）
+                                        │  mcp_call / function_call
+                                        ▼
+                          music_tools.execute_tool()（唯一执行器）
+                                        │
+                     play/next/prev → music_track（URL 由曲库给）
+                     pause/resume/stop → music_control
+                                        │
+设备 ◀────────────── music_track / music_control + 模板确认语
+```
+
+- **端侧 ESP32 零改动**：协议、状态机、`mid` 过滤全部不变。
+- **URL 永不出现在模型可见内容里**：工具结果只有 `track_id/title/artist/duration_ms`；
+  持有 WS 连接的一侧（mock 或真实云端）按 `track_id` 回曲库取 URL。
+- **一轮只调 1 次模型**：拿到工具调用就执行，确认语用固定模板（“好的，已暂停。”），不再让模型复述。
+- `music_tools.py` 的 `MusicSession` 是服务端权威播放状态（idle/playing/paused + 当前曲目 + 队列），
+  `next/prev` 在搜索结果队列内移动，否则走曲库游标。
+
+### 三种跑法
+
+```bash
+# 1) 演示（进程内假模型，不需要开发板/token）
+uv run tools/music_demo.py
+uv run tools/music_demo.py --rounds "放首晴天" "暂停" "下一首"
+
+# 2) mock + 真实 Hermes（工具已配在 Hermes 侧；默认 mcp 模式）
+export LLM_BASE_URL=https://<网关>/v1 LLM_MODEL=<模型> LLM_API_KEY=sk-...
+uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc \
+  tools/ws_mock_server.py --music --music-catalog tools/music_catalog.example.json \
+  --asr sensevoice --tts-qwen
+
+# 3) mock + 本地 inline function tools（网关支持 /responses 的 tools 字段时）
+uv run tools/ws_mock_server.py --music --music-tools inline \
+  --music-catalog tools/music_catalog.example.json
+```
+
+### MCP 服务（配到 Hermes）
+
+```bash
+# 自测工具语义（不需要 MCP 客户端）
+uv run tools/music_mcp_server.py --catalog tools/music_catalog.example.json --self-test
+
+# stdio（Hermes 拉起；最常用）
+uv run tools/music_mcp_server.py --catalog tools/music_catalog.json
+
+# HTTP（本机/局域网调试）
+uv run tools/music_mcp_server.py --catalog tools/music_catalog.json \
+  --transport streamable-http --host 127.0.0.1 --port 8766
+```
+
+Hermes 配置示例（按实际 MCP 配置格式调整）：
+
+```json
+{
+  "mcpServers": {
+    "music": {
+      "command": "uv",
+      "args": ["run", "/abs/path/tools/music_mcp_server.py",
+               "--catalog", "/abs/path/tools/music_catalog.json"]
+    }
+  }
+}
+```
+
+HTTP 方式是 `{"url": "http://127.0.0.1:8766/mcp"}`。工具：`music_search`、`music_play`、
+`music_pause`、`music_resume`、`music_next`、`music_prev`、`music_stop`、`music_status`。
+
+> **曲库一致性**：MCP 服务与 mock（或真实云端）必须用**同一份曲库**，否则 `track_id`
+> 在客户端侧找不到对应 URL。用搜索源（`--search-url`）返回的曲目也一样——客户端需能解析。
 
 ```bash
 # 内置示例曲目（自动起 HTTP，真机可直接拉流；横幅会打印局域网 URL）
@@ -1708,23 +1788,30 @@ uv run --with av --with numpy --with sherpa-onnx --with mlx-audio --with lameenc
 > 不能等 EOF 收尾，停播只能靠 `music_control{stop}`、断流或切歌；mock 不伪造结束事件。
 > 示例曲库里的电台 URL 只是示例（公网可达性/版权自行确认），换成自己的流随时可用。
 
-**行为**（ASR 文本 → 事件）：
+**行为**（ASR 文本 → LLM 工具调用 → 设备事件）：
 
-| 说的话 | 下发 | 说明 |
-|---|---|---|
-| 放首周杰伦的晴天 / 播放孤勇者 / 来首歌 | `music_track{mid,url,codec:"mp3",duration_ms,title}` | 曲库检索；无匹配回退当前曲目并 WARN |
-| 下一首 / 上一首 / 换一首 | **新的 `music_track`** | 端侧没有播放列表，只有服务端能决定下一首；搜索结果 **>1 条**时先在这批结果里移动，否则/搜索单条时回退**整库顺序**（2026-11-10 调整，避免搜一次后「下一首」被单条结果卡住） |
-| 暂停 / 先停一下 | `music_control{mid,action:"pause"}` | 控制事件沿用当前 `mid`（不加 1） |
-| 继续 / 接着放 | `music_control{action:"resume"}` | |
-| 停止播放 / 别放了 / 关掉音乐 | `music_control{action:"stop"}` | 控制词优先于「放」 |
-| 今天天气如何 | 无音乐事件 | 照旧走 LLM/复读 |
+| 说的话（示例） | 期望工具 | 下发 | 说明 |
+|---|---|---|---|
+| 放首周杰伦的晴天 / 播放孤勇者 / 来首歌 | `music_play{query}` | `music_track{mid,url,codec:"mp3",duration_ms,title}` | 搜索源优先、回退曲库；无匹配回退当前曲目并标 `matched=false` |
+| 下一首 / 上一首 / 换一首 | `music_next` / `music_prev` | **新的 `music_track`** | 端侧没有播放列表；搜索结果 >1 条时在队列内移动，否则走曲库游标 |
+| 暂停 / 先停一下 | `music_pause` | `music_control{mid,action:"pause"}` | 控制事件沿用当前 `mid`（不加 1） |
+| 继续 / 接着放 | `music_resume` | `music_control{action:"resume"}` | 没有暂停中的曲目时 `ok=false`（模型应改调 play） |
+| 停止播放 / 别放了 / 关掉音乐 | `music_stop` | `music_control{action:"stop"}` | 与暂停语义不同：丢弃当前曲目 |
+| 今天天气如何 | 不调用 | 无音乐事件 | 同一次 Responses 调用的文本直接作为回答 |
 
-- **回答**：命中音乐意图时用固定确认语（"好的，为你播放晴天。"）走 TTS 下发，
-  保证「说暂停」不再等一次 LLM 往返；`--no-tts` 下只发 `tts_start`/`tts_end`。
+- **Hermes 实际形态（2026-11-12 真机）**：网关把工具包了一层元工具——
+  `tool_describe{names:[...]}` 列工具、`tool_call{calls:[{name:"mcp__music__music_play",arguments:{...}}]}`
+  调用；`responses_client` 会自动展开并剥掉 `mcp__<server>__` 前缀，`tool_describe` 忽略，
+  其它 MCP 工具（日历/文件系统等）静默跳过。
+- **一轮只调 1 次模型**：拿到工具调用就执行并用**模板确认语**（“好的，已暂停。”）走 TTS；
+  `--no-tts` 下只发 `tts_start`/`tts_end`。代价是“暂停”也要过一次模型（延迟基线见 PV-020）。
+- **一轮只执行第一个会改状态的工具**：模型同时调 pause+stop 时只认第一个，避免设备状态跳变。
 - **事件字段**：`mid` 是连接内自增的音乐 id，**不复用语音 `sid`**（P-3）；端侧 T4.2
   按 `t` 分流。URL 只出现在 `music_track`，且只接受 `http(s)`。
-- **一条命令看事件流**：`uv run tools/music_demo.py`（进程内起 mock + 假设备，打印 6 轮 JSON，不接板）；`--rounds "放首晴天" "暂停"` 只跑指定句子；加 `--search-url 'http://127.0.0.1:9009/search?q={query}'` 走本机搜索源。
-- **离线自测**：`uv run tools/mock_music_test.py`（178 项：意图/曲库/搜索适配器/HTTP Range/e2e 假设备/搜索 next-prev/LLM 流水线同开/电台 URL）。
+- **一条命令看事件流**：`uv run tools/music_demo.py`（进程内起 mock + 假设备 + 假模型，打印 6 轮 JSON，不接板）；
+  `--rounds "放首晴天" "暂停"` 只跑指定句子；加 `--search-url 'http://127.0.0.1:9009/search?q={query}'` 走本机搜索源。
+- **离线自测**：`uv run tools/mock_music_test.py`（**170 项**：工具状态机/幂等/track_id 往返/曲库/搜索适配器/
+  HTTP Range/Responses 解析/inline 与 mcp 两种工具调用/e2e 假设备/未配置 LLM 降级/CLI）。
 
 > 曲库/HTTP 都在 mock 进程内；**唯一真机依赖**是设备能访问到 `music_track.url` 的局域网地址
 > （mock 自动用 `lan_ips()` 拼 URL；跨网段请用 `--music-url` 指向可达地址）。

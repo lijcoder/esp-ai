@@ -166,6 +166,26 @@
 | 关闭条件 | T4.4 ①~⑤、T4.5 ①~⑤ 全过并记入 STATUS §5；若 T4.5 未实现项单独登记 |
 | 关联 | STATUS §2 T4.4/T4.5、PV-015、PV-017（BOD 已关闭）、build/t44_contract.md |
 
+### PV-019 · Hermes 网关 Responses API / MCP 联调（真实工具调用）
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-12 11:3x（采样）**，M2 决策后登记 |
+| 来源 | 用户实测「Hermes 的 chat 接口不返回工具调用」；改走 Responses API + MCP |
+| 现象/问题 | ① 网关 `/responses` 是否按标准返回 `output[].type=mcp_call`（或 `function_call`）——**2026-11-12 真机实测：是元工具形态**（`tool_describe` + `tool_call{calls:[{name:"mcp__music__music_play",...}]}`），已在 `responses_client` 适配；② Hermes 是否能拉起 stdio MCP（`uv run tools/music_mcp_server.py --catalog …`）或配 HTTP——**已拉起并返回真实 `track_id`**；③ 工具结果里的中文/JSON 是否原样回传——已确认；④ 模型是否会在闲聊时误调音乐工具——待多轮观察 |
+| 验收方法 | `curl $LLM_BASE_URL/responses` 发一条「放首歌」，检查 `output` 数组；把 MCP 配到 Hermes 后对设备说「放首歌/暂停/下一首」，看 mock 日志是否出现 `[MUSIC] tool=music_play … → music_track`；同轮 `responses.requests` 里确认**无 URL** |
+| 关闭条件 | 真实 Hermes 一轮「点歌 + 暂停 + 下一首」全部命中；日志无 URL；闲聊不误调工具 |
+| 关联 | PRODUCT_IDEAS M2；ARCH §6.3；`tools/music_mcp_server.py`、`tools/responses_client.py` |
+
+### PV-020 · 真实模型下的意图命中率与延迟基线
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-12 11:3x（采样）**，随 M2 一起登记 |
+| 来源 | 规则表因“命中率低”被删除；需要量化替代方案是否真的更好 |
+| 现象/问题 | 换成 LLM 工具调用后，命中率/首声延迟/成本都未实测；尤其「暂停/停止」也要过一次模型，延迟可能从 0.3s 涨到 1.5s+ |
+| 验收方法 | 固定 20 条口语化指令（点歌含歌名/歌手/模糊指代、暂停/继续/下一首/上一首/停止、闲聊不误触发），逐条记录：是否调用工具、工具是否正确、设备事件是否下发、从 `audio_end` 到首声的毫秒数；同一批指令用旧规则表跑一次做对照（历史日志/脚本可复现） |
+| 关闭条件 | 工具选择正确率 ≥18/20；`pause/stop` 端到端 ≤1.5s、`play` ≤2.5s；闲聊误触发 0；结果记入 STATUS §5 |
+| 关联 | PRODUCT_IDEAS M2；`tools/mock_music_test.py`、`music_e2e_test.py --fake-tools` |
+
 ## 3. 待决定 / 已被暂缓（PD）
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）

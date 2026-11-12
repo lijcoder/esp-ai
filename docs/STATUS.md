@@ -63,6 +63,7 @@
 
 | 日期 | 任务 | 说明 |
 |---|---|---|
+| 2026-11-12 | **诊断：工具结果缺 URL 时显式 WARN** | 用户端到端跑出“播放 mock 示例曲目”：Hermes 的 MCP 子进程仍是旧版（结果无 url），mock 静默回退本地曲库；无 `--music-catalog` 时落到示例曲目。`mock_downlink` 在 play/next/prev 的工具结果**没有 url** 时打 WARN，提示重启 Hermes 或临时加 `--music-catalog`，避免再把回退误判成正常点歌。离线 183/183。 |
 | 2026-11-12 | **简化命令：MCP 工具结果直接带 URL** | 用户反馈启动参数太复杂，且“search 已找到歌，为什么还要 track_id 再查一次”。根因是原方案为不让 URL 进模型上下文，工具结果只给 track_id、由 mock 按 `--music-catalog` 反查。现改为：MCP 的 `music_play`/`music_search` 结果**带 url**；mock 解析 Hermes 的 `function_call_output`（含 `<untrusted_tool_result>` 包装）后直接用该 URL 下发 `music_track`，**不再需要 `--music-catalog`**，`--music-tools` 默认就是 `mcp` 也可省略。安全边界：只接受**工具结果**里的 URL（不采纳模型 arguments 里的 URL），校验 `http(s)` + 长度 <320；本地 `changed` 以 mock 会话状态为准（MCP 进程状态可能过期）。离线 `mock_music_test` **183/183**（新增 URL 透传解析/空曲库 apply_remote/端到端 hermes_output）。 |
 | 2026-11-12 | **修正启动横幅：`--music` 不要求 `--llm`** | 用户真机日志显示：未加 `--llm` 时横幅提示“复读模式/要大模型回答请加 --llm”，但 `--music` 实际已用 `LLM_*` 调 Responses。新增 `mock_core.llm_env_ready()`（CLI 值优先、缺省读环境变量），`mock_cli`/`mock_server` 按实际回答来源显示：配置齐全 → “TTS 回答（Responses/LLM）”，缺配置 → 明确 WARN“音乐不执行、回答复读”；`--music` + `--llm` 都不开时才提示复读。离线 `mock_music_test` **183/183**（新增 3 项 `llm_env_ready` 断言）。 |
 | 2026-11-12 | **LLM 会话追踪：Responses body 增 `conversation`** | 用户要求给 LLM 请求体加 `conversation` 参数追踪会话，取值仍来自 `LLM_SESSION_ID`（沿用 chat 接口时期的会话 id）；**请求头 `X-Hermes-Session-Id` 保留**，两个字段并存。`tools/responses_client.py` 与 `tools/llm_client.py` 均按需写 body `conversation`（空则不写、也不带头）。离线 `mock_music_test` **183/183**（新增 4 项断言：body 带 conversation / 未配置不带 / chat 路径同样带）。 |

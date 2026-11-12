@@ -691,6 +691,13 @@ class DownlinkMixin:
                               f"[MUSIC] tool={call.name}（用工具结果的 URL）→ "
                               f"ok={command.ok} state={command.state} {command.message}")
             if command is None:
+                if remote is not None and canonical in (
+                        music_tools.TOOL_PLAY, music_tools.TOOL_NEXT, music_tools.TOOL_PREV):
+                    # 工具结果里没有 url（MCP 服务是旧版/网关裁掉了 output）：
+                    # 只能回退本地曲库；没有 --music-catalog 时就会落到示例曲目。
+                    self._log(logging.WARNING,
+                              "[MUSIC] 工具结果里没有可用 url（MCP 服务版本过旧？）→ 回退本地曲库；"
+                              "重启 Hermes 让 MCP 加载新版，或临时加 --music-catalog")
                 command = await asyncio.to_thread(
                     music_tools.execute_tool, session, canonical, call.arguments
                 )

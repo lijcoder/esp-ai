@@ -89,6 +89,7 @@ typedef struct {
     uint32_t round_aborts;     /* voice_cloud 报告的异常结束数 */
     uint32_t interrupts;       /* vs_interrupt() 次数 */
     uint32_t wakes_dropped;    /* 会话中/播放器忙时忽略的唤醒数 */
+    uint32_t wakes_during_tts; /* TTS 播放中检测到的唤醒数（C4 spike，仅计数） */
     uint32_t timeouts;         /* THINKING 超时数 */
     uint32_t cloud_errors;     /* 云端 error 数 */
     /* ---- T3.7 连续对话（FOLLOW_UP） ---- */

@@ -612,7 +612,12 @@ static void vc_audio_start(uint8_t codec_id, uint32_t sample_rate)
     /* R1：流式播放期间暂停收音，避免扬声器回采自激（R2 由完成回调恢复）。
      * T3.2 起走 audio_fe 的原因位仲裁（与提示音的 PROMPT 位互不覆盖）。 */
     if (s_done_subscribed) {
-        audio_fe_feed_hold(AUDIO_FE_HOLD_TTS);
+    #if CONFIG_AUDIO_FE_AEC_TTS_BARGEIN
+    /* C4 spike：TTS 期间保持开麦，靠 AEC 抵消自播；只用于验证唤醒检测 */
+    ESP_LOGI(TAG, "TTS 期间保持开麦（AEC barge-in spike，feed 不 hold）");
+#else
+    audio_fe_feed_hold(AUDIO_FE_HOLD_TTS);
+#endif
     } else {
         ESP_LOGE(TAG, "未订阅播放完成回调，跳过 R1（否则流结束后无法恢复收音）");
     }

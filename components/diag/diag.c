@@ -1487,6 +1487,7 @@ static void print_vs_status(void)
            "；打断 %" PRIu32 " 唤醒丢弃 %" PRIu32 "；超时 %" PRIu32 " 云端 error %" PRIu32 "\n",
            st.rounds_started, st.rounds_completed, st.rounds_errored, st.round_aborts,
            st.interrupts, st.wakes_dropped, st.timeouts, st.cloud_errors);
+    printf("  TTS 中唤醒（C4 spike）: %" PRIu32 " 次\n", st.wakes_during_tts);
     printf("  迁移: 共 %" PRIu32 " 次；最近 sid=%u，上次状态停留 %" PRIu32 " ms\n",
            st.transitions, (unsigned)st.last_sid, st.last_state_ms);
 #if CONFIG_VS_FOLLOWUP_ENABLE

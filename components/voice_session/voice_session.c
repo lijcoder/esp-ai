@@ -734,6 +734,15 @@ static void vs_on_wake(void)
 {
     ESP_LOGI(TAG, "wake detected");
     const vs_state_t prev = vs_get_state();
+#if CONFIG_AUDIO_FE_AEC_TTS_BARGEIN
+    if (prev == VS_STATE_SPEAKING) {
+        portENTER_CRITICAL(&s_mux);
+        s_stats.wakes_during_tts++;
+        portEXIT_CRITICAL(&s_mux);
+        ESP_LOGW(TAG, "TTS 播放中检测到唤醒（AEC barge-in spike，仅计数不打断）");
+        return;
+    }
+#endif
     const bool from_followup = (prev == VS_STATE_FOLLOW_UP);
     if (from_followup) {
         /* T3.7：续听窗口内再次唤醒 = 重开一轮（播应答提示音、续听计数清零） */

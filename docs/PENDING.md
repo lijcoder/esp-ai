@@ -189,6 +189,17 @@
 | 关联 | PRODUCT_IDEAS M2；`tools/mock_music_test.py`、`music_e2e_test.py --fake-tools` |
 
 ## 3. 待决定 / 已被暂缓（PD）
+### PD-008 · T4.4 C4（TTS 播放中唤醒打断）spike 结果与后续
+| 项 | 内容 |
+|---|---|
+| 提出时间 | **2026-11-12 23:0x（采样）**，用户同意做 dev-only spike |
+| 来源 | 用户反馈“TTS 播放时唤醒词不能触发”；R1 半双工关麦，C4 需 AEC |
+| 实测 | AEC `SR_HIGH_PERF` filter=4、TTS 期间不 hold mic：`aecr corr` 在 delay 0/40/80/120/160/200ms 下 **best corr 0.01~0.13**（正常应 >0.9）；`aecr stat` **ERLE -5~-9dB**；唤醒检测 AEC off 0/2（vol30/60）、AEC on vol30 **2/2**、vol60 **0/2**、TTS 无唤醒控制 0 |
+| 现象/问题 | TTS 参考与麦克风回声不相关，AEC 输出反而比输入更响（发散/叠加），不能作为 barge-in 基础；vol30 的 2/2 更可能是 AEC 输出残留/偶然，不可靠 |
+| 下一步 | ① 查 TTS stream 路径的参考环写入/读取对齐（音乐 pump 的 C3 tone 是 0.98，stream 路径需单独验证）；② 用 `aecr corr` 在 TTS 期间定位真实声学延迟；③ 修好后再评估 vol30/60/70 的唤醒率与误触发；④ 正式 C4 需改 R1 策略并同步 ARCH |
+| 关闭条件 | TTS 期间 `aecr corr` >0.8、ERLE >10dB；唤醒检测 ≥4/5 且 TTS 自触发 0/5；再决定是否实现打断 |
+| 关联 | ARCH §3.3 R1/C4 注记；`CONFIG_AUDIO_FE_AEC_TTS_BARGEIN`（默认 n）、`vs status` 的“TTS 中唤醒”计数 |
+
 
 ### PD-001 · LED 亮度太亮晃眼（用户 2026-11-02 反馈）
 | 项 | 内容 |

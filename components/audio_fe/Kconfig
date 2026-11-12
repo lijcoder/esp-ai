@@ -77,6 +77,15 @@ menu "Audio Front-End"
             参考环读取相对播放写指针的延迟，用于对齐 DMA/功放/声学路径。
             真机按 ERLE/唤醒率扫描（runtime `aec delay <ms>`）。
 
+    config AUDIO_FE_AEC_TTS_BARGEIN
+        bool "TTS 播放期间保持开麦（AEC barge-in spike）"
+        depends on AUDIO_FE_AEC_ENABLE
+        default n
+        help
+            仅用于 T4.4 C4 spike：TTS 播放时**不 hold mic**，让 WakeNet 继续听，
+            由 AEC 用 TTS 参考抵消自播；voice_session 只计数
+            （`vs status` 的“TTS 中唤醒”），不真正打断。验证通过后再决定是否正式实现。
+
     config AUDIO_FE_AEC_BYPASS_WHEN_IDLE
         bool "无播放时旁路 AEC"
         depends on AUDIO_FE_AEC_ENABLE

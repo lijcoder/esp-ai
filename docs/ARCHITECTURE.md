@@ -112,6 +112,8 @@ TTS(MP3 流/整段) ─┐
 | R4 | 按键打断：语音类内容（提示音/TTS）→ **80ms** 淡出并丢弃 → 发 `interrupt` 报文 + 作废 sid → 恢复 feed（丢弃 50ms）→ `IDLE`；**只有音乐在播 → 暂停并保留**（T4.4） |
 | R5 | 恢复 feed 后丢弃最早 **50ms** 的音频（`CONFIG_AUDIO_FE_RESUME_DISCARD_MS`），避免打断瞬间的噪声触发 VAD |
 
+> **T4.4 C4 spike（2026-11-12，no-go）**：`AUDIO_FE_AEC_ENABLE` + `AUDIO_FE_AEC_TTS_BARGEIN` 打开后，TTS 期间保持开麦并靠 AEC 抵消自播。实测 TTS 期间 `aecr corr` **best corr 仅 0.01~0.13**（延迟 0/40/80/120/160/200ms 全扫）、`aecr stat` **ERLE -5~-9dB（负）**；唤醒检测：AEC off 0/2（vol30/60）、AEC on vol30 2/2 / vol60 0/2、TTS 静音控制 0。结论：**当前 TTS 参考路径/对齐不可用，C4 暂不实现**，R1 保持；spike 代码默认关闭（`AUDIO_FE_AEC_TTS_BARGEIN=n`），待修参考相关性后再评估。
+
 **门控仲裁（T3.2 定稿，唯一入口）**：`audio_fe` 维护一个原因位图，业务方各自 `audio_fe_feed_hold(reason)` / `audio_fe_feed_release(reason)`，**位图归零才真正恢复收音**。原因位：`PROMPT`（唤醒应答提示音，`voice_session`）、`TTS`（云端 TTS 流式播放，`voice_cloud`）、`PROBE`（console/旧 `audio_fe_set_feed_enabled()` 兼容）。这解决了 T3.1 之前"提示音 R1/R2"与"TTS R1/R2"两套独立开关互相覆盖的问题（谁后执行谁生效 → 可能提前开麦自激，或永久关麦卡死会话）。
 
 > **T3.2 实现状态（2026-11-01）**：

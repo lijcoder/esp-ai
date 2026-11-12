@@ -171,6 +171,21 @@ def test_tools(check: Checker) -> None:
     check.ok('"state"' in prompt and "music_play" in prompt, "system prompt 注入状态/规则")
     check.ok("http" not in prompt, "system prompt 不含 URL")
 
+    # 设备上报的 music_status 同步到 mock 会话（语音 auto-pause 不经过工具调用）
+    session = music_tools.MusicSession(service)
+    music_tools.execute_tool(session, "music_play", {"query": "晴天"})
+    session.apply_status("paused")
+    check.eq(session.state, "paused", "apply_status(paused) 同步设备暂停态")
+    command = music_tools.execute_tool(session, "music_resume", {})
+    check.ok(command.ok and command.changed and session.state == "playing",
+             "同步后 resume 立即生效")
+    session.apply_status("stopped")
+    check.ok(session.state == "idle" and session.current is None,
+             "apply_status(stopped) 清空当前曲目")
+    command = music_tools.execute_tool(music_tools.MusicSession(MusicService(catalog=MusicCatalog())),
+                                       "music_resume", {}, lenient=True)
+    check.ok(command.ok and command.changed, "lenient resume（MCP 无状态）返回已请求")
+
     # 工具结果自带 URL：空曲库也能起播（mock 不再依赖 --music-catalog）
     url = "http://192.168.1.10:9009/media/remote.mp3"
     payload = {

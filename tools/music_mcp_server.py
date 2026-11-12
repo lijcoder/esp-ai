@@ -126,6 +126,25 @@ def make_server(session: MusicSession) -> MCPServer:
 
     async def run_tool(name: str, arguments: dict[str, Any]) -> str:
         async with lock:  # 单设备状态：并发调用串行化，避免队列/游标交叉
+            # pause/resume/stop 是“意图”，不是 MCP 自己能判定的状态：
+            # 设备可能因语音/按键自行暂停，MCP 进程看不到。这里返回固定的“已请求”，
+            # 由持有设备的客户端按自己的状态执行；避免模型看到“已经在播放/没在播放”
+            # 这类与设备矛盾的结论后改调 music_play（真机复现过）。
+            if name == TOOL_PAUSE:
+                session.state = "paused"
+                return _json({"ok": True, "action": "pause", "changed": True,
+                              "state": "paused", "message": "已请求暂停"})
+            if name == TOOL_RESUME:
+                session.state = "playing"
+                return _json({"ok": True, "action": "resume", "changed": True,
+                              "state": "playing", "message": "已请求继续"})
+            if name == TOOL_STOP:
+                session.state = "idle"
+                session.current = None
+                session.queue = []
+                session.index = -1
+                return _json({"ok": True, "action": "stop", "changed": True,
+                              "state": "idle", "message": "已请求停止"})
             try:
                 command = await anyio.to_thread.run_sync(
                     lambda: execute_tool(session, name, arguments)

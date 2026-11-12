@@ -11,6 +11,7 @@ import json
 import logging
 import socket
 import sys
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -255,9 +256,14 @@ class Session(DownlinkMixin):
                 self._log(logging.WARNING, "scenario 非 music，不回 music_track（--scenario music 可测）")
 
         elif event == "music_status":
+            state = str(msg.get("state") or "")
+            if self.music_session is not None and state:
+                # 设备可能因语音/按键自行 paused/stopped：同步云端视角，
+                # 否则 system prompt 会告诉模型“还在播放”，说“继续”时模型去 play。
+                self.music_session.apply_status(state)
             self._log(
                 logging.INFO,
-                f"<-- music_status state={msg.get('state')} progress_ms={msg.get('progress_ms')}",
+                f"<-- music_status state={state} progress_ms={msg.get('progress_ms')}",
             )
 
         else:

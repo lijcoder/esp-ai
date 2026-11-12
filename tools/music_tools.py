@@ -229,22 +229,49 @@ class MusicSession:
                        track=track, matched=matched,
                        message=f"开始播放《{track.title}》{note}")
 
-    def pause(self) -> Command:
+    def apply_status(self, state: str) -> None:
+        """把设备上报的 music_status 同步到本会话（设备可能因语音/按键自行暂停）。
+
+        mock 的 MusicSession 是“云端视角”；设备 auto-pause / stop 不会经过工具调用，
+        不同步的话 system prompt 会告诉模型“还在播放”，用户说“继续”时模型会去 play。
+        """
+        if state == "playing":
+            self.state = STATE_PLAYING
+        elif state == "paused":
+            self.state = STATE_PAUSED
+        elif state in ("stopped", "error", "idle"):
+            self.state = STATE_IDLE
+            self.current = None
+            self.queue = []
+            self.index = -1
+
+    def pause(self, lenient: bool = False) -> Command:
         if self.state == STATE_PAUSED:
             return Command(ok=True, action=ACTION_PAUSE, changed=False,
                            state=self.state, track=self.current, message="已经是暂停状态")
         if self.state != STATE_PLAYING or self.current is None:
+            if lenient:
+                # MCP 服务只表达“用户要暂停”；真实状态由持有设备的客户端决定
+                self.state = STATE_PAUSED
+                return Command(ok=True, action=ACTION_PAUSE, changed=True,
+                               state=self.state, track=self.current,
+                               message="已请求暂停")
             return Command(ok=False, action=ACTION_PAUSE, state=self.state,
                            message="当前没有在播放，无法暂停")
         self.state = STATE_PAUSED
         return Command(ok=True, action=ACTION_PAUSE, changed=True, state=self.state,
                        track=self.current, message=f"已暂停《{self.current.title}》")
 
-    def resume(self) -> Command:
+    def resume(self, lenient: bool = False) -> Command:
         if self.state == STATE_PLAYING:
             return Command(ok=True, action=ACTION_RESUME, changed=False,
                            state=self.state, track=self.current, message="已经在播放")
         if self.state != STATE_PAUSED or self.current is None:
+            if lenient:
+                self.state = STATE_PLAYING
+                return Command(ok=True, action=ACTION_RESUME, changed=True,
+                               state=self.state, track=self.current,
+                               message="已请求继续")
             return Command(ok=False, action=ACTION_RESUME, state=self.state,
                            message="没有暂停中的曲目；要听歌请调用 music_play")
         self.state = STATE_PLAYING
@@ -257,9 +284,9 @@ class MusicSession:
     def prev(self) -> Command:
         return self._step(-1)
 
-    def stop(self) -> Command:
+    def stop(self, lenient: bool = False) -> Command:
         if self.state == STATE_IDLE and self.current is None:
-            return Command(ok=True, action=ACTION_STOP, changed=False,
+            return Command(ok=True, action=ACTION_STOP, changed=lenient,
                            state=self.state, message="当前没有在播放")
         old = self.current
         self.state = STATE_IDLE
@@ -453,7 +480,8 @@ def canonical_tool_name(name: str) -> str:
     return prefixed if prefixed in TOOL_NAMES else raw
 
 
-def execute_tool(session: MusicSession, name: str, arguments: dict[str, Any] | None) -> Command:
+def execute_tool(session: MusicSession, name: str, arguments: dict[str, Any] | None,
+                 lenient: bool = False) -> Command:
     """唯一的工具执行入口（MCP / Responses 共用）；arg 容错为 dict。"""
     args = arguments if isinstance(arguments, dict) else {}
     tool = canonical_tool_name(name)
@@ -464,15 +492,15 @@ def execute_tool(session: MusicSession, name: str, arguments: dict[str, Any] | N
                             track_id=_as_str(args.get("track_id")),
                             index=_as_optional_int(args.get("index")))
     if tool == TOOL_PAUSE:
-        return session.pause()
+        return session.pause(lenient)
     if tool == TOOL_RESUME:
-        return session.resume()
+        return session.resume(lenient)
     if tool == TOOL_NEXT:
         return session.next()
     if tool == TOOL_PREV:
         return session.prev()
     if tool == TOOL_STOP:
-        return session.stop()
+        return session.stop(lenient)
     if tool == TOOL_STATUS:
         return session.status()
     return Command(ok=False, action=tool or "unknown", state=session.state,
@@ -528,7 +556,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "parameters": _EMPTY_PARAMS,
     },
     TOOL_RESUME: {
-        "description": "从暂停点继续播放；没有暂停中的曲目时会失败（应改用 music_play）。",
+        "description": "从暂停点继续播放。用户说“继续/接着放”时必须调用它（即使不确定设备是否在暂停态，由设备决定）。",
         "parameters": _EMPTY_PARAMS,
     },
     TOOL_NEXT: {
@@ -580,7 +608,8 @@ MUSIC_SYSTEM_PROMPT = """你是语音助手的音乐控制决策层。
 - 点歌用 music_play{query=歌名或歌手}；不确定曲目时先 music_search。
 - “继续/接着放”用 music_resume；“暂停”用 music_pause；“关掉/别放了”用 music_stop。
 - “下一首/换一首”用 music_next；“上一首”用 music_prev。
-- 当前没有在播放时不要调用 music_next/music_pause/music_resume。
+- 当前没有曲目（state=idle）时不要调用 music_next/music_prev/music_pause/music_resume。
+- state=paused 时，用户说“继续/接着放”必须调用 music_resume，不要用 music_play 重新点歌。
 - 用户只是闲聊、问天气、问知识时，**不要调用任何音乐工具**，按普通语音助手正常回答。
 - 工具返回 ok=false 时按 message 向用户解释，不要编造播放结果。
 

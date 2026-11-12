@@ -647,6 +647,7 @@ class DownlinkMixin:
             return False, None
 
         tools = music_tools.tool_definitions() if mode == "inline" else None
+        self._log(logging.INFO, f"[MUSIC] 云端状态: {session.describe()}")
         # 基础人设（--llm-system / 默认语音助手）+ 音乐工具规则；音乐轮外也走同一次调用，
         # 避免「开了 --music 之后普通问答失去助手口径」。
         base_system = (cfg.llm_system or "").strip() or llm_client.DEFAULT_SYSTEM
